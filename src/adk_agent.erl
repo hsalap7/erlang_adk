@@ -128,6 +128,11 @@ run_agent_loop(Config, Memory, Tools) ->
 execute_tools([], _ToolsList, MemoryAcc) ->
     MemoryAcc;
 execute_tools([{NameBin, ArgsMap} | Rest], ToolsList, MemoryAcc) ->
+    execute_tools_inner(NameBin, ArgsMap, undefined, Rest, ToolsList, MemoryAcc);
+execute_tools([{NameBin, ArgsMap, Sig} | Rest], ToolsList, MemoryAcc) ->
+    execute_tools_inner(NameBin, ArgsMap, Sig, Rest, ToolsList, MemoryAcc).
+
+execute_tools_inner(NameBin, ArgsMap, Sig, Rest, ToolsList, MemoryAcc) ->
     FoundTool = lists:search(
         fun(Mod) ->
             Schema = Mod:schema(),
@@ -143,7 +148,7 @@ execute_tools([{NameBin, ArgsMap} | Rest], ToolsList, MemoryAcc) ->
         false ->
             #{<<"success">> => false, <<"error">> => <<"Tool not found">>}
     end,
-    Memory1 = adk_memory:add_message(MemoryAcc, tool, {tool_response, NameBin, Result}),
+    Memory1 = adk_memory:add_message(MemoryAcc, tool, {tool_response, NameBin, Result, Sig}),
     execute_tools(Rest, ToolsList, Memory1).
 
 format_result(Res) when is_map(Res) -> Res;

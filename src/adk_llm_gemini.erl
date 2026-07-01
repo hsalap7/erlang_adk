@@ -78,18 +78,27 @@ build_contents([#{role := system, content := Content} | Rest], SysAcc, ContentsA
             _ -> <<SysAcc/binary, "\n", ContentBin/binary>>
         end,
     build_contents(Rest, NewSys, ContentsAcc);
-build_contents([#{role := tool, content := {tool_response, Name, ResponseMap}} | Rest], SysAcc, ContentsAcc) ->
-    Part = #{<<"functionResponse">> => #{
-        <<"name">> => to_binary(Name),
-        <<"response">> => ResponseMap
-    }},
-    Msg = #{<<"role">> => <<"user">>, <<"parts">> => [Part]},
+build_contents([#{role := tool} | _] = History, SysAcc, ContentsAcc) ->
+    %% Group consecutive tool responses into a single 'user' message
+    {ToolParts, Rest} = consume_tool_responses(History, []),
+    Msg = #{<<"role">> => <<"user">>, <<"parts">> => ToolParts},
     build_contents(Rest, SysAcc, [Msg | ContentsAcc]);
 build_contents([#{role := agent, content := {tool_calls, Calls}} | Rest], SysAcc, ContentsAcc) ->
-    Parts = [#{<<"functionCall">> => #{
-        <<"name">> => to_binary(Name),
-        <<"args">> => Args
-    }} || {Name, Args} <- Calls],
+    Parts = [begin
+        {Name, Args, Sig} = case Call of
+            {N, A} -> {N, A, undefined};
+            {N, A, S} -> {N, A, S}
+        end,
+        FuncCall = #{
+            <<"name">> => to_binary(Name),
+            <<"args">> => Args
+        },
+        Part0 = #{<<"functionCall">> => FuncCall},
+        case Sig of
+            undefined -> Part0;
+            _ -> Part0#{<<"thought_signature">> => Sig}
+        end
+    end || Call <- Calls],
     Msg = #{<<"role">> => <<"model">>, <<"parts">> => Parts},
     build_contents(Rest, SysAcc, [Msg | ContentsAcc]);
 build_contents([#{role := Role, content := Content} | Rest], SysAcc, ContentsAcc) ->
@@ -101,6 +110,26 @@ build_contents([#{role := Role, content := Content} | Rest], SysAcc, ContentsAcc
     Part = #{<<"text">> => to_binary(Content)},
     Msg = #{<<"role">> => GeminiRole, <<"parts">> => [Part]},
     build_contents(Rest, SysAcc, [Msg | ContentsAcc]).
+
+consume_tool_responses([#{role := tool, content := {tool_response, Name, ResponseMap, Sig}} | Rest], Acc) ->
+    FuncResp = #{
+        <<"name">> => to_binary(Name),
+        <<"response">> => ResponseMap
+    },
+    Part0 = #{<<"functionResponse">> => FuncResp},
+    Part1 = case Sig of
+        undefined -> Part0;
+        _ -> Part0#{<<"thoughtSignature">> => Sig}
+    end,
+    consume_tool_responses(Rest, [Part1 | Acc]);
+consume_tool_responses([#{role := tool, content := {tool_response, Name, ResponseMap}} | Rest], Acc) ->
+    Part = #{<<"functionResponse">> => #{
+        <<"name">> => to_binary(Name),
+        <<"response">> => ResponseMap
+    }},
+    consume_tool_responses(Rest, [Part | Acc]);
+consume_tool_responses(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
 
 build_gen_config(Config) ->
     Keys = [
@@ -122,12 +151,24 @@ build_gen_config(Config) ->
 
 parse_response(#{<<"candidates">> := [#{<<"content">> := #{<<"parts">> := Parts}} | _]}) ->
     %% Look for function calls first
-    ToolCalls = lists:filtermap(
+    ToolCallsWithSigs = lists:filtermap(
         fun
-            (#{<<"functionCall">> := #{<<"name">> := Name, <<"args">> := Args}}) ->
-                {true, {Name, Args}};
+            (Part = #{<<"functionCall">> := FuncCall}) ->
+                Name = maps:get(<<"name">>, FuncCall),
+                Args = maps:get(<<"args">>, FuncCall, #{}),
+                Sig = maps:get(<<"thoughtSignature">>, Part, undefined),
+                {true, {Name, Args, Sig}};
             (_) -> false
         end, Parts),
+    
+    %% Propagate the thought_signature to all tool calls in parallel array
+    GlobalSig = lists:foldl(fun
+        ({_, _, S}, _Acc) when S =/= undefined -> S;
+        (_, Acc) -> Acc
+    end, undefined, ToolCallsWithSigs),
+    
+    ToolCalls = [{N, A, GlobalSig} || {N, A, _} <- ToolCallsWithSigs],
+    
     case ToolCalls of
         [] ->
             %% Try to extract text

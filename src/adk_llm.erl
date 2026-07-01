@@ -4,6 +4,8 @@
 -type memory() :: list(map()).
 -type tools() :: list(module()).
 
+-export_type([config/0, memory/0, tools/0]).
+
 -callback generate(Config :: config(), Memory :: memory(), Tools :: tools()) ->
     {ok, binary() | string()} | {tool_calls, list()} | {error, term()}.
 
