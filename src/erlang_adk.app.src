@@ -1,0 +1,22 @@
+{application, erlang_adk,
+ [{description, "An Erlang client for integrating with the Google Accessory Development Kit (ADK)."},
+  {tags, ["google", "adk", "hardware", "android"]},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {erlang_adk_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    inets,
+    ssl,
+    cowboy,
+    telemetry,
+    mnesia,
+    jsx
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache-2.0"]},
+  {links, [{"GitHub", "https://github.com/google/erlang_adk"}]}
+ ]}.

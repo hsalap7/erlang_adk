@@ -1,0 +1,21 @@
+{"1.2.0",
+[{<<"cowboy">>,{pkg,<<"cowboy">>,<<"2.12.0">>},0},
+ {<<"cowlib">>,{pkg,<<"cowlib">>,<<"2.13.0">>},1},
+ {<<"jsx">>,
+  {git,"https://github.com/talentdeficit/jsx.git",
+       {ref,"1d3407aa9752430ec0a06111ac1b046ffafdca22"}},
+  0},
+ {<<"ranch">>,{pkg,<<"ranch">>,<<"1.8.0">>},1},
+ {<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.3.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"cowboy">>, <<"F276D521A1FF88B2B9B4C54D0E753DA6C66DD7BE6C9FCA3D9418B561828A3731">>},
+ {<<"cowlib">>, <<"DB8F7505D8332D98EF50A3EF34B34C1AFDDEC7506E4EE4DD4A3A266285D282CA">>},
+ {<<"ranch">>, <<"8C7A100A139FD57F17327B6413E4167AC559FBC04CA7448E9BE9057311597A1D">>},
+ {<<"telemetry">>, <<"FEDEBBAE410D715CF8E7062C96A1EF32EC22E764197F70CDA73D82778D61E7A2">>}]},
+{pkg_hash_ext,[
+ {<<"cowboy">>, <<"8A7ABE6D183372CEB21CAA2709BEC928AB2B72E18A3911AA1771639BEF82651E">>},
+ {<<"cowlib">>, <<"E1E1284DC3FC030A64B1AD0D8382AE7E99DA46C3246B815318A4B848873800A4">>},
+ {<<"ranch">>, <<"49FBCFD3682FAB1F5D109351B61257676DA1A2FDBE295904176D5E521A2DDFE5">>},
+ {<<"telemetry">>, <<"7015FC8919DBE63764F4B4B87A95B7C0996BD539E0D499BE6EC9D7F3875B79E6">>}]}
+].
