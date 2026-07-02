@@ -38,16 +38,12 @@ new(Agent, AppName, SessionSvc, Opts) ->
 %% This blocks until the entire invocation is complete.
 -spec run(Runner :: runner(), UserId :: binary(), SessionId :: binary(), Message :: term()) -> {ok, binary()} | {error, term()}.
 run(Runner, UserId, SessionId, Message) ->
-    case run_async(Runner, UserId, SessionId, Message) of
-        {ok, StreamPid} ->
-            collect_events(StreamPid, <<>>);
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    {ok, StreamPid} = run_async(Runner, UserId, SessionId, Message),
+    collect_events(StreamPid, <<>>).
 
 %% @doc Execute the agent asynchronously, returning a process ID that streams events.
-%% The returned PID will send `{adk_event, StreamPid, Event}` and `{adk_done, StreamPid}` messages.
--spec run_async(Runner :: runner(), UserId :: binary(), SessionId :: binary(), Message :: term()) -> {ok, pid()} | {error, term()}.
+%% The returned PID will send '{adk_event, StreamPid, Event}' and '{adk_done, StreamPid}' messages.
+-spec run_async(Runner :: runner(), UserId :: binary(), SessionId :: binary(), Message :: term()) -> {ok, pid()}.
 run_async(Runner, UserId, SessionId, Message) ->
     Caller = self(),
     StreamPid = spawn(fun() ->
@@ -95,7 +91,7 @@ resume(Runner, UserId, SessionId, ToolResponse) ->
             
             run_loop(Runner, UserId, SessionId, InvId, Caller)
         catch
-            E:R:S ->
+            _E:R:_S ->
                 Caller ! {adk_error, self(), R}
         end
     end),
@@ -160,7 +156,7 @@ run_loop(Runner, UserId, SessionId, InvId, Caller) ->
             SessionSvc:add_event(Runner#runner.app_name, UserId, SessionId, FinalEvent),
             Caller ! {adk_event, self(), FinalEvent},
             Caller ! {adk_done, self()};
-        {tool_calls, AgentEvent, ToolCalls} ->
+        {tool_calls, AgentEvent, _ToolCalls} ->
             %% Record Agent's tool call decision
             SessionSvc:add_event(Runner#runner.app_name, UserId, SessionId, AgentEvent),
             Caller ! {adk_event, self(), AgentEvent},
