@@ -7,7 +7,8 @@ generate(_Config, History, _Tools) ->
         true ->
             LastMsg = lists:last(History),
             case maps:get(content, LastMsg) of
-                "Trigger tool" -> {tool_calls, [{<<"dummy_tool">>, #{<<"arg">> => <<"val">>}}]};
+                <<"Trigger tool">> -> {tool_calls, [{<<"dummy_tool">>, #{<<"arg">> => <<"val">>}, undefined}]};
+                "Trigger tool" -> {tool_calls, [{<<"dummy_tool">>, #{<<"arg">> => <<"val">>}, undefined}]};
                 {tool_response, _, _, _} -> {ok, <<"Tool executed">>};
                 _ -> {ok, <<"Simulated response">>}
             end;

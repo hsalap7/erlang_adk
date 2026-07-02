@@ -11,11 +11,15 @@
 %% Legacy Session Structure: {SessionId, Memory}
 %% New Session Structure: {{AppName, UserId, SessionId}, StateMap, EventList, Timestamp}
 
-%% @doc Initialize the ETS table. Should be called by the application startup.
+%% @doc Initialize the session storage
 init() ->
-    %% We use public so the runner or agents can read/write directly for now,
-    %% though typically this would be wrapped in a gen_server for safety.
-    ets:new(?TABLE, [set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]).
+    case ets:info(adk_sessions) of
+        undefined ->
+            ets:new(adk_sessions, [set, public, named_table, {read_concurrency, true}, {write_concurrency, true}]);
+        _ ->
+            ok
+    end,
+    ok.
 
 %% --- Legacy API for backward compatibility ---
 save(SessionId, Memory) ->

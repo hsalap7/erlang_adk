@@ -8,9 +8,9 @@ generate(Config, Memory, Tools) ->
     Model = maps:get(model, Config, <<"gemini-3.5-flash">>),
     ApiKey = get_api_key(Config),
 
-    Url =
-        "https://generativelanguage.googleapis.com/v1beta/models/" ++
-            binary_to_list(Model) ++ ":generateContent?key=" ++ binary_to_list(ApiKey),
+    BaseUrl = maps:get(base_url, Config, <<"https://generativelanguage.googleapis.com">>),
+    Url = binary_to_list(BaseUrl) ++ "/v1beta/models/" ++
+          binary_to_list(Model) ++ ":generateContent?key=" ++ binary_to_list(ApiKey),
 
     %% Build the payload
     {SystemInstruction, Contents} = build_contents(Memory, <<>>, []),
@@ -62,8 +62,13 @@ stream(Config, Memory, Tools, Callback) ->
     Model = maps:get(model, Config, <<"gemini-1.5-flash">>),
     ApiKey = get_api_key(Config),
 
-    Host = "generativelanguage.googleapis.com",
-    Path = "/v1beta/models/" ++ binary_to_list(Model) ++ ":streamGenerateContent?alt=sse&key=" ++ binary_to_list(ApiKey),
+    BaseUrl = maps:get(base_url, Config, <<"https://generativelanguage.googleapis.com">>),
+    #{host := Host, path := BasePath, port := Port, scheme := Scheme} = uri_string:parse(BaseUrl),
+    PortNum = case Port of
+        undefined -> if Scheme == <<"https">> -> 443; true -> 80 end;
+        P -> P
+    end,
+    Path = binary_to_list(BasePath) ++ "/v1beta/models/" ++ binary_to_list(Model) ++ ":streamGenerateContent?alt=sse&key=" ++ binary_to_list(ApiKey),
 
     {SystemInstruction, Contents} = build_contents(Memory, <<>>, []),
 
@@ -93,7 +98,10 @@ stream(Config, Memory, Tools, Callback) ->
 
     %% Simplified Gun implementation for streaming
     %% In a real production system we'd manage the gun connection properly.
-    {ok, ConnPid} = gun:open(Host, 443, #{transport => tls}),
+    {ok, ConnPid} = case Scheme of
+        <<"https">> -> gun:open(binary_to_list(Host), PortNum, #{transport => tls});
+        <<"http">> -> gun:open(binary_to_list(Host), PortNum, #{transport => tcp})
+    end,
     case gun:await_up(ConnPid) of
         {ok, _Protocol} ->
             StreamRef = gun:post(ConnPid, Path, Headers, JsonBody),
