@@ -1,4 +1,4 @@
-# Erlang ADK v0.2.0
+# Erlang ADK v0.2.1
 
 An Erlang-native Agent Development Kit (ADK) designed to bring the capabilities of Google ADK 2.0 to the Erlang/OTP ecosystem. It leverages Erlang's robust OTP framework (processes, `gen_server`, and supervisors) to provide a scalable, observable, and highly concurrent multi-agent system.
 
