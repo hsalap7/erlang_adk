@@ -6,6 +6,8 @@
 -type session() :: map().
 -type session_meta() :: map().
 
+-export_type([session/0, session_meta/0]).
+
 -callback create_session(AppName :: binary(), UserId :: binary(), Opts :: map()) -> {ok, session()} | {error, term()}.
 -callback get_session(AppName :: binary(), UserId :: binary(), SessionId :: binary()) -> {ok, session()} | {error, not_found}.
 -callback list_sessions(AppName :: binary(), UserId :: binary()) -> {ok, [session_meta()]}.

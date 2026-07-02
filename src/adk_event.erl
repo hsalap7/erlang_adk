@@ -12,7 +12,7 @@
 -export_type([event/0]).
 
 %% @doc Create a new immutable event record with auto-generated ID and timestamp.
-%% Author is the name of the agent or <<"user">>.
+%% Author is the name of the agent or the binary string "user".
 %% Content can be text (binary), {tool_calls, List}, or {tool_response, ...}.
 -spec new(Author :: binary(), Content :: term()) -> event().
 new(Author, Content) ->

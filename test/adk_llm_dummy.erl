@@ -1,6 +1,6 @@
 -module(adk_llm_dummy).
 -behaviour(adk_llm).
--export([generate/3]).
+-export([generate/3, stream/4]).
 
 generate(_Config, History, _Tools) ->
     case length(History) > 0 of
@@ -14,3 +14,8 @@ generate(_Config, History, _Tools) ->
         false ->
             {ok, <<"Simulated response">>}
     end.
+
+stream(_Config, _History, _Tools, Callback) ->
+    Callback(<<"Simulated streaming chunk 1">>),
+    Callback(<<"Simulated streaming chunk 2">>),
+    ok.

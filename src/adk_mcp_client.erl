@@ -6,10 +6,7 @@
 
 -export([connect/2, list_tools/1, execute_tool/3, close/1]).
 
--record(mcp_client, {
-    transport :: binary(), %% <<"stdio">> | <<"sse">>
-    target    :: binary()
-}).
+
 
 %% @doc Connect to an MCP server.
 -spec connect(Transport :: binary(), Target :: binary()) -> {ok, pid() | map()} | {error, term()}.
