@@ -6,10 +6,7 @@
 
 -export([start/2, stop/1]).
 
--record(mcp_server, {
-    transport :: binary(),
-    tools     :: [module()]
-}).
+
 
 %% @doc Start an MCP server to expose the given tools.
 -spec start(Transport :: binary(), Tools :: [module()]) -> {ok, map()} | {error, term()}.

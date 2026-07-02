@@ -6,7 +6,7 @@
 
 -export([execute/3]).
 
-%% @doc Callback behaviour definition.
+%% Callback behaviour definition.
 -callback on_agent_start(AgentName :: binary(), Input :: term()) -> ok.
 -callback on_agent_end(AgentName :: binary(), Output :: term()) -> ok.
 -callback on_tool_start(ToolName :: binary(), Args :: map()) -> ok.

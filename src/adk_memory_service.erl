@@ -14,10 +14,12 @@
     score => float()
 }.
 
+-export_type([query/0, filter/0, result/0]).
+
 -callback init(Config :: map()) -> {ok, pid()} | {error, term()}.
 -callback add(Pid :: pid(), Content :: binary(), Metadata :: map()) -> {ok, binary()} | {error, term()}.
 -callback search(Pid :: pid(), Query :: query(), Filter :: filter(), Limit :: pos_integer()) -> {ok, [result()]} | {error, term()}.
 -callback delete(Pid :: pid(), Id :: binary()) -> ok | {error, term()}.
 
-%% @doc Helper to index an entire session's events into long term memory.
+%% Helper to index an entire session's events into long term memory.
 -callback add_session_to_memory(Pid :: pid(), SessionId :: binary(), Events :: [adk_event:event()]) -> ok | {error, term()}.
