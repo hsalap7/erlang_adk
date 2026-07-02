@@ -1,7 +1,7 @@
 -module(adk_agent).
 -behaviour(gen_server).
 
--export([start_link/3, prompt/2, delegate/2, delegate/3]).
+-export([start_link/3, prompt/2, delegate/2, delegate/3, run_with_events/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -26,6 +26,10 @@ delegate(Pid, Message) ->
 
 delegate(Pid, Message, ReplyToPid) ->
     gen_server:cast(Pid, {delegate, Message, ReplyToPid}).
+
+%% @doc Run the agent using the new Event-based architecture.
+run_with_events(Pid, HistoryEvents, InvocationId) ->
+    gen_server:call(Pid, {run_with_events, HistoryEvents, InvocationId}, 60000).
 
 %% Gen Server Callbacks
 init([Name, LLMConfig, Tools]) ->
@@ -69,6 +73,35 @@ handle_call({prompt, Message}, _From, State) ->
     true -> ok end,
     
     {reply, {ok, Response}, State#state{memory = Memory2}};
+
+handle_call({run_with_events, HistoryEvents, InvocationId}, _From, State) ->
+    telemetry:execute([erlang_adk, agent, run_with_events, start], #{}, #{agent => State#state.name}),
+    StartTime = erlang:monotonic_time(millisecond),
+    
+    %% Convert incoming events to legacy history format for the LLM
+    LegacyHistory = adk_memory:from_events(HistoryEvents),
+    
+    Result = case adk_llm:generate(State#state.llm_config, adk_memory:get_history(LegacyHistory), State#state.tools) of
+        {ok, Text} ->
+            ResponseText = unicode:characters_to_list(Text),
+            FinalEvent = adk_event:new(list_to_binary(State#state.name), ResponseText, #{
+                invocation_id => InvocationId, 
+                is_final => true
+            }),
+            {ok, FinalEvent};
+        {tool_calls, Calls} ->
+            AgentEvent = adk_event:new(list_to_binary(State#state.name), {tool_calls, Calls}, #{
+                invocation_id => InvocationId
+            }),
+            {tool_calls, AgentEvent, Calls};
+        {error, Reason} ->
+            {error, Reason}
+    end,
+    
+    Duration = erlang:monotonic_time(millisecond) - StartTime,
+    telemetry:execute([erlang_adk, agent, run_with_events, stop], #{duration => Duration}, #{agent => State#state.name}),
+    
+    {reply, Result, State};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
