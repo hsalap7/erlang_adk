@@ -96,7 +96,7 @@ build_contents([#{role := agent, content := {tool_calls, Calls}} | Rest], SysAcc
         Part0 = #{<<"functionCall">> => FuncCall},
         case Sig of
             undefined -> Part0;
-            _ -> Part0#{<<"thought_signature">> => Sig}
+            _ -> Part0#{<<"thoughtSignature">> => Sig}
         end
     end || Call <- Calls],
     Msg = #{<<"role">> => <<"model">>, <<"parts">> => Parts},
@@ -161,7 +161,7 @@ parse_response(#{<<"candidates">> := [#{<<"content">> := #{<<"parts">> := Parts}
             (_) -> false
         end, Parts),
     
-    %% Propagate the thought_signature to all tool calls in parallel array
+    %% Propagate the thoughtSignature to all tool calls in parallel array
     GlobalSig = lists:foldl(fun
         ({_, _, S}, _Acc) when S =/= undefined -> S;
         (_, Acc) -> Acc
