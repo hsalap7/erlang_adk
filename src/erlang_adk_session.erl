@@ -81,6 +81,9 @@ add_event(AppName, UserId, SessionId, Event) ->
     true -> ok
     end,
     
+    %% Strip temp: keys after applying delta (temp keys are single-turn only)
+    strip_temp_keys(AppName, UserId, SessionId),
+    
     %% Then append the event
     case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
         [{{AppName, UserId, SessionId}, State, Events, _Ts}] ->
@@ -100,7 +103,38 @@ generate_id() ->
 merge_state(State, Delta) ->
     maps:merge(State, Delta).
 
-update_global_states(_AppName, _UserId, _Delta) ->
-    %% Implementation for user: and app: prefix state sharing across sessions would go here
-    %% For now, they are stored locally in the session.
+strip_temp_keys(AppName, UserId, SessionId) ->
+    case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
+        [{{AppName, UserId, SessionId}, State, Events, Ts}] ->
+            Cleaned = maps:filter(fun(K, _) ->
+                not (is_binary(K) andalso binary:match(K, <<"temp:">>) =:= {0, 5})
+            end, State),
+            case map_size(Cleaned) =:= map_size(State) of
+                true -> ok;
+                false -> ets:insert(?TABLE, {{AppName, UserId, SessionId}, Cleaned, Events, Ts})
+            end;
+        [] -> ok
+    end.
+
+update_global_states(AppName, UserId, Delta) ->
+    UserDelta = maps:filter(fun(K, _) -> is_binary(K) andalso binary:match(K, <<"user:">>) =:= {0, 5} end, Delta),
+    AppDelta = maps:filter(fun(K, _) -> is_binary(K) andalso binary:match(K, <<"app:">>) =:= {0, 4} end, Delta),
+    
+    if map_size(UserDelta) > 0 ->
+        UserMatch = [{{{AppName, UserId, '_'}, '_', '_', '_'}, [], ['$_']}],
+        UserSessions = ets:select(?TABLE, UserMatch),
+        lists:foreach(fun({{A, U, S}, State, Events, Ts}) ->
+            Merged = merge_state(State, UserDelta),
+            ets:insert(?TABLE, {{A, U, S}, Merged, Events, Ts})
+        end, UserSessions);
+    true -> ok end,
+    
+    if map_size(AppDelta) > 0 ->
+        AppMatch = [{{{AppName, '_', '_'}, '_', '_', '_'}, [], ['$_']}],
+        AppSessions = ets:select(?TABLE, AppMatch),
+        lists:foreach(fun({{A, U, S}, State, Events, Ts}) ->
+            Merged = merge_state(State, AppDelta),
+            ets:insert(?TABLE, {{A, U, S}, Merged, Events, Ts})
+        end, AppSessions);
+    true -> ok end,
     ok.

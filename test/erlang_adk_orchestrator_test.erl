@@ -7,6 +7,8 @@ dummy_agent() ->
         {'$gen_call', From, {prompt, Msg}} ->
             gen_server:reply(From, {ok, <<"Resp: ", Msg/binary>>}),
             dummy_agent();
+        stop ->
+            ok;
         _ ->
             dummy_agent()
     end.
@@ -22,7 +24,9 @@ test_sequential() ->
     Pid2 = spawn(fun dummy_agent/0),
     
     Result = erlang_adk_orchestrator:sequential([Pid1, Pid2], <<"Hi">>),
-    ?assertEqual({ok, <<"Resp: Resp: Hi">>}, Result).
+    ?assertEqual({ok, <<"Resp: Resp: Hi">>}, Result),
+    Pid1 ! stop,
+    Pid2 ! stop.
 
 test_parallel() ->
     Pid1 = spawn(fun dummy_agent/0),
@@ -35,4 +39,6 @@ test_parallel() ->
     HasPid1 = lists:keymember(Pid1, 1, ResultList),
     HasPid2 = lists:keymember(Pid2, 1, ResultList),
     ?assert(HasPid1),
-    ?assert(HasPid2).
+    ?assert(HasPid2),
+    Pid1 ! stop,
+    Pid2 ! stop.

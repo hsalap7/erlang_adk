@@ -93,7 +93,7 @@ execute_node(CompiledGraph, NodeName, State) ->
                 execute_node(CompiledGraph, NextNode, NewState)
             catch
                 E:R:S ->
-                    io:format("Graph execution error at ~p: ~p:~p~n~p~n", [NodeName, E, R, S]),
+                    logger:error("Graph execution error at ~p: ~p:~p~n~p", [NodeName, E, R, S]),
                     {error, {node_execution_failed, NodeName, R}}
             end;
         error ->

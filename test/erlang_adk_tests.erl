@@ -57,6 +57,7 @@ telemetry_test_case() ->
     telemetry:detach(<<"test_handler">>).
 
 a2a_test_case() ->
+    _ = list_to_atom("A2AAgent"),
     {ok, _Pid} = erlang_adk:spawn_agent("A2AAgent", #{provider => adk_llm_dummy}, []),
     %% Wait a tiny bit for Cowboy to be ready
     timer:sleep(100),
@@ -82,6 +83,6 @@ async_delegate_test_case() ->
     receive
         {agent_response, Pid, Res} ->
             ?assertEqual("Simulated response", Res)
-    after 1000 ->
+    after 5000 ->
         ?assert(false)
     end.

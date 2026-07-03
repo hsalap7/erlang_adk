@@ -11,11 +11,11 @@
 %% @doc Start an MCP server to expose the given tools.
 -spec start(Transport :: binary(), Tools :: [module()]) -> {ok, map()} | {error, term()}.
 start(<<"stdio">>, Tools) ->
-    io:format("Starting MCP server via stdio~n"),
+    logger:info("Starting MCP server via stdio"),
     %% A real implementation would listen on standard input and write to standard output
     {ok, #{transport => <<"stdio">>, tools => Tools}};
 start(<<"sse">>, Tools) ->
-    io:format("Starting MCP server via SSE~n"),
+    logger:info("Starting MCP server via SSE"),
     %% A real implementation would start a cowboy web server
     {ok, #{transport => <<"sse">>, tools => Tools}}.
 

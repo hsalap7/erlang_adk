@@ -46,7 +46,7 @@ run(Runner, UserId, SessionId, Message) ->
 -spec run_async(Runner :: runner(), UserId :: binary(), SessionId :: binary(), Message :: term()) -> {ok, pid()}.
 run_async(Runner, UserId, SessionId, Message) ->
     Caller = self(),
-    StreamPid = spawn(fun() ->
+    StreamPid = proc_lib:spawn(fun() ->
         try
             %% 1. Ensure session exists
             ensure_session(Runner, UserId, SessionId),
@@ -66,7 +66,7 @@ run_async(Runner, UserId, SessionId, Message) ->
             run_loop(Runner, UserId, SessionId, InvId, Caller)
         catch
             E:R:S ->
-                io:format("Runner Async Error: ~p:~p~n~p~n", [E, R, S]),
+                logger:error("Runner Async Error: ~p:~p~n~p", [E, R, S]),
                 Caller ! {adk_error, self(), R}
         end
     end),
@@ -77,7 +77,7 @@ run_async(Runner, UserId, SessionId, Message) ->
 resume(Runner, UserId, SessionId, ToolResponse) ->
     %% For HITL resume, we inject the tool response and re-start the loop.
     Caller = self(),
-    StreamPid = spawn(fun() ->
+    StreamPid = proc_lib:spawn(fun() ->
         try
             %% Determine InvId from previous state (omitted for brevity, assume new one or loaded)
             InvId = generate_invocation_id(),
@@ -156,17 +156,59 @@ run_loop(Runner, UserId, SessionId, InvId, Caller) ->
             SessionSvc:add_event(Runner#runner.app_name, UserId, SessionId, FinalEvent),
             Caller ! {adk_event, self(), FinalEvent},
             Caller ! {adk_done, self()};
-        {tool_calls, AgentEvent, _ToolCalls} ->
+        {tool_calls, AgentEvent, Calls} ->
             %% Record Agent's tool call decision
             SessionSvc:add_event(Runner#runner.app_name, UserId, SessionId, AgentEvent),
             Caller ! {adk_event, self(), AgentEvent},
             
-            %% Execute tools (pseudo-code, delegated to tool runner)
-            %% For each tool, we generate a tool response event, save to session, send to caller, and loop.
-            %% Tool execution skipped here for brevity, assuming dummy result for now to break loop
+            {ok, Tools, SubAgents} = adk_agent:get_tools(Runner#runner.agent),
+            execute_runner_tools(Runner, UserId, SessionId, InvId, Caller, Calls, Tools, SubAgents),
             
             %% Loop back
             run_loop(Runner, UserId, SessionId, InvId, Caller);
         {error, Reason} ->
             Caller ! {adk_error, self(), Reason}
     end.
+
+%% @private Execute tools iteratively, capturing adk_pause for HITL.
+execute_runner_tools(_Runner, _UserId, _SessionId, _InvId, _Caller, [], _Tools, _SubAgents) -> ok;
+execute_runner_tools(Runner, UserId, SessionId, InvId, Caller, [Call | Rest], Tools, SubAgents) ->
+    {NameBin, ArgsMap, Sig} = case Call of
+        {N, A} -> {N, A, undefined};
+        {N, A, S} -> {N, A, S}
+    end,
+    
+    FoundTool = lists:search(
+        fun(Mod) ->
+            Schema = Mod:schema(),
+            maps:get(<<"name">>, Schema, atom_to_binary(Mod, utf8)) == NameBin
+        end, Tools),
+        
+    Result = case FoundTool of
+        {value, Mod} ->
+            Context = #{session_id => SessionId, user_id => UserId, state_ref => Runner#runner.session_svc},
+            case catch Mod:execute(ArgsMap, Context) of
+                {ok, Res} -> #{<<"success">> => true, <<"result">> => adk_agent:format_result(Res)};
+                {error, Reason} -> #{<<"success">> => false, <<"error">> => adk_agent:format_result(Reason)};
+                {'EXIT', Reason} -> #{<<"success">> => false, <<"error">> => adk_agent:format_result(Reason)};
+                {adk_pause, Reason, Summary} -> erlang:throw({adk_pause, Reason, Summary})
+            end;
+        false ->
+            case maps:find(NameBin, SubAgents) of
+                {ok, SubPid} ->
+                    SubPrompt = maps:get(<<"prompt">>, ArgsMap, <<"">>),
+                    case adk_agent:prompt(SubPid, binary_to_list(SubPrompt)) of
+                        {ok, SubRes} -> #{<<"success">> => true, <<"result">> => adk_agent:format_result(SubRes)};
+                        {error, SubErr} -> #{<<"success">> => false, <<"error">> => adk_agent:format_result(SubErr)}
+                    end;
+                error ->
+                    #{<<"success">> => false, <<"error">> => <<"Tool not found">>}
+            end
+    end,
+    
+    ToolEvent = adk_event:new(<<"tool">>, {tool_response, NameBin, Result, Sig}, #{invocation_id => InvId}),
+    SessionSvc = Runner#runner.session_svc,
+    SessionSvc:add_event(Runner#runner.app_name, UserId, SessionId, ToolEvent),
+    Caller ! {adk_event, self(), ToolEvent},
+    
+    execute_runner_tools(Runner, UserId, SessionId, InvId, Caller, Rest, Tools, SubAgents).

@@ -60,7 +60,7 @@ parallel(Pids, Prompt) ->
         Parent = self(),
         Refs = lists:map(fun(Pid) ->
             Ref = make_ref(),
-            spawn(fun() -> Parent ! {Ref, Pid, erlang_adk:prompt(Pid, Input)} end),
+            proc_lib:spawn(fun() -> Parent ! {Ref, Pid, erlang_adk:prompt(Pid, Input)} end),
             Ref
         end, Pids),
         

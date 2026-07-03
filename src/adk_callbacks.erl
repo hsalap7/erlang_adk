@@ -22,7 +22,7 @@ execute(Handlers, Hook, Args) ->
                 try erlang:apply(Handler, Hook, Args)
                 catch
                     E:R:S ->
-                        io:format("Callback error in ~p:~p - ~p:~p~n~p~n", [Handler, Hook, E, R, S])
+                        logger:error("Callback error in ~p:~p - ~p:~p~n~p", [Handler, Hook, E, R, S])
                 end;
             false -> ok
         end

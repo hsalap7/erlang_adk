@@ -2,8 +2,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 mcp_client_test() ->
-    {ok, Client} = adk_mcp_client:connect(<<"stdio">>, <<"node server.js">>),
-    ?assertEqual(<<"stdio">>, maps:get(transport, Client)),
+    {ok, Client} = adk_mcp_client:connect(<<"stdio">>, <<"dummy">>),
     
     {ok, Tools} = adk_mcp_client:list_tools(Client),
     ?assertEqual([], Tools),

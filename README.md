@@ -1,4 +1,4 @@
-# Erlang ADK v0.2.1
+# Erlang ADK v0.2.4
 
 An Erlang-native Agent Development Kit (ADK) designed to bring the capabilities of Google ADK 2.0 to the Erlang/OTP ecosystem. It leverages Erlang's robust OTP framework (processes, `gen_server`, and supervisors) to provide a scalable, observable, and highly concurrent multi-agent system.
 
@@ -8,23 +8,21 @@ It features native integration with Google Gemini, allowing your agents to inter
 
 ## Features (ADK 2.0 Feature Parity)
 
-- **Graph-Based Workflows**: Decouple execution from LLMs using `adk_graph`. Build workflows with nodes, deterministic edges, and conditional branching.
-- **Multi-Agent Systems**: Create teams of specialized agents that collaborate. An agent can act as a tool for another agent using `adk_agent_tool`.
-- **Model Context Protocol (MCP)**: Connect agents to external data sources. Includes both an MCP Client (`adk_mcp_client`) and Server (`adk_mcp_server`).
-- **Human-in-the-Loop (HITL)**: Built-in primitives to pause workflows mid-run (`adk_long_running_tool`), ask for human approval, and resume later.
-- **Session Management**: Full state scoping (`user:`, `app:`, `temp:`) and session persistence via ETS or Mnesia (`adk_session_service`).
-- **Long-term Semantic Memory**: Dedicated `adk_memory_service` for storing and searching past interactions across sessions.
-- **Callbacks**: Hook into the execution lifecycle with `before_agent`, `after_tool`, etc., using `adk_callbacks`.
-- **Streaming**: Stream Gemini responses directly via `gun` integration for low latency.
-- **Evaluation Framework**: Evaluate agent performance against datasets using `adk_eval`.
-- **Resiliency**: Built-in exponential backoff via `adk_retry`.
-- **Agent Orchestrators**: Backward-compatible orchestrators (`sequential`, `parallel`, `loop`).
-- **Agent-to-Agent (A2A)**: HTTP-based communication between agents.
-- **Observability**: Built-in `telemetry` integration.
+1. **Agent-to-Agent Delegation**: Expose agents as tools via `adk_agent_tool`.
+2. **Graph-based Orchestration**: Compose multiple agents into directed graphs with conditional branching using `adk_graph`.
+3. **Tool Execution**: Agents can securely invoke functions or sub-agents defined in a module with `-behaviour(adk_tool)`.
+4. **Session Management**: Built-in persistence for sessions across Mnesia, ETS, and state-scoping (`user:`, `app:`, `temp:` prefixes).
+5. **Telemetry & Observability**: Standard `telemetry` events emitted for all agent lifecycles, enabling easy integration with Datadog/Prometheus.
+6. **Event-Driven Architecture**: High-performance async runner loop emitting SSE-friendly ADK events.
+7. **Human-in-the-Loop (HITL)**: First-class support for pausing agents to await human approval using `adk_long_running_tool`.
+8. **Evaluation Framework**: Evaluate agent performance against datasets using `adk_eval`.
+9. **Resiliency**: Built-in exponential backoff via `adk_retry`.
+10. **MCP Integration**: Connect to external MCP servers for tool discovery via `adk_mcp_client`.
+11. **Callbacks**: Hook into the execution lifecycle with `before_model`, `after_model`, etc., using `adk_callbacks`.
 
 ---
 
-## Quickstart
+## Installation
 
 Add `erlang_adk` as a dependency in your `rebar.config`:
 
@@ -47,243 +45,350 @@ Before spawning an agent, make sure your API key is available:
 export GEMINI_API_KEY="your_api_key_here"
 ```
 
+---
+
+## Quickstart
+
 ### Basic LLM Agent
 
 Spawn an agent and prompt it:
 
 ```erlang
 %% Define agent configuration
-Config = #{
-    name => <<"WeatherAgent">>,
-    description => <<"An agent that checks the weather.">>,
-    model => <<"gemini-1.5-flash">>
+LLMConfig = #{
+    provider => adk_llm_gemini,
+    instructions => <<"You are a helpful weather assistant.">>,
+    model => <<"gemini-2.5-flash">>
 },
 
-%% Spawn the agent
-{ok, Pid} = erlang_adk:spawn_agent(Config, [], [my_weather_tool]),
+%% Spawn the agent (Name, LLMConfig, Tools)
+{ok, Pid} = erlang_adk:spawn_agent("WeatherAgent", LLMConfig, [my_weather_tool]),
 
-%% Prompt the agent
-{ok, Response} = erlang_adk:prompt(Pid, <<"What is the weather in Tokyo?">>).
+%% Prompt the agent synchronously
+{ok, Response} = erlang_adk:prompt(Pid, "What is the weather in Tokyo?"),
 io:format("Response: ~s~n", [Response]).
+```
+
+### Async Delegation
+
+Fire-and-forget or receive results asynchronously:
+
+```erlang
+%% Fire and forget
+ok = erlang_adk:delegate(Pid, "Do background task").
+
+%% Receive reply when done
+erlang_adk:delegate(Pid, "Summarize this", self()),
+receive
+    {agent_response, Pid, Result} -> io:format("Got: ~s~n", [Result])
+end.
+```
+
+---
+
+## Tools
+
+Implement the `adk_tool` behaviour to expose functions to your agent. Each tool receives its arguments and a `Context` map containing `session_id`, `user_id`, and `state_ref`:
+
+```erlang
+-module(my_weather_tool).
+-behaviour(adk_tool).
+-export([schema/0, execute/2]).
+
+schema() ->
+    #{<<"name">> => <<"get_weather">>,
+      <<"description">> => <<"Get current weather for a city">>,
+      <<"parameters">> => #{
+          <<"type">> => <<"object">>,
+          <<"properties">> => #{
+              <<"city">> => #{<<"type">> => <<"string">>}
+          },
+          <<"required">> => [<<"city">>]
+      }}.
+
+execute(#{<<"city">> := City}, _Context) ->
+    {ok, <<"Sunny in ", City/binary>>}.
+```
+
+---
+
+## Multi-Agent Systems
+
+### Sequential & Parallel Orchestration
+
+Manage multiple agents as sequential or parallel pipelines:
+
+```erlang
+{ok, Agent1} = erlang_adk:spawn_agent("Translator", #{provider => adk_llm_dummy, instructions => "Translate to French."}, []),
+{ok, Agent2} = erlang_adk:spawn_agent("Summarizer", #{provider => adk_llm_dummy, instructions => "Summarize the text."}, []),
+
+%% Run sequentially — output of Agent1 feeds into Agent2
+{ok, Result} = erlang_adk:sequential([Agent1, Agent2], "Hello world").
+
+%% Run in parallel — all agents receive the same prompt
+Results = erlang_adk:parallel([Agent1, Agent2], "Hello world").
+%% Returns [{Pid1, Response1}, {Pid2, Response2}]
+```
+
+### Iterative Loop (Worker/Reviewer Pattern)
+
+```erlang
+{ok, Worker} = erlang_adk:spawn_agent("Writer", #{provider => adk_llm_gemini}, []),
+{ok, Reviewer} = erlang_adk:spawn_agent("Editor", #{provider => adk_llm_gemini}, []),
+
+%% Worker drafts, Reviewer critiques, loop up to 3 times until "APPROVED"
+{ok, FinalDraft} = erlang_adk:loop(Worker, Reviewer, "Write a poem about Erlang", 3).
+```
+
+### Sub-Agent Routing
+
+Register sub-agents so the LLM can delegate to them as tools:
+
+```erlang
+{ok, SubAgent} = erlang_adk:spawn_agent("SearchAgent", #{provider => adk_llm_gemini}, [search_tool]),
+
+%% Pass sub_agents map in config — keys are tool names the LLM will call
+MasterConfig = #{
+    provider => adk_llm_gemini,
+    instructions => "You coordinate research tasks.",
+    sub_agents => #{<<"SearchAgent">> => SubAgent}
+},
+{ok, Master} = erlang_adk:spawn_agent("Master", MasterConfig, []).
+```
+
+### Agent-as-Tool
+
+Wrap an agent as a tool for explicit invocation:
+
+```erlang
+Config = #{name => <<"ResearchAgent">>, description => <<"Performs deep research">>},
+Schema = adk_agent_tool:schema(Config),
+
+%% Execute it
+{ok, Result} = adk_agent_tool:execute(SubAgentPid, #{<<"prompt">> => <<"Find info on OTP">>}, #{}).
 ```
 
 ---
 
 ## Graph-Based Workflows
 
-Agents and functions can be orchestrated using Graph Workflows (`adk_graph`), which decouple logic from LLM reasoning. This allows complex control flow (loops, branches, retries).
+Agents and functions can be orchestrated using directed graphs with `adk_graph`, which decouple logic from LLM reasoning. This allows complex control flow (loops, branches, retries).
 
 ```erlang
 %% 1. Create a new graph
-G0 = adk_graph:new(<<"MyWorkflow">>, []),
+G0 = adk_graph:new(),
 
-%% 2. Define a simple function node
-NodeFn = fun(State) -> #{<<"count">> => maps:get(<<"count">>, State, 0) + 1} end,
-G1 = adk_graph:add_node(G0, adk_graph_node:function_node(<<"increment">>, NodeFn)),
+%% 2. Define a function node
+CounterFn = fun(State) ->
+    #{<<"count">> => maps:get(<<"count">>, State, 0) + 1}
+end,
+G1 = adk_graph:add_node(G0, counter, CounterFn),
 
 %% 3. Add a conditional edge
 CondFn = fun(State) ->
-    if maps:get(<<"count">>, State) < 3 -> <<"increment">>;
-       true -> <<"end_node">>
+    case maps:get(<<"count">>, State) < 3 of
+        true -> counter;
+        false -> end_node
     end
 end,
-G2 = adk_graph:add_edge(G1, <<"increment">>, cond_target, CondFn),
+G2 = adk_graph:add_conditional_edge(G1, counter, CondFn),
 
-%% 4. Execute the workflow
-{ok, Compiled} = adk_graph:compile(G2),
-{ok, FinalState} = adk_graph:execute(Compiled, #{<<"count">> => 0}).
-```
-
----
-
-## Multi-Agent Systems & Agent-as-Tool
-
-An entire agent can act as a tool for another agent using `adk_agent_tool`. This allows a master agent to delegate complex tasks to sub-agents.
-
-```erlang
-%% 1. Spawn a sub-agent
-SubConfig = #{name => <<"ResearchAgent">>, description => <<"Finds info">>},
-{ok, SubPid} = erlang_adk:spawn_agent(SubConfig, [], [search_tool]),
-
-%% 2. Wrap it as a tool
-AgentTool = adk_agent_tool:new(SubPid, #{skip_summarization => false}),
-
-%% 3. Spawn a master agent equipped with the sub-agent
-MasterConfig = #{name => <<"Master">>, description => <<"Coordinates research">>},
-{ok, MasterPid} = erlang_adk:spawn_agent(MasterConfig, [], [AgentTool]),
-
-%% 4. Prompt the master agent
-{ok, Result} = erlang_adk:prompt(MasterPid, <<"Research quantum computing.">>).
+%% 4. Set entry point, compile, and run
+G3 = adk_graph:set_entry_point(G2, counter),
+{ok, Compiled} = adk_graph:compile(G3),
+{ok, FinalState} = adk_graph:run(Compiled, #{<<"count">> => 0}).
+%% FinalState = #{<<"count">> => 3}
 ```
 
 ---
 
 ## Human-in-the-Loop (HITL)
 
-Suspend execution and wait for human input using the built-in pause mechanism (`adk_long_running_tool`). 
+Pause execution mid-workflow to await human approval using `adk_long_running_tool`:
 
 ```erlang
-%% 1. Wrap a dangerous tool to require human approval
-SafeTool = adk_long_running_tool:new(format_hard_drive_tool),
+%% 1. Include the HITL tool in your agent's tool list
+{ok, Pid} = erlang_adk:spawn_agent("SafeAgent", LLMConfig, [adk_long_running_tool, my_tool]),
 
-%% 2. The agent executes it and pauses
-Result = adk_tool:execute(SafeTool, #{<<"disk">> => <<"C:">>}),
-%% -> returns {pending, PauseToken} and hibernates the agent
+%% 2. When the LLM calls "request_human_approval", the runner pauses
+%%    by throwing {adk_pause, human_in_the_loop, Summary}
 
-%% 3. The UI or a human reviews the action and resumes the agent
-adk_runner:resume(Runner, UserId, SessionId, PauseToken, <<"Approved">>).
+%% 3. Resume with the Event-Driven Runner
+Runner = adk_runner:new(Pid, <<"my_app">>, erlang_adk_session),
+{ok, StreamPid} = adk_runner:resume(Runner, <<"user1">>, <<"sess1">>, <<"Approved">>).
+```
+
+---
+
+## Event-Driven Runner (ADK 2.0 Architecture)
+
+The `adk_runner` module provides the event-driven execution model:
+
+```erlang
+%% Create a runner
+Runner = adk_runner:new(AgentPid, <<"my_app">>, erlang_adk_session),
+
+%% Synchronous execution
+{ok, Response} = adk_runner:run(Runner, <<"user1">>, <<"session1">>, <<"Hello">>).
+
+%% Asynchronous execution — receive events as messages
+{ok, StreamPid} = adk_runner:run_async(Runner, <<"user1">>, <<"session1">>, <<"Hello">>),
+receive
+    {adk_event, StreamPid, Event} -> io:format("Event: ~p~n", [Event]);
+    {adk_done, StreamPid} -> io:format("Done!~n");
+    {adk_error, StreamPid, Reason} -> io:format("Error: ~p~n", [Reason])
+end.
 ```
 
 ---
 
 ## Session Management
 
-ADK 2.0 introduces Scoped State prefixes for advanced state management across turns:
+### Scoped State Prefixes
 
-- Keys without a prefix are **session-scoped** (cleared when the session ends).
-- Keys starting with `<<"user:">>` are **user-scoped** (shared across all sessions for a user).
-- Keys starting with `<<"app:">>` are **app-scoped** (shared globally across all users).
-- Keys starting with `<<"temp:">>` are **temporary** (discarded after a single interaction turn).
+ADK 2.0 introduces scoped state for managing data across sessions:
+
+- **No prefix**: Session-scoped (cleared when the session ends)
+- `<<"user:key">>`: User-scoped (shared across all sessions for a user)
+- `<<"app:key">>`: App-scoped (shared globally across all users)
+- `<<"temp:key">>`: Temporary (stripped after each interaction turn)
 
 ```erlang
 StateDelta = #{
     <<"user:preferences">> => <<"dark_mode">>,
+    <<"app:global_counter">> => 42,
     <<"temp:cache">> => <<"transient_data">>
 },
-adk_session_service:update_state(<<"MyApp">>, <<"User1">>, <<"SessionX">>, StateDelta).
+erlang_adk_session:update_state(<<"MyApp">>, <<"User1">>, <<"SessionX">>, StateDelta).
 ```
 
----
-
-## Long-term Memory
-
-Automatically extract facts from sessions and index them into long-term memory for future retrieval.
+### Session Storage Backends
 
 ```erlang
-%% Add a completed session to long-term memory
-adk_memory_service:add_session_to_memory(Session),
+%% ETS-backed (default, in-memory)
+{ok, Pid} = erlang_adk:spawn_agent("Agent", #{
+    provider => adk_llm_dummy,
+    session_id => my_session
+}, []).
 
-%% Later, search memory for context
-{ok, Memories} = adk_memory_service:search(Pid, <<"user prefers dark mode">>, #{}, 5).
-```
-
----
-
-## MCP Integration
-
-### MCP Client (Connecting to External Servers)
-
-Connect to any external Model Context Protocol (MCP) server (e.g. running on Node.js or Python) and use its tools in Erlang.
-
-```erlang
-%% Connect via stdio
-{ok, Client} = adk_mcp_client:connect(<<"stdio">>, <<"node server.js">>),
-
-%% Wrap all external tools as Erlang ADK tools
-McpTools = adk_mcp_client:as_adk_tools(Client),
-
-%% Pass them to your agent
-erlang_adk:spawn_agent(Config, [], McpTools).
-```
-
-### MCP Server (Exposing Agents as Tools)
-
-Start an MCP server in Erlang to expose your agents and functions to MCP clients like Claude Desktop.
-
-```erlang
-%% Start an SSE MCP server exposing specific tools/agents
-{ok, Server} = adk_mcp_server:start(<<"sse">>, [my_erlang_tool, AgentTool]),
-```
-
----
-
-## Callbacks
-
-Hook into the lifecycle of agents and tools. Callbacks can even override tool results or skip execution entirely.
-
-```erlang
--module(my_audit_callback).
--behaviour(adk_callbacks).
-
-before_tool(ToolName, Args, _Context) ->
-    io:format("Executing ~s with ~p~n", [ToolName, Args]),
-    ok. %% Return {skip, Reason} to prevent execution
-```
-
-Attach callbacks via agent config:
-```erlang
-Config = #{callbacks => [my_audit_callback]},
-```
-
----
-
-## Evaluation Framework
-
-Test your agents against deterministic JSON datasets.
-
-```erlang
-%% Define test configuration
-EvalConfig = #{
-    criteria => #{tool_trajectory_avg_score => 0.8},
-    match_type => <<"in_order">>
-},
-
-%% Run the evaluation suite
-{ok, Results} = adk_eval:evaluate(AgentConfig, "test_data.json", EvalConfig),
-io:format("Score: ~p~n", [Results]).
-```
-
----
-
-## Streaming
-
-Stream responses directly from the LLM (useful for chat UIs).
-
-```erlang
-Callback = fun(Chunk) -> io:format("~s", [Chunk]) end,
-{ok, StreamPid} = adk_llm_gemini:stream(LLMConfig, History, Tools, Callback).
-```
-
----
-
-## Retry Configuration
-
-Wrap tools or API calls with robust exponential backoff.
-
-```erlang
-%% Configure max 5 attempts, 1000ms base delay, 2.0x multiplier
-RetryConf = adk_retry:new(#{max_attempts => 5, backoff_ms => 1000, backoff_mult => 2.0}),
-
-%% Execute a flaky function
-adk_retry:with_retry(fun() -> flaky_network_call() end, RetryConf).
+%% Mnesia-backed (persistent, distributed)
+{ok, Pid} = erlang_adk:spawn_agent("Agent", #{
+    provider => adk_llm_dummy,
+    session_id => my_session,
+    session_store => erlang_adk_session_mnesia
+}, []).
 ```
 
 ---
 
 ## Observability (Telemetry)
 
-The Erlang ADK uses the `telemetry` library. You can monitor latency and attach handlers to these events:
+The Erlang ADK instruments all major operations using the standard `telemetry` library:
 
-- `[erlang_adk, agent, prompt, start]`
-- `[erlang_adk, agent, prompt, stop]` (includes duration)
+**Events emitted:**
+- `[erlang_adk, agent, prompt, start | stop]`
+- `[erlang_adk, agent, delegate, start | stop]`
+- `[erlang_adk, agent, run_with_events, start | stop]`
 
 ```erlang
-telemetry:attach(
-    <<"my-agent-handler">>,
-    [erlang_adk, agent, prompt, stop],
-    fun(EventName, Measurements, Metadata, _Config) ->
-        io:format("Agent took ~p microseconds~n", [maps:get(duration, Measurements)])
-    end,
-    []
-).
+Handler = fun(_Event, Measurements, Metadata, _Config) ->
+    Duration = maps:get(duration, Measurements),
+    AgentName = maps:get(agent, Metadata),
+    io:format("Agent ~p took ~p ms~n", [AgentName, Duration])
+end,
+telemetry:attach(<<"my_handler">>, [erlang_adk, agent, prompt, stop], Handler, #{}).
+```
+
+---
+
+## Callbacks
+
+Hook into the execution lifecycle. Callbacks are fired around every LLM call:
+
+```erlang
+-module(my_audit_callback).
+-export([before_model/3, after_model/2]).
+
+before_model(Config, Memory, Tools) ->
+    io:format("LLM call starting with ~p tools~n", [length(Tools)]),
+    ok.
+
+after_model(_Config, {Response, _Memory}) ->
+    io:format("LLM responded: ~s~n", [Response]),
+    ok.
+```
+
+Attach callbacks via agent config:
+```erlang
+LLMConfig = #{
+    provider => adk_llm_gemini,
+    callbacks => [my_audit_callback]
+}.
+```
+
+---
+
+## MCP Integration (Model Context Protocol)
+
+Connect to external MCP servers to discover and use their tools:
+
+```erlang
+%% Connect via stdio (e.g., a Node.js MCP server)
+{ok, Client} = adk_mcp_client:connect(<<"stdio">>, <<"node my_mcp_server.js">>),
+
+%% List available tools
+{ok, Tools} = adk_mcp_client:list_tools(Client),
+
+%% Execute a specific tool
+{ok, Result} = adk_mcp_client:execute_tool(Client, <<"search">>, #{<<"query">> => <<"erlang">>}),
+
+%% Close connection
+ok = adk_mcp_client:close(Client).
+```
+
+---
+
+## Evaluation Framework
+
+Test your agents against deterministic datasets:
+
+```erlang
+EvalConfig = #{
+    criteria => #{tool_trajectory_avg_score => 0.8},
+    match_type => <<"in_order">>
+},
+{ok, Results} = adk_eval:evaluate(AgentConfig, "test_data.json", EvalConfig).
+```
+
+---
+
+## Retry with Exponential Backoff
+
+Wrap flaky functions with robust retry logic:
+
+```erlang
+Fun = fun() -> flaky_network_call() end,
+Opts = #{max_attempts => 5, initial_delay => 1000, backoff_factor => 2.0},
+{ok, Result} = adk_retry:execute(Fun, Opts).
+```
+
+---
+
+## Streaming
+
+Stream LLM responses directly (useful for chat UIs):
+
+```erlang
+Callback = fun(Chunk) -> io:format("~s", [Chunk]) end,
+ok = adk_llm:stream(LLMConfig, History, Tools, Callback).
 ```
 
 ---
 
 ## Testing
 
-Run the full test suite using rebar3:
+Run the full test suite:
 
 ```bash
-rebar3 do clean, compile, ct, dialyzer, ex_doc, edoc
+rebar3 do clean, compile, eunit, ct, dialyzer
 ```

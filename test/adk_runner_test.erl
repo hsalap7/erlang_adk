@@ -28,6 +28,8 @@ dummy_agent_loop() ->
             FinalEvent = adk_event:new(<<"agent">>, <<"Response text">>, #{invocation_id => InvId, is_final => true}),
             gen_server:reply(From, {ok, FinalEvent}),
             dummy_agent_loop();
+        stop ->
+            ok;
         _ ->
             dummy_agent_loop()
     end.
@@ -49,7 +51,8 @@ test_sync_run() ->
     ?assertEqual(<<"user">>, E1#adk_event.author),
     ?assertEqual(<<"Hello">>, E1#adk_event.content),
     ?assertEqual(<<"agent">>, E2#adk_event.author),
-    ?assertEqual(<<"Response text">>, E2#adk_event.content).
+    ?assertEqual(<<"Response text">>, E2#adk_event.content),
+    AgentPid ! stop.
 
 test_async_run() ->
     AgentPid = spawn(fun dummy_agent_loop/0),
@@ -71,4 +74,5 @@ test_async_run() ->
     
     receive {adk_done, StreamPid} -> 
         ok
-    after 1000 -> ?assert(false) end.
+    after 1000 -> ?assert(false) end,
+    AgentPid ! stop.

@@ -9,9 +9,14 @@ init(Req0, State) ->
             {ok, Body, Req1} = cowboy_req:read_body(Req0),
             try jsx:decode(Body, [return_maps]) of
                 #{<<"agent_name">> := AgentName, <<"prompt">> := Prompt} ->
-                    AgentAtom = list_to_atom(binary_to_list(AgentName)),
-                    case whereis(AgentAtom) of
+                    AgentAtom = try list_to_existing_atom(binary_to_list(AgentName)) catch error:badarg -> undefined end,
+                    case AgentAtom of
                         undefined ->
+                            Req2 = cowboy_req:reply(404, #{}, <<"Agent not found">>, Req1),
+                            {ok, Req2, State};
+                        _ ->
+                            case whereis(AgentAtom) of
+                                undefined ->
                             Req2 = cowboy_req:reply(404, #{}, <<"Agent not found">>, Req1),
                             {ok, Req2, State};
                         Pid ->
@@ -23,6 +28,7 @@ init(Req0, State) ->
                                 {error, Reason} ->
                                     Req2 = cowboy_req:reply(500, #{}, list_to_binary(io_lib:format("~p", [Reason])), Req1),
                                     {ok, Req2, State}
+                            end
                             end
                     end
             catch

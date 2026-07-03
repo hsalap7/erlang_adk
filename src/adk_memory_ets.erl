@@ -4,14 +4,14 @@
 -module(adk_memory_ets).
 -behaviour(adk_memory_service).
 
--export([init/1, add/3, search/4, delete/2, add_session_to_memory/3]).
+-export([init/1, add/3, search/4, delete/2, add_session_to_memory/3, stop/1]).
 
 -record(state, {table}).
 
 init(_Config) ->
     %% We spawn a gen_server or just use a named public ETS table for simplicity
     Table = ets:new(adk_memory_ets, [set, public, {read_concurrency, true}, {write_concurrency, true}]),
-    {ok, spawn(fun() -> loop(#state{table = Table}) end)}.
+    {ok, proc_lib:spawn_link(fun() -> loop(#state{table = Table}) end)}.
 
 loop(State) ->
     receive
@@ -56,7 +56,9 @@ loop(State) ->
             true ->
                 From ! {memory_reply, ok}
             end,
-            loop(State)
+            loop(State);
+        stop ->
+            ok
     end.
 
 %% API Wrappers
@@ -76,6 +78,10 @@ delete(Pid, Id) ->
 add_session_to_memory(Pid, SessionId, Events) ->
     Pid ! {add_session, self(), SessionId, Events},
     receive {memory_reply, Result} -> Result after 5000 -> {error, timeout} end.
+
+stop(Pid) ->
+    Pid ! stop,
+    ok.
 
 %% Internal Functions
 

@@ -18,7 +18,7 @@ setup() ->
     Pid.
 
 cleanup(Pid) ->
-    exit(Pid, kill).
+    adk_memory_ets:stop(Pid).
 
 test_add_search(Pid) ->
     {ok, Id1} = adk_memory_ets:add(Pid, <<"Erlang is awesome">>, #{<<"lang">> => <<"erlang">>}),

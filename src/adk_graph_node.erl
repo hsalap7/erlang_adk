@@ -72,7 +72,7 @@ execute_tools_inner(NameBin, ArgsMap, Sig, Rest, ToolsList, Acc) ->
     
     Result = case FoundTool of
         {value, Mod} ->
-            case Mod:execute(ArgsMap) of
+            case Mod:execute(ArgsMap, #{}) of
                 {ok, Res} -> #{<<"success">> => true, <<"result">> => format_result(Res)};
                 {error, Reason} -> #{<<"success">> => false, <<"error">> => format_result(Reason)}
             end;

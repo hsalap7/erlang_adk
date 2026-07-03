@@ -43,8 +43,16 @@ generate(Config, Memory, Tools) ->
     %% HTTP Request
     Headers = [{"Content-Type", "application/json"}],
     Request = {Url, Headers, "application/json", JsonBody},
-    %% Simplified SSL
-    HttpOptions = [{ssl, [{verify, verify_none}]}],
+    %% Secure SSL verification (requires OTP 25+)
+    %% Fallback to verify_none for older OTP versions without crashing or alerting Dialyzer
+    SslOpts = case erlang:function_exported(public_key, cacerts_get, 0) of
+        true ->
+            Certs = apply(public_key, cacerts_get, []),
+            [{verify, verify_peer}, {cacerts, Certs}];
+        false ->
+            [{verify, verify_none}]
+    end,
+    HttpOptions = [{ssl, SslOpts}],
     Options = [{body_format, binary}],
 
     case httpc:request(post, Request, HttpOptions, Options) of
