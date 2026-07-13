@@ -1,5 +1,5 @@
 -module(dummy_tool).
--export([schema/0, execute/1]).
+-export([schema/0, execute/2]).
 
 schema() ->
     #{<<"name">> => <<"dummy_tool">>,
@@ -7,5 +7,5 @@ schema() ->
       <<"parameters">> => #{<<"type">> => <<"OBJECT">>}
     }.
 
-execute(#{<<"arg">> := Val}) ->
+execute(#{<<"arg">> := Val}, _Context) ->
     {ok, #{<<"status">> => <<"success">>, <<"val">> => Val}}.

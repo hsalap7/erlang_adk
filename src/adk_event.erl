@@ -1,6 +1,6 @@
 %% @doc adk_event - Immutable event records for the ADK event system.
 %%
-%% Events are the fundamental unit of communication in the ADK 2.0 architecture.
+%% Events are the fundamental unit of communication in the Runner architecture.
 %% Every agent action, tool call, and state change is recorded as an event.
 -module(adk_event).
 
@@ -88,16 +88,25 @@ format_content({tool_calls, Calls}) ->
     #{<<"type">> => <<"tool_calls">>, <<"calls">> => Calls};
 format_content({tool_response, NameBin, Result, Sig}) ->
     #{<<"type">> => <<"tool_response">>, <<"name">> => NameBin, <<"result">> => Result, <<"signature">> => Sig};
+format_content({tool_response, NameBin, Result, Sig, CallId}) ->
+    #{<<"type">> => <<"tool_response">>, <<"name">> => NameBin,
+      <<"result">> => Result, <<"signature">> => Sig,
+      <<"call_id">> => CallId};
 format_content(Text) when is_binary(Text) ->
     #{<<"type">> => <<"text">>, <<"text">> => Text};
 format_content(Text) when is_list(Text) ->
-    #{<<"type">> => <<"text">>, <<"text">> => list_to_binary(Text)};
+    #{<<"type">> => <<"text">>,
+      <<"text">> => unicode:characters_to_binary(Text)};
 format_content(Other) ->
     #{<<"type">> => <<"unknown">>, <<"data">> => list_to_binary(io_lib:format("~p", [Other]))}.
 
 %% @private Parse content from map serialization.
 parse_content(#{<<"type">> := <<"tool_calls">>, <<"calls">> := Calls}) ->
     {tool_calls, Calls};
+parse_content(#{<<"type">> := <<"tool_response">>, <<"name">> := NameBin,
+                <<"result">> := Result, <<"signature">> := Sig,
+                <<"call_id">> := CallId}) ->
+    {tool_response, NameBin, Result, Sig, CallId};
 parse_content(#{<<"type">> := <<"tool_response">>, <<"name">> := NameBin, <<"result">> := Result, <<"signature">> := Sig}) ->
     {tool_response, NameBin, Result, Sig};
 parse_content(#{<<"type">> := <<"text">>, <<"text">> := Text}) ->

@@ -4,7 +4,8 @@
 graph_node_test_() ->
     [
      fun test_function_node/0,
-     fun test_tool_node/0
+     fun test_tool_node/0,
+     fun test_agent_node_instructions_and_callbacks/0
     ].
 
 test_function_node() ->
@@ -21,3 +22,26 @@ test_tool_node() ->
     Events = maps:get(<<"events">>, Result2),
     ?assertEqual(1, length(Events)),
     ?assertEqual([], maps:get(<<"pending_tools">>, Result2)).
+
+test_agent_node_instructions_and_callbacks() ->
+    NodeFn = adk_graph_node:agent_node(<<"graph_agent">>, #{
+        provider => adk_llm_probe,
+        instructions => <<"GRAPH INSTRUCTION">>,
+        test_pid => self(),
+        callback_pid => self(),
+        callbacks => [adk_unloaded_callback]
+    }, []),
+    Result = NodeFn(#{<<"events">> =>
+                          [adk_event:new(<<"user">>, <<"hello">>)]}),
+    ?assertEqual(<<"graph_agent">>, maps:get(<<"last_agent">>, Result)),
+    receive
+        {probe_generate, History, []} ->
+            ?assert(lists:any(
+                      fun(#{role := system,
+                            content := <<"GRAPH INSTRUCTION">>}) -> true;
+                         (_) -> false
+                      end, History))
+    after 1000 -> ?assert(false)
+    end,
+    receive before_model -> ok after 1000 -> ?assert(false) end,
+    receive after_model -> ok after 1000 -> ?assert(false) end.

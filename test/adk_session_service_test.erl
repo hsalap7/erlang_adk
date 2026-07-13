@@ -10,8 +10,8 @@ setup() ->
     ok.
 
 cleanup(_) ->
-    %% It's an ETS table, we can just delete it
-    ets:delete(adk_sessions),
+    %% Preserve the supervised table; remove only this suite's data.
+    ets:delete_all_objects(adk_sessions),
     ok.
 
 session_service_test_() ->

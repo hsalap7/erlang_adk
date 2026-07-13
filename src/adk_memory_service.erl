@@ -1,6 +1,6 @@
 %% @doc adk_memory_service - Behaviour for long-term, semantic memory.
 %%
-%% ADK 2.0 separates short-term working memory (sessions) from long-term
+%% Erlang ADK separates short-term working memory (sessions) from long-term
 %% semantic/vector memory. This behaviour defines the interface for
 %% querying and updating long-term knowledge.
 -module(adk_memory_service).

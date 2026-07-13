@@ -1,23 +1,21 @@
-%% @doc adk_mcp_server - Serve ADK tools via the Model Context Protocol.
+%% @doc adk_mcp_server - Placeholder for a future MCP server.
 %%
-%% Allows exposing Erlang ADK tools to other clients (like Claude Desktop)
-%% over stdio or SSE.
+%% No server transport is implemented yet. start/2 fails explicitly instead
+%% of returning a descriptor that could be mistaken for a listening server.
 -module(adk_mcp_server).
 
 -export([start/2, stop/1]).
 
 
 
-%% @doc Start an MCP server to expose the given tools.
+%% @doc Report that the requested server transport is not implemented.
 -spec start(Transport :: binary(), Tools :: [module()]) -> {ok, map()} | {error, term()}.
-start(<<"stdio">>, Tools) ->
-    io:format("Starting MCP server via stdio~n"),
-    %% A real implementation would listen on standard input and write to standard output
-    {ok, #{transport => <<"stdio">>, tools => Tools}};
-start(<<"sse">>, Tools) ->
-    io:format("Starting MCP server via SSE~n"),
-    %% A real implementation would start a cowboy web server
-    {ok, #{transport => <<"sse">>, tools => Tools}}.
+start(<<"stdio">>, _Tools) ->
+    {error, {not_implemented, mcp_server_stdio}};
+start(<<"sse">>, _Tools) ->
+    {error, {not_implemented, mcp_server_sse}};
+start(Transport, _Tools) ->
+    {error, {unsupported_transport, Transport}}.
 
 %% @doc Stop the MCP server.
 -spec stop(Server :: map()) -> ok.

@@ -1,11 +1,11 @@
 -module(erlang_adk_orchestrator).
 
--export([sequential/2, parallel/2, loop/4]).
+-export([sequential/2, parallel/2, parallel/3, loop/4]).
 
 %% @doc sequential takes a list of Agent Pids and an Initial Prompt.
 %% It constructs a sequential graph of the agents and executes it.
 sequential([], Prompt) ->
-    {ok, Prompt};
+    {ok, to_binary(Prompt)};
 sequential(Pids, Prompt) ->
     G0 = adk_graph:new(),
     
@@ -26,7 +26,7 @@ build_seq_graph(G, [], _Index, EntryNode, LastNode) ->
     G1 = adk_graph:add_edge(G, LastNode, end_node),
     {G1, EntryNode, LastNode};
 build_seq_graph(G, [Pid | Rest], Index, EntryNode, LastNode) ->
-    NodeName = list_to_atom("agent_" ++ integer_to_list(Index)),
+    NodeName = <<"agent_", (integer_to_binary(Index))/binary>>,
     
     NodeFn = fun(State) ->
         Input = maps:get(<<"prompt">>, State),
@@ -53,23 +53,30 @@ build_seq_graph(G, [Pid | Rest], Index, EntryNode, LastNode) ->
 %% @doc parallel takes a list of Agent Pids and a Prompt.
 %% It prompts all agents concurrently using the graph engine.
 parallel(Pids, Prompt) ->
+    parallel(Pids, Prompt, 60000).
+
+%% @doc Prompt agents concurrently with one overall deadline. Results retain
+%% the input PID order and contain `{error, Reason}' for failed branches.
+parallel(Pids, Prompt, Timeout) when is_integer(Timeout), Timeout > 0 ->
     G0 = adk_graph:new(),
     
     ParallelNodeFn = fun(State) ->
         Input = maps:get(<<"prompt">>, State),
         Parent = self(),
-        Refs = lists:map(fun(Pid) ->
+        Jobs = lists:map(fun(Pid) ->
             Ref = make_ref(),
-            spawn(fun() -> Parent ! {Ref, Pid, erlang_adk:prompt(Pid, Input)} end),
-            Ref
+            {Worker, Monitor} = spawn_monitor(fun() ->
+                Result = try erlang_adk:prompt(Pid, Input) of
+                    Value -> Value
+                catch
+                    Class:Reason -> {error, {Class, Reason}}
+                end,
+                Parent ! {Ref, Pid, Result}
+            end),
+            {Ref, Pid, Worker, Monitor}
         end, Pids),
-        
-        Results = lists:map(fun(Ref) ->
-            receive 
-                {Ref, Pid, {ok, Response}} -> {Pid, Response};
-                {Ref, Pid, {error, Reason}} -> {Pid, {error, Reason}}
-            end
-        end, Refs),
+        Deadline = erlang:monotonic_time(millisecond) + Timeout,
+        Results = collect_parallel(Jobs, Deadline, []),
         #{<<"results">> => Results}
     end,
 
@@ -83,7 +90,10 @@ parallel(Pids, Prompt) ->
 
 %% @doc loop runs a worker agent and a reviewer agent iteratively using a graph.
 loop(_WorkerPid, _ReviewerPid, LastDraft, 0) ->
-    {ok, LastDraft};
+    {ok, to_binary(LastDraft)};
+loop(_WorkerPid, _ReviewerPid, _Prompt, MaxIterations)
+  when MaxIterations < 0 ->
+    {error, invalid_max_iterations};
 loop(WorkerPid, ReviewerPid, Prompt, IterationsLeft) ->
     G0 = adk_graph:new(),
     
@@ -98,19 +108,22 @@ loop(WorkerPid, ReviewerPid, Prompt, IterationsLeft) ->
     ReviewerNode = fun(State) ->
         Draft = maps:get(<<"draft">>, State),
         Iters = maps:get(<<"iters">>, State),
-        case erlang_adk:prompt(ReviewerPid, "Review this draft and reply with 'APPROVED' if it meets all requirements. Otherwise provide a critique:\n" ++ Draft) of
+        ReviewPrompt =
+            <<"Review this draft and reply with exactly 'APPROVED' if it meets "
+              "all requirements. Otherwise provide a critique:\n",
+              (to_binary(Draft))/binary>>,
+        case erlang_adk:prompt(ReviewerPid, ReviewPrompt) of
             {ok, ReviewBin} ->
-                ReviewStr = case is_binary(ReviewBin) of
-                    true -> binary_to_list(ReviewBin);
-                    false -> ReviewBin
-                end,
-                case string:find(string:to_lower(ReviewStr), "approved") of
-                    nomatch ->
-                        #{<<"prompt">> => "Please revise your draft based on this critique:\n" ++ ReviewStr,
-                          <<"approved">> => false,
-                          <<"iters">> => Iters - 1};
+                ReviewText = to_binary(ReviewBin),
+                case string:uppercase(string:trim(ReviewText)) of
+                    <<"APPROVED">> ->
+                        #{<<"approved">> => true};
                     _ ->
-                        #{<<"approved">> => true}
+                        #{<<"prompt">> =>
+                              <<"Please revise your draft based on this critique:\n",
+                                ReviewText/binary>>,
+                          <<"approved">> => false,
+                          <<"iters">> => Iters - 1}
                 end;
             {error, Reason} ->
                 erlang:error(Reason)
@@ -141,3 +154,26 @@ loop(WorkerPid, ReviewerPid, Prompt, IterationsLeft) ->
         {ok, FinalState} -> {ok, maps:get(<<"draft">>, FinalState)};
         {error, Reason} -> {error, Reason}
     end.
+
+collect_parallel([], _Deadline, Acc) ->
+    lists:reverse(Acc);
+collect_parallel([{Ref, Pid, Worker, Monitor} | Rest], Deadline, Acc) ->
+    Remaining = erlang:max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {Ref, Pid, {ok, Response}} ->
+            erlang:demonitor(Monitor, [flush]),
+            collect_parallel(Rest, Deadline, [{Pid, Response} | Acc]);
+        {Ref, Pid, {error, Reason}} ->
+            erlang:demonitor(Monitor, [flush]),
+            collect_parallel(Rest, Deadline, [{Pid, {error, Reason}} | Acc]);
+        {'DOWN', Monitor, process, Worker, Reason} ->
+            collect_parallel(Rest, Deadline,
+                             [{Pid, {error, {worker_down, Reason}}} | Acc])
+    after Remaining ->
+        exit(Worker, kill),
+        erlang:demonitor(Monitor, [flush]),
+        collect_parallel(Rest, Deadline, [{Pid, {error, timeout}} | Acc])
+    end.
+
+to_binary(Value) when is_binary(Value) -> Value;
+to_binary(Value) when is_list(Value) -> unicode:characters_to_binary(Value).

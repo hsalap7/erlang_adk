@@ -2,7 +2,7 @@
 
 -type config() :: map().
 -type memory() :: list(map()).
--type tools() :: list(module()).
+-type tools() :: list(module() | map()).
 
 -export_type([config/0, memory/0, tools/0]).
 
@@ -10,7 +10,7 @@
     {ok, binary() | string()} | {tool_calls, list()} | {error, term()}.
 
 -callback stream(Config :: config(), Memory :: memory(), Tools :: tools(), Callback :: fun((binary()) -> ok)) ->
-    ok | {error, term()}.
+    ok | {tool_calls, list()} | {error, term()}.
 
 -export([generate/3, stream/4]).
 

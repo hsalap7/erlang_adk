@@ -35,8 +35,22 @@ to_events(Memory) ->
 %% @doc Convert events to legacy memory list
 from_events(Events) ->
     lists:foldl(fun(Event, Acc) ->
-        Role = try binary_to_existing_atom(Event#adk_event.author, utf8) catch _:_ -> agent end,
-        Content = Event#adk_event.content,
-        Msg = #{role => Role, content => Content, timestamp => Event#adk_event.timestamp},
-        [Msg | Acc]
+        %% Pause notifications are persisted for clients and recovery, but are
+        %% control-plane events rather than model conversation turns.
+        case maps:is_key(<<"pause">>, Event#adk_event.actions) of
+            true -> Acc;
+            false ->
+                %% Provider roles are protocol roles, not dynamically-created
+                %% agent names. Other authors represent model messages.
+                Role = case Event#adk_event.author of
+                    <<"user">> -> user;
+                    <<"system">> -> system;
+                    <<"tool">> -> tool;
+                    _ -> agent
+                end,
+                Content = Event#adk_event.content,
+                Msg = #{role => Role, content => Content,
+                        timestamp => Event#adk_event.timestamp},
+                [Msg | Acc]
+        end
     end, [], Events).

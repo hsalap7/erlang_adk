@@ -17,7 +17,7 @@ long_running_tool_test() ->
     
     %% Expect a throw of {adk_pause, ...}
     ?assertThrow({adk_pause, human_in_the_loop, <<"Test">>}, 
-                 adk_long_running_tool:execute(#{<<"action_summary">> => <<"Test">>})).
+                 adk_long_running_tool:execute(#{<<"action_summary">> => <<"Test">>}, #{})).
 
 
 on_tool_start(Name, _Args) ->

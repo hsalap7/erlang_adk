@@ -12,5 +12,11 @@
 -callback get_session(AppName :: binary(), UserId :: binary(), SessionId :: binary()) -> {ok, session()} | {error, not_found}.
 -callback list_sessions(AppName :: binary(), UserId :: binary()) -> {ok, [session_meta()]}.
 -callback delete_session(AppName :: binary(), UserId :: binary(), SessionId :: binary()) -> ok.
--callback update_state(AppName :: binary(), UserId :: binary(), SessionId :: binary(), StateDelta :: map()) -> ok.
--callback add_event(AppName :: binary(), UserId :: binary(), SessionId :: binary(), Event :: adk_event:event()) -> ok.
+-callback update_state(AppName :: binary(), UserId :: binary(), SessionId :: binary(), StateDelta :: map()) ->
+    ok | {error, not_found}.
+-callback add_event(AppName :: binary(), UserId :: binary(), SessionId :: binary(), Event :: adk_event:event()) ->
+    ok | {error, not_found}.
+-callback clear_temp_state(AppName :: binary(), UserId :: binary(), SessionId :: binary()) ->
+    ok | {error, not_found}.
+-callback take_state(AppName :: binary(), UserId :: binary(), SessionId :: binary(), Key :: term()) ->
+    {ok, term()} | {error, not_found}.

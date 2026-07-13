@@ -9,7 +9,8 @@ memory_ets_test_() ->
      fun(Pid) ->
          [
           ?_test(test_add_search(Pid)),
-          ?_test(test_add_session(Pid))
+          ?_test(test_add_session(Pid)),
+          ?_test(test_correlated_replies(Pid))
          ]
      end}.
 
@@ -18,7 +19,7 @@ setup() ->
     Pid.
 
 cleanup(Pid) ->
-    exit(Pid, kill).
+    adk_memory_ets:stop(Pid).
 
 test_add_search(Pid) ->
     {ok, Id1} = adk_memory_ets:add(Pid, <<"Erlang is awesome">>, #{<<"lang">> => <<"erlang">>}),
@@ -29,6 +30,10 @@ test_add_search(Pid) ->
     [R1] = Results,
     ?assertEqual(Id1, maps:get(id, R1)),
     ?assertEqual(<<"Erlang is awesome">>, maps:get(content, R1)),
+
+    {ok, Filtered} = adk_memory_ets:search(
+                       Pid, <<"is">>, #{<<"lang">> => <<"erlang">>}, 10),
+    ?assertEqual([Id1], [maps:get(id, Result) || Result <- Filtered]),
     
     %% Delete
     ok = adk_memory_ets:delete(Pid, Id1),
@@ -47,3 +52,14 @@ test_add_session(Pid) ->
     Content = maps:get(content, R),
     ?assert(string:str(binary_to_list(Content), "Query 1") > 0),
     ?assert(string:str(binary_to_list(Content), "Response 1") > 0).
+
+test_correlated_replies(Pid) ->
+    OldRef = make_ref(),
+    Pid ! {add, self(), OldRef, <<"older request">>, #{}},
+    {ok, NewId} = adk_memory_ets:add(Pid, <<"current request">>, #{}),
+    receive
+        {memory_reply, OldRef, {ok, OldId}} ->
+            ?assertNotEqual(OldId, NewId)
+    after 1000 ->
+        ?assert(false)
+    end.
