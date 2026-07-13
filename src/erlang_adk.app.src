@@ -1,8 +1,7 @@
 {application, erlang_adk, [
-    {description,
-        "An Erlang client for Google Agent Development Kit (ADK)."},
+    {description, "An Erlang client for Google Agent Development Kit (ADK)."},
     {tags, ["google", "adk", "hardware", "android", "erl_adk", "erlang_adk", "ADK", "adk_erlang"]},
-    {vsn, "0.2.4"},
+    {vsn, "0.2.5"},
     {registered, []},
     {mod, {erlang_adk_app, []}},
     {applications, [

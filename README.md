@@ -1,4 +1,4 @@
-# Erlang ADK v0.2.4
+# Erlang ADK v0.2.5
 
 Erlang ADK is an experimental, Erlang-native toolkit for building Gemini-backed agents with OTP processes, supervision, tools, sessions, event streams, and concurrent multi-agent workflows.
 
@@ -6,7 +6,7 @@ The project follows the behavior of Google ADK where that behavior maps cleanly 
 
 ## Current scope
 
-| Area | Status in v0.2.4 |
+| Area | Status in v0.2.5 |
 | --- | --- |
 | Gemini text, function calling, thought signatures, call IDs, and SSE text streaming | Implemented |
 | Erlang tools and agents exposed as model tools | Implemented |
@@ -25,7 +25,7 @@ Add the package to `rebar.config`:
 
 ```erlang
 {deps, [
-    {erlang_adk, "~> 0.2.4"}
+    {erlang_adk, "~> 0.2.5"}
 ]}.
 ```
 
@@ -349,7 +349,7 @@ ok = erlang_adk_session:update_state(
     AppName, UserId, SessionId,
     #{<<"theme">> => <<"local">>,
       <<"user:preferences">> => <<"dark">>,
-      <<"app:release">> => <<"0.2.4">>,
+      <<"app:release">> => <<"0.2.5">>,
       <<"temp:lookup">> => <<"in-flight">>}),
 {ok, StoredSession} = erlang_adk_session:get_session(
     AppName, UserId, SessionId),
@@ -360,7 +360,7 @@ StoredState = maps:get(state, StoredSession),
     AppName, UserId, #{session_id => <<"state-session-2">>}),
 FutureState = maps:get(state, FutureSession),
 <<"dark">> = maps:get(<<"user:preferences">>, FutureState),
-<<"0.2.4">> = maps:get(<<"app:release">>, FutureState),
+<<"0.2.5">> = maps:get(<<"app:release">>, FutureState),
 error = maps:find(<<"theme">>, FutureState),
 
 ok = erlang_adk_session:clear_temp_state(AppName, UserId, SessionId),
