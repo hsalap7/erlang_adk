@@ -15,7 +15,7 @@ run(AgentRef, Dataset, MetricFn) ->
 
 %% @doc Run an evaluation with options (e.g. concurrency).
 %%
-%% `concurrency` controls the number of evaluator worker processes. Calls made
+%% `concurrency' controls the number of evaluator worker processes. Calls made
 %% to one stateful agent pid are still serialized by that agent's gen_server;
 %% use separate agent processes when model calls themselves must overlap.
 -spec run(AgentRef :: term(), Dataset :: dataset(), MetricFn :: metric_fn(), Opts :: map()) -> {ok, map()} | {error, term()}.

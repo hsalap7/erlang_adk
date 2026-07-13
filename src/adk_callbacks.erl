@@ -36,8 +36,8 @@ execute(Handlers, Hook, Args) ->
     ok.
 
 %% @doc Run handlers until one explicitly replaces or halts the operation.
-%% Observation-only callbacks return `ok` or `continue`. A callback may return
-%% `{replace, Value}` to replace an after-hook result, or `{halt, Value}` to
+%% Observation-only callbacks return `ok' or `continue'. A callback may return
+%% `{replace, Value}' to replace an after-hook result, or `{halt, Value}' to
 %% skip the operation wrapped by a before-hook.
 -spec run([module()], atom(), [term()]) -> continue | {halt, term()} | {replace, term()}.
 run([], _Hook, _Args) ->

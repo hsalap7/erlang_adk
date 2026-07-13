@@ -56,7 +56,7 @@ parallel(Pids, Prompt) ->
     parallel(Pids, Prompt, 60000).
 
 %% @doc Prompt agents concurrently with one overall deadline. Results retain
-%% the input PID order and contain `{error, Reason}` for failed branches.
+%% the input PID order and contain `{error, Reason}' for failed branches.
 parallel(Pids, Prompt, Timeout) when is_integer(Timeout), Timeout > 0 ->
     G0 = adk_graph:new(),
     
