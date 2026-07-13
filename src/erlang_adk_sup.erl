@@ -26,16 +26,31 @@ start_link() ->
 %%                  type => worker(),       % optional
 %%                  modules => modules()}   % optional
 init([]) ->
-    SupFlags = #{strategy => one_for_all,
-                 intensity => 0,
-                 period => 1},
+    %% Session-table, registry, and agent lifetimes are coupled. If the ETS owner
+    %% or registry dies, rest_for_one also replaces the downstream services and
+    %% agents so none continue against lost storage or stale registrations.
+    SupFlags = #{strategy => rest_for_one,
+                 intensity => 5,
+                 period => 10},
+    SessionOwner = #{id => erlang_adk_session_owner,
+                     start => {erlang_adk_session_owner, start_link, []},
+                     restart => permanent,
+                     shutdown => 5000,
+                     type => worker,
+                     modules => [erlang_adk_session_owner]},
+    Registry = #{id => adk_agent_registry,
+                 start => {adk_agent_registry, start_link, []},
+                 restart => permanent,
+                 shutdown => 5000,
+                 type => worker,
+                 modules => [adk_agent_registry]},
     AgentSup = #{id => adk_agent_sup,
                  start => {adk_agent_sup, start_link, []},
                  restart => permanent,
                  shutdown => infinity,
                  type => supervisor,
                  modules => [adk_agent_sup]},
-    ChildSpecs = [AgentSup],
+    ChildSpecs = [SessionOwner, Registry, AgentSup],
     {ok, {SupFlags, ChildSpecs}}.
 
 %% internal functions

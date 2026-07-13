@@ -38,3 +38,19 @@ to_map_roundtrip_test() ->
     Map = adk_event:to_map(Event1),
     Event2 = adk_event:from_map(Map),
     ?assertEqual(Event1, Event2).
+
+unicode_charlist_serialization_test() ->
+    Text = "café \x{2615}",
+    Event = adk_event:new(<<"agent">>, Text),
+    Map = adk_event:to_map(Event),
+    #{<<"text">> := Encoded} = maps:get(<<"content">>, Map),
+    ?assertEqual(unicode:characters_to_binary(Text), Encoded).
+
+runner_pause_is_not_model_history_test() ->
+    User = adk_event:new(<<"user">>, <<"do it">>),
+    Pause = adk_event:new(<<"runner">>, <<"approve it">>,
+                          #{actions => #{<<"pause">> => #{}}}),
+    [OnlyMessage] = adk_memory:get_history(
+                      adk_memory:from_events([User, Pause])),
+    ?assertEqual(user, maps:get(role, OnlyMessage)),
+    ?assertEqual(<<"do it">>, maps:get(content, OnlyMessage)).

@@ -28,7 +28,7 @@ schema() ->
 
 %% @doc Executing this tool intentionally throws a pause exception
 %% that the adk_runner catches to suspend the workflow.
--spec execute(Args :: map(), Context :: map()) -> {ok, term()} | {error, term()}.
+-spec execute(Args :: map(), Context :: map()) -> no_return().
 execute(Args, _Context) ->
     Summary = maps:get(<<"action_summary">>, Args, <<"Unknown action">>),
     %% We throw a special term that the runner's execute_tools logic must catch

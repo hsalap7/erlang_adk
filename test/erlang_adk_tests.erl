@@ -7,7 +7,7 @@ all_test_() ->
             application:ensure_all_started(erlang_adk)
         end,
         fun(_) -> 
-            application:stop(erlang_adk) 
+            ok
         end,
         [
             fun basic_agent_test_case/0,
@@ -25,7 +25,7 @@ basic_agent_test_case() ->
     {ok, Pid} = erlang_adk:spawn_agent("TestAgent", LLMConfig, []),
     {ok, Response} = erlang_adk:prompt(Pid, "Hello"),
     ok = erlang_adk:delegate(Pid, "Do something async"),
-    ?assertEqual("Simulated response", Response),
+    ?assertEqual(<<"Simulated response">>, Response),
     Memory = erlang_adk_session:load(test_session_1),
     ?assert(length(Memory) > 0),
     erlang_adk_session:delete(test_session_1).
@@ -35,10 +35,12 @@ orchestrator_test_case() ->
     {ok, Pid1} = erlang_adk:spawn_agent("Agent1", LLMConfig, []),
     {ok, Pid2} = erlang_adk:spawn_agent("Agent2", LLMConfig, []),
     {ok, SeqRes} = erlang_adk:sequential([Pid1, Pid2], "Hello"),
-    ?assertEqual("Simulated response", SeqRes),
+    ?assertEqual(<<"Simulated response">>, SeqRes),
     ParallelRes = erlang_adk:parallel([Pid1, Pid2], "Hello"),
     SortedRes = lists:sort(ParallelRes),
-    SortedExpected = lists:sort([{Pid1, "Simulated response"}, {Pid2, "Simulated response"}]),
+    SortedExpected = lists:sort(
+                       [{Pid1, <<"Simulated response">>},
+                        {Pid2, <<"Simulated response">>}]),
     ?assertEqual(SortedExpected, SortedRes).
 
 telemetry_test_case() ->
@@ -57,12 +59,17 @@ telemetry_test_case() ->
     telemetry:detach(<<"test_handler">>).
 
 a2a_test_case() ->
-    _ = list_to_atom("A2AAgent"),
-    {ok, _Pid} = erlang_adk:spawn_agent("A2AAgent", #{provider => adk_llm_dummy}, []),
+    UnicodeResponse = <<"café \x{2615}"/utf8>>,
+    {ok, Pid} = erlang_adk:spawn_agent("A2AAgent", #{
+        provider => adk_llm_probe,
+        response => UnicodeResponse
+    }, []),
     %% Wait a tiny bit for Cowboy to be ready
     timer:sleep(100),
-    Res = erlang_adk_a2a_client:prompt("http://localhost:8080/a2a/prompt", "A2AAgent", "Hello"),
-    ?assertEqual({ok, "Simulated response"}, Res).
+    Res = erlang_adk_a2a_client:prompt(
+            "http://localhost:8080/a2a/prompt", "A2AAgent", <<"héllo"/utf8>>),
+    ?assertEqual({ok, UnicodeResponse}, Res),
+    ok = erlang_adk:stop_agent(Pid).
 
 mnesia_session_test_case() ->
     LLMConfig = #{provider => adk_llm_dummy, session_id => mnesia_test_1, session_store => erlang_adk_session_mnesia},
@@ -75,14 +82,14 @@ mnesia_session_test_case() ->
 tools_test_case() ->
     {ok, Pid} = erlang_adk:spawn_agent("ToolsAgent", #{provider => adk_llm_dummy}, [dummy_tool]),
     {ok, Res} = erlang_adk:prompt(Pid, "Trigger tool"),
-    ?assertEqual("Tool executed", Res).
+    ?assertEqual(<<"Tool executed">>, Res).
 
 async_delegate_test_case() ->
     {ok, Pid} = erlang_adk:spawn_agent("AsyncAgent", #{provider => adk_llm_dummy}, []),
     erlang_adk:delegate(Pid, "Hello", self()),
     receive
         {agent_response, Pid, Res} ->
-            ?assertEqual("Simulated response", Res)
+            ?assertEqual(<<"Simulated response">>, Res)
     after 5000 ->
         ?assert(false)
     end.

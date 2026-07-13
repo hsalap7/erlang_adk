@@ -1,6 +1,6 @@
 %% @doc adk_graph_node - Helper functions for creating common graph nodes.
 %%
-%% ADK 2.0 graphs can contain various node types. This module provides builders
+%% Erlang ADK graphs can contain various node types. This module provides builders
 %% for common node types to simplify graph construction.
 -module(adk_graph_node).
 
@@ -12,23 +12,26 @@
 agent_node(Name, Config, Tools) ->
     fun(State) ->
         %% Extract history from state or use empty
-        History = maps:get(<<"events">>, State, []),
+        HistoryEvents = maps:get(<<"events">>, State, []),
+        Memory0 = adk_memory:from_events(HistoryEvents),
+        Memory = ensure_instructions(Memory0, Config),
+        History = adk_memory:get_history(Memory),
         
         %% Invoke LLM
-        case adk_llm:generate(Config, History, Tools) of
+        case generate_with_callbacks(Config, Memory, History, Tools) of
             {ok, Text} ->
-                ResponseText = unicode:characters_to_list(Text),
+                ResponseText = unicode:characters_to_binary(Text),
                 FinalEvent = adk_event:new(Name, ResponseText, #{is_final => true}),
                 %% Append new event to events list
-                NewHistory = [FinalEvent | History],
+                NewHistory = HistoryEvents ++ [FinalEvent],
                 #{<<"events">> => NewHistory, <<"last_agent">> => Name};
             {tool_calls, Calls} ->
                 AgentEvent = adk_event:new(Name, {tool_calls, Calls}, #{}),
-                NewHistory = [AgentEvent | History],
+                NewHistory = HistoryEvents ++ [AgentEvent],
                 #{<<"events">> => NewHistory, <<"pending_tools">> => Calls, <<"last_agent">> => Name};
             {error, Reason} ->
                 ErrorEvent = adk_event:new(Name, list_to_binary(io_lib:format("Error: ~p", [Reason])), #{}),
-                NewHistory = [ErrorEvent | History],
+                NewHistory = HistoryEvents ++ [ErrorEvent],
                 #{<<"events">> => NewHistory, <<"error">> => Reason}
         end
     end.
@@ -50,7 +53,7 @@ tool_node(ToolsList) ->
             Calls ->
                 History = maps:get(<<"events">>, State, []),
                 NewEvents = execute_tools(Calls, ToolsList, []),
-                NewHistory = lists:reverse(NewEvents) ++ History,
+                NewHistory = History ++ lists:reverse(NewEvents),
                 #{<<"events">> => NewHistory, <<"pending_tools">> => []}
         end
     end.
@@ -59,11 +62,15 @@ tool_node(ToolsList) ->
 execute_tools([], _ToolsList, Acc) ->
     Acc;
 execute_tools([{NameBin, ArgsMap} | Rest], ToolsList, Acc) ->
-    execute_tools_inner(NameBin, ArgsMap, undefined, Rest, ToolsList, Acc);
+    execute_tools_inner(NameBin, ArgsMap, undefined, undefined, Rest,
+                        ToolsList, Acc);
 execute_tools([{NameBin, ArgsMap, Sig} | Rest], ToolsList, Acc) ->
-    execute_tools_inner(NameBin, ArgsMap, Sig, Rest, ToolsList, Acc).
+    execute_tools_inner(NameBin, ArgsMap, Sig, undefined, Rest,
+                        ToolsList, Acc);
+execute_tools([{NameBin, ArgsMap, Sig, CallId} | Rest], ToolsList, Acc) ->
+    execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList, Acc).
 
-execute_tools_inner(NameBin, ArgsMap, Sig, Rest, ToolsList, Acc) ->
+execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList, Acc) ->
     FoundTool = lists:search(
         fun(Mod) ->
             Schema = Mod:schema(),
@@ -72,16 +79,56 @@ execute_tools_inner(NameBin, ArgsMap, Sig, Rest, ToolsList, Acc) ->
     
     Result = case FoundTool of
         {value, Mod} ->
-            case Mod:execute(ArgsMap, #{}) of
+            try Mod:execute(ArgsMap, #{}) of
                 {ok, Res} -> #{<<"success">> => true, <<"result">> => format_result(Res)};
-                {error, Reason} -> #{<<"success">> => false, <<"error">> => format_result(Reason)}
+                {error, Reason} -> #{<<"success">> => false, <<"error">> => format_result(Reason)};
+                Other -> #{<<"success">> => false,
+                           <<"error">> => format_result({invalid_tool_result, Other})}
+            catch
+                Class:Failure ->
+                    #{<<"success">> => false,
+                      <<"error">> => format_result({Class, Failure})}
             end;
         false ->
             #{<<"success">> => false, <<"error">> => <<"Tool not found">>}
     end,
-    ToolEvent = adk_event:new(<<"tool">>, {tool_response, NameBin, Result, Sig}),
+    ToolResponse = case CallId of
+        undefined -> {tool_response, NameBin, Result, Sig};
+        _ -> {tool_response, NameBin, Result, Sig, CallId}
+    end,
+    ToolEvent = adk_event:new(<<"tool">>, ToolResponse),
     execute_tools(Rest, ToolsList, [ToolEvent | Acc]).
 
 format_result(Res) when is_map(Res) -> Res;
 format_result(Res) when is_binary(Res) -> #{<<"result">> => Res};
-format_result(Res) -> #{<<"result">> => list_to_binary(io_lib:format("~p", [Res]))}.
+format_result(Res) ->
+    #{<<"result">> => unicode:characters_to_binary(io_lib:format("~p", [Res]))}.
+
+ensure_instructions(Memory, Config) ->
+    case lists:any(fun(#{role := system}) -> true; (_) -> false end, Memory) of
+        true -> Memory;
+        false ->
+            Instructions = maps:get(instructions, Config,
+                                    <<"You are a helpful assistant.">>),
+            Memory ++ [#{role => system, content => Instructions,
+                         timestamp => erlang:system_time(millisecond)}]
+    end.
+
+generate_with_callbacks(Config, Memory, History, Tools) ->
+    Handlers = maps:get(callbacks, Config, []),
+    RawResult = case adk_callbacks:run(Handlers, before_model,
+                                       [Config, Memory, Tools]) of
+        {halt, Replacement} -> Replacement;
+        {replace, Replacement} -> Replacement;
+        _ ->
+            try adk_llm:generate(Config, History, Tools) of
+                Result -> Result
+            catch
+                Class:Reason -> {error, {Class, Reason}}
+            end
+    end,
+    case adk_callbacks:run(Handlers, after_model, [Config, RawResult]) of
+        {halt, ReplacementResult} -> ReplacementResult;
+        {replace, ReplacementResult} -> ReplacementResult;
+        _ -> RawResult
+    end.

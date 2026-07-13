@@ -5,7 +5,8 @@ retry_test_() ->
     [
         {"Success first try", ?_test(test_success())},
         {"Retry then success", ?_test(test_retry_success())},
-        {"Exhaust retries", ?_test(test_exhaust_retries())}
+        {"Exhaust retries", ?_test(test_exhaust_retries())},
+        {"Reject invalid options", ?_test(test_invalid_options())}
     ].
 
 test_success() ->
@@ -39,3 +40,8 @@ test_exhaust_retries() ->
     Opts = #{max_attempts => 3, initial_delay => 1, backoff_factor => 1.0},
     {error, fail} = adk_retry:execute(Fun, Opts),
     ?assertEqual(3, get(retry_count2)).
+
+test_invalid_options() ->
+    ?assertEqual({error, invalid_retry_options},
+                 adk_retry:execute(fun() -> {ok, never} end,
+                                   #{max_attempts => 0})).

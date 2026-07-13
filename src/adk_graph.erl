@@ -1,11 +1,11 @@
-%% @doc adk_graph - Graph-based workflow engine for ADK 2.0.
+%% @doc adk_graph - Graph-based workflow engine for Erlang ADK.
 %%
 %% This module allows constructing stateful execution graphs where nodes can be 
 %% agents, functions, or sub-graphs, and edges define the conditional routing.
 -module(adk_graph).
 
 -export([new/0, add_node/3, add_edge/3, add_conditional_edge/3, set_entry_point/2]).
--export([compile/1, run/2]).
+-export([compile/1, run/2, run/3]).
 
 -type node_name() :: atom() | binary().
 -type node_fn() :: fun((map()) -> map()).
@@ -60,26 +60,41 @@ compile(Graph) ->
     case Graph#graph.entry_point of
         undefined -> {error, missing_entry_point};
         Entry ->
-            %% In a full implementation, we would validate that all edges point to valid nodes.
-            %% For brevity, we assume the graph is valid.
-            {ok, #compiled_graph{
-                nodes = Graph#graph.nodes,
-                edges = Graph#graph.edges,
-                entry_point = Entry
-            }}
+            case validate_graph(Entry, Graph#graph.nodes, Graph#graph.edges) of
+                ok ->
+                    {ok, #compiled_graph{
+                        nodes = Graph#graph.nodes,
+                        edges = Graph#graph.edges,
+                        entry_point = Entry
+                    }};
+                Error -> Error
+            end
     end.
 
 %% @doc Execute the compiled graph with an initial state.
 -spec run(CompiledGraph :: compiled_graph(), InitialState :: map()) -> {ok, map()} | {error, term()}.
 run(CompiledGraph, InitialState) ->
+    run(CompiledGraph, InitialState, #{}).
+
+%% @doc Execute with a configurable safety bound for cyclic graphs.
+-spec run(CompiledGraph :: compiled_graph(), InitialState :: map(), Opts :: map()) ->
+    {ok, map()} | {error, term()}.
+run(CompiledGraph, InitialState, Opts) ->
     Entry = CompiledGraph#compiled_graph.entry_point,
-    execute_node(CompiledGraph, Entry, InitialState).
+    MaxSteps = maps:get(max_steps, Opts, 10000),
+    case is_integer(MaxSteps) andalso MaxSteps > 0 of
+        true -> execute_node(CompiledGraph, Entry, InitialState, 0, MaxSteps);
+        false -> {error, {invalid_max_steps, MaxSteps}}
+    end.
 
 %% Internal Functions
 
-execute_node(_CompiledGraph, end_node, State) ->
+execute_node(_CompiledGraph, end_node, State, _Steps, _MaxSteps) ->
     {ok, State};
-execute_node(CompiledGraph, NodeName, State) ->
+execute_node(_CompiledGraph, _NodeName, _State, Steps, MaxSteps)
+  when Steps >= MaxSteps ->
+    {error, {max_steps_exceeded, MaxSteps}};
+execute_node(CompiledGraph, NodeName, State, Steps, MaxSteps) ->
     case maps:find(NodeName, CompiledGraph#compiled_graph.nodes) of
         {ok, NodeFn} ->
             try
@@ -90,7 +105,8 @@ execute_node(CompiledGraph, NodeName, State) ->
                 NextNode = determine_next_node(CompiledGraph, NodeName, NewState),
                 
                 %% 3. Recurse
-                execute_node(CompiledGraph, NextNode, NewState)
+                execute_node(CompiledGraph, NextNode, NewState,
+                             Steps + 1, MaxSteps)
             catch
                 E:R:S ->
                     logger:error("Graph execution error at ~p: ~p:~p~n~p", [NodeName, E, R, S]),
@@ -109,4 +125,28 @@ determine_next_node(CompiledGraph, NodeName, State) ->
         error ->
             %% If no edge is defined, implicitly end
             end_node
+    end.
+
+validate_graph(Entry, Nodes, Edges) ->
+    case maps:is_key(Entry, Nodes) of
+        false -> {error, {unknown_entry_point, Entry}};
+        true ->
+            maps:fold(fun(From, Target, Acc) ->
+                case Acc of
+                    ok -> validate_edge(From, Target, Nodes);
+                    Error -> Error
+                end
+            end, ok, Edges)
+    end.
+
+validate_edge(From, _Target, Nodes) when not is_map_key(From, Nodes) ->
+    {error, {unknown_edge_source, From}};
+validate_edge(_From, Target, _Nodes) when is_function(Target, 1) ->
+    ok;
+validate_edge(_From, end_node, _Nodes) ->
+    ok;
+validate_edge(_From, Target, Nodes) ->
+    case maps:is_key(Target, Nodes) of
+        true -> ok;
+        false -> {error, {unknown_edge_target, Target}}
     end.
