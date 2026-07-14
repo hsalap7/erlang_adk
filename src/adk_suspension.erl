@@ -181,6 +181,18 @@ pause_details({credential_required, Request}) when is_map(Request) ->
         {ok, Safe} -> Safe#{<<"type">> => <<"credential_request">>};
         {error, _} -> undefined
     end;
+pause_details({tool_confirmation, ActionId, Hint})
+  when is_binary(ActionId) ->
+    Base = #{<<"type">> => <<"tool_confirmation">>,
+             <<"action_id">> => ActionId},
+    Details = case Hint of
+        undefined -> Base;
+        _ -> Base#{<<"hint">> => Hint}
+    end,
+    case adk_tool_confirmation:valid_details(Details) of
+        true -> Details;
+        false -> undefined
+    end;
 pause_details(_) ->
     undefined.
 
@@ -213,6 +225,20 @@ validate_progress(_Details, _OperationId, _Update) ->
     {ok, term()} | {error, term()}.
 validate_resume(undefined, ToolResponse, _CredentialStore, _UserId) ->
     {ok, ToolResponse};
+validate_resume(#{<<"type">> := <<"tool_confirmation">>} = Details,
+                Response0, _CredentialStore, _UserId)
+  when is_map(Response0) ->
+    case {adk_tool_confirmation:valid_details(Details),
+          normalize_public_map(Response0)} of
+        {true, {ok, #{<<"confirmed">> := Confirmed} = Response}}
+          when is_boolean(Confirmed), map_size(Response) =:= 1 ->
+            {ok, Response};
+        _ ->
+            {error, invalid_tool_confirmation_response}
+    end;
+validate_resume(#{<<"type">> := <<"tool_confirmation">>},
+                _Response, _CredentialStore, _UserId) ->
+    {error, invalid_tool_confirmation_response};
 validate_resume(#{<<"type">> := <<"long_running">>,
                   <<"operation_id">> := OperationId},
                 Response0, _CredentialStore, _UserId)

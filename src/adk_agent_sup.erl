@@ -11,6 +11,12 @@ start_link() ->
 
 %% @doc Spawns a new ADK agent process dynamically under this supervisor.
 start_agent(Name, LLMConfig, Tools) ->
+    case adk_agent_tree:validate(Name, LLMConfig) of
+        ok -> start_validated_agent(Name, LLMConfig, Tools);
+        {error, _Reason} = Error -> Error
+    end.
+
+start_validated_agent(Name, LLMConfig, Tools) ->
     case adk_agent_config_store:put(Name, LLMConfig, Tools) of
         {ok, ConfigRef} ->
             case supervisor:start_child(?SERVER, [ConfigRef]) of

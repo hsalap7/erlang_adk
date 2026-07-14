@@ -98,7 +98,8 @@ valid_discriminator(Value) when is_binary(Value) ->
 valid_discriminator(_) -> false.
 
 valid_outcome({ok, _Output}) -> true;
-valid_outcome({tool_calls, Calls}) -> is_list(Calls);
+valid_outcome({tool_calls, Calls}) ->
+    adk_tool_call:validate_list(Calls) =:= ok;
 valid_outcome(streamed) -> true;
 valid_outcome(_) -> false.
 

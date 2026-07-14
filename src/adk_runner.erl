@@ -383,10 +383,12 @@ start_validated_resumed_stream(Runner, UserId, SessionId, ToolResponse,
               PauseState, Runtime);
         {error, _} = Error ->
             InvocationId = maps:get(<<"invocation_id">>, PauseState),
-            restore_pause_state_at_key(
-              Runner, UserId, SessionId,
-              continuation_key(InvocationId), PauseState),
-            Error
+            case restore_pause_state_at_key(
+                   Runner, UserId, SessionId,
+                   continuation_key(InvocationId), PauseState) of
+                ok -> Error;
+                {error, _} = RestoreError -> RestoreError
+            end
     end.
 
 start_resumed_stream(Runner, UserId, SessionId, ToolResponse,
@@ -1470,6 +1472,21 @@ execute_runner_tools(Runner, UserId, SessionId, InvId, Caller,
 execute_serial_descriptor(Runner, UserId, SessionId, InvId, Caller,
                           Descriptor, Rest, Runtime,
                           LlmCalls, ToolRounds) ->
+    case descriptor_confirmation(Descriptor) of
+        none ->
+            execute_ready_serial_descriptor(
+              Runner, UserId, SessionId, InvId, Caller,
+              Descriptor, Rest, Runtime, LlmCalls, ToolRounds);
+        Confirmation ->
+            pause_for_tool_confirmation(
+              Runner, UserId, SessionId, InvId, Caller,
+              Descriptor, Rest, Confirmation,
+              LlmCalls, ToolRounds, Runtime)
+    end.
+
+execute_ready_serial_descriptor(Runner, UserId, SessionId, InvId, Caller,
+                                Descriptor, Rest, Runtime,
+                                LlmCalls, ToolRounds) ->
     NameBin = maps:get(name, Descriptor),
     ArgsMap = maps:get(args, Descriptor),
     Sig = maps:get(thought_signature, Descriptor),
@@ -1488,6 +1505,15 @@ execute_serial_descriptor(Runner, UserId, SessionId, InvId, Caller,
             execute_failed_tool_with_callbacks(
               maps:get(reason, Descriptor), NameBin, ArgsMap,
               Context, Runtime);
+        invalid_tool_arguments ->
+            {result, adk_toolset:invalid_arguments_response(
+                       maps:get(reason, Descriptor))};
+        confirmation_error ->
+            {result,
+             #{<<"success">> => false,
+               <<"error">> =>
+                   #{<<"kind">> =>
+                         <<"tool_confirmation_evaluation_failed">>}}};
         sub_agent ->
             execute_sub_agent_with_callbacks(
               NameBin, ArgsMap, Context,
@@ -1522,41 +1548,166 @@ resolve_runner_call(Runner, UserId, SessionId, InvId, Call, Runtime) ->
              thought_signature => Sig,
              call_id => CallId,
              context => Context},
-    Resolved = case adk_toolset:resolve(
-                      Tools, NameBin, ArgsMap, Context) of
-        {ok, {module, Mod}} ->
-            Base#{kind => tool, module => Mod};
-        {ok, {resolved, ResolvedCall}} ->
-            Base#{kind => resolved_tool,
-                  resolved_call => ResolvedCall};
+    Preflighted = case adk_toolset:preflight(
+                           Tools, NameBin, ArgsMap) of
+        {ok, Target} ->
+            Base#{kind => tool_preflight, tool_target => Target};
         {error, not_found} ->
-            Base#{kind => sub_agent,
-                  sub_agent_spec => maps:get(
-                                      NameBin, SubAgents, undefined),
-                  sub_agents => SubAgents};
+            resolve_runner_sub_agent(
+              Base, NameBin, ArgsMap, SubAgents, Runtime);
+        {error, {invalid_tool_arguments, _} = Reason} ->
+            Base#{kind => invalid_tool_arguments, reason => Reason};
         {error, Reason} ->
             Base#{kind => tool_error, reason => Reason}
     end,
-    apply_tool_runtime_policy(Resolved, Runtime).
+    Admitted = apply_tool_runtime_policy(Preflighted, Runtime),
+    apply_tool_confirmation(
+      materialize_runner_tool(Admitted, Runtime)).
+
+materialize_runner_tool(#{kind := tool_preflight,
+                          tool_target := Target,
+                          name := Name, args := Args,
+                          context := Context} = Descriptor,
+                        Runtime) ->
+    Base = maps:remove(tool_target, Descriptor),
+    case adk_toolset:materialize(Target, Name, Args, Context) of
+        {ok, {module, Module}} ->
+            with_runner_agent_path(
+              Base#{kind => tool, module => Module}, Runtime);
+        {ok, {resolved, ResolvedCall}} ->
+            with_resolved_module_agent_path(
+              Base#{kind => resolved_tool,
+                    resolved_call => ResolvedCall}, Runtime);
+        {error, Reason} ->
+            Base#{kind => tool_error, reason => Reason}
+    end;
+materialize_runner_tool(Descriptor, _Runtime) ->
+    Descriptor.
+
+apply_tool_confirmation(#{kind := tool, module := Module,
+                          args := Args, context := Context} = Descriptor) ->
+    attach_tool_confirmation(
+      Descriptor,
+      adk_tool_confirmation:module_requirement(Module, Args, Context));
+apply_tool_confirmation(#{kind := resolved_tool,
+                          resolved_call := ResolvedCall,
+                          args := Args,
+                          context := Context} = Descriptor) ->
+    attach_tool_confirmation(
+      Descriptor,
+      adk_tool_confirmation:resolved_requirement(
+        ResolvedCall, Args, Context));
+apply_tool_confirmation(Descriptor) ->
+    %% Invalid arguments and runtime-policy denials deliberately reach this
+    %% clause, so neither a module callback nor dynamic confirmation metadata
+    %% is evaluated for a call which is already inadmissible.
+    Descriptor.
+
+attach_tool_confirmation(Descriptor, {ok, none}) ->
+    maps:remove(confirmation, Descriptor);
+attach_tool_confirmation(Descriptor, {ok, Confirmation}) ->
+    Descriptor#{confirmation => Confirmation};
+attach_tool_confirmation(Descriptor, {error, Reason}) ->
+    (maps:without([module, resolved_call, confirmation], Descriptor))#{
+        kind => confirmation_error,
+        reason => Reason}.
 
 normalize_call({Name, Args}) -> {Name, Args, undefined, undefined};
 normalize_call({Name, Args, Sig}) -> {Name, Args, Sig, undefined};
 normalize_call({Name, Args, Sig, CallId}) -> {Name, Args, Sig, CallId}.
 
-descriptor_parallel_safe(#{kind := tool, module := Mod} = Descriptor) ->
+resolve_runner_sub_agent(Base, Name, Args, SubAgents, Runtime) ->
+    case maps:find(Name, SubAgents) of
+        {ok, SubSpec} ->
+            Description = case SubSpec of
+                #{description := Desc} -> Desc;
+                _ -> <<"Delegate a task to this specialist agent.">>
+            end,
+            Schema = adk_agent_tool:schema(
+                       #{name => Name, description => Description}),
+            case adk_toolset:validate_arguments(Schema, Args) of
+                {ok, _CanonicalArgs} ->
+                    with_runner_agent_path(
+                      Base#{kind => sub_agent,
+                            sub_agent_spec => SubSpec,
+                            sub_agents => SubAgents}, Runtime);
+                {error, {invalid_tool_arguments, _} = Reason} ->
+                    Base#{kind => invalid_tool_arguments,
+                          reason => Reason}
+            end;
+        error ->
+            Base#{kind => sub_agent,
+                  sub_agent_spec => undefined,
+                  sub_agents => SubAgents}
+    end.
+
+with_runner_agent_path(Descriptor, Runtime) ->
+    Context = maps:get(context, Descriptor),
+    Descriptor#{context => with_runner_agent_path_context(Context, Runtime)}.
+
+with_resolved_module_agent_path(
+  #{resolved_call := #{module := Module}} = Descriptor, Runtime)
+  when is_atom(Module) ->
+    %% A module executor is trusted local code even when selected through a
+    %% dynamic catalog. Opaque execute closures remain on the minimal context.
+    with_runner_agent_path(Descriptor, Runtime);
+with_resolved_module_agent_path(Descriptor, _Runtime) ->
+    Descriptor.
+
+with_runner_agent_path_context(Context, Runtime) ->
+    case adk_agent_tree:validate_name(maps:get(name, Runtime, undefined)) of
+        {ok, Name} ->
+            Context#{'$adk_agent_path' => [Name]};
+        {error, _} ->
+            Context
+    end.
+
+descriptor_parallel_safe(Descriptor) ->
+    case descriptor_confirmation(Descriptor) of
+        none -> descriptor_kind_parallel_safe(Descriptor);
+        _Confirmation -> false
+    end.
+
+descriptor_kind_parallel_safe(#{kind := tool, module := Mod} = Descriptor) ->
     adk_tool_executor:is_parallel_safe(
       (descriptor_executor_base(Descriptor))#{module => Mod});
-descriptor_parallel_safe(#{kind := resolved_tool,
-                           resolved_call := ResolvedCall} = Descriptor) ->
+descriptor_kind_parallel_safe(#{kind := resolved_tool,
+                                resolved_call := ResolvedCall} = Descriptor) ->
     adk_tool_executor:is_parallel_safe(
       maps:merge(ResolvedCall, descriptor_executor_base(Descriptor)));
-descriptor_parallel_safe(#{kind := tool_error}) ->
+descriptor_kind_parallel_safe(#{kind := tool_error}) ->
     false;
-descriptor_parallel_safe(#{kind := policy_denied}) ->
+descriptor_kind_parallel_safe(#{kind := invalid_tool_arguments}) ->
     false;
-descriptor_parallel_safe(#{kind := sub_agent,
-                           sub_agent_spec := SubSpec}) ->
+descriptor_kind_parallel_safe(#{kind := confirmation_error}) ->
+    false;
+descriptor_kind_parallel_safe(#{kind := policy_denied}) ->
+    false;
+descriptor_kind_parallel_safe(#{kind := sub_agent,
+                                sub_agent_spec := SubSpec}) ->
     sub_agent_parallel_safe(SubSpec).
+
+descriptor_confirmation(Descriptor) ->
+    case maps:get(confirmation, Descriptor, none) of
+        #{required := true} = Confirmation -> Confirmation;
+        _ -> none
+    end.
+
+pause_for_tool_confirmation(Runner, UserId, SessionId, InvId, Caller,
+                            Descriptor, Rest, Confirmation,
+                            LlmCalls, ToolRounds, Runtime) ->
+    Name = maps:get(name, Descriptor),
+    Args = maps:get(args, Descriptor),
+    CallId = maps:get(call_id, Descriptor),
+    ActionId = adk_tool_confirmation:action_id(
+                 Name, Args, InvId, CallId),
+    Hint = maps:get(hint, Confirmation, undefined),
+    Summary = adk_tool_confirmation:summary(Name, Confirmation),
+    pause_invocation(
+      Runner, UserId, SessionId, InvId, Caller,
+      Name, Args, maps:get(thought_signature, Descriptor), CallId,
+      Rest, {tool_confirmation, ActionId, Hint}, Summary,
+      LlmCalls, ToolRounds, Runtime).
 
 sub_agent_parallel_safe(SubSpec) when is_map(SubSpec) ->
     parallel_flag(SubSpec)
@@ -1937,7 +2088,7 @@ lookup_sub_agent(Name) ->
     end.
 
 safe_sub_agent_prompt(SubPid, Prompt, Context) ->
-    try adk_agent:prompt(SubPid, Prompt, Context) of
+    try adk_agent:invoke(SubPid, Prompt, Context) of
         Result -> Result
     catch
         Class:Reason ->
@@ -1948,7 +2099,8 @@ safe_sub_agent_prompt(SubPid, Prompt, Context) ->
 delegation_context(Config, Context) ->
     Base0 = maps:with(
               [state, app_name, user_id, session_id, invocation_id,
-               artifact_service, artifact_scope], Context),
+               state_ref, artifact_service, artifact_scope,
+               '$adk_agent_path'], Context),
     Base = case maps:is_key(state, Base0) of
         true -> Base0;
         false -> Base0#{state => delegation_state(Context)}
@@ -2042,10 +2194,11 @@ resume_with_runtime(Runner, UserId, SessionId, ToolResponse,
                 %% Validation is deliberately before admission/model/tool
                 %% execution. A malformed or wrongly scoped response cannot
                 %% consume the single-use continuation.
-                restore_pause_state_at_key(
-                  Runner, UserId, SessionId,
-                  continuation_key(InvId), PauseState),
-                Caller ! {adk_error, self(), ValidationReason},
+                ErrorReason = restore_or_original_error(
+                                Runner, UserId, SessionId,
+                                continuation_key(InvId), PauseState,
+                                ValidationReason),
+                Caller ! {adk_error, self(), ErrorReason},
                 ok;
             {ok, ValidatedResponse} ->
                 case with_admission(
@@ -2060,11 +2213,12 @@ resume_with_runtime(Runner, UserId, SessionId, ToolResponse,
                         %% Admission failure occurs before resumed work starts.
                         %% Restore the consumed continuation so a busy
                         %% controller cannot destroy a valid external result.
-                        restore_pause_state_at_key(
-                          Runner, UserId, SessionId,
-                          continuation_key(InvId), PauseState),
-                        Caller ! {adk_error, self(),
-                                  {admission_failed, AdmissionReason}},
+                        ErrorReason = restore_or_original_error(
+                                        Runner, UserId, SessionId,
+                                        continuation_key(InvId), PauseState,
+                                        {admission_failed,
+                                         AdmissionReason}),
+                        Caller ! {adk_error, self(), ErrorReason},
                         ok;
                     _ -> ok
                 end
@@ -2090,11 +2244,71 @@ execute_admitted_resume(Runner, UserId, SessionId, ToolResponse,
              maps:get(<<"remaining_calls">>, PauseState, [])),
     LlmCalls = maps:get(<<"llm_calls">>, PauseState, 0),
     ToolRounds = maps:get(<<"tool_rounds">>, PauseState, 0),
+    Details = maps:get(<<"details">>, PauseState, undefined),
+    case Details of
+        #{<<"type">> := <<"tool_confirmation">>} ->
+            resume_tool_confirmation(
+              Runner, UserId, SessionId, InvId, Caller,
+              NameBin, ArgsMap, Sig, CallId, Rest,
+              ToolResponse, Runtime, LlmCalls, ToolRounds);
+        _ ->
+            Context = resumed_tool_context(
+                        Runner, UserId, SessionId, InvId, CallId,
+                        NameBin, ArgsMap, Runtime),
+            Result = complete_resumed_tool(
+                       NameBin, ArgsMap, Context, ToolResponse, Runtime),
+            record_tool_response(
+              Runner, UserId, SessionId, InvId, Caller,
+              NameBin, Result, Sig, CallId, Runtime),
+            continue_resumed_invocation(
+              Runner, UserId, SessionId, InvId, Caller,
+              Rest, Runtime, LlmCalls, ToolRounds)
+    end.
+
+resumed_tool_context(Runner, UserId, SessionId, InvId, CallId,
+                     Name, Args, Runtime) ->
     Context = tool_context(Runner, UserId, SessionId, InvId, CallId),
-    Result = complete_resumed_tool(NameBin, ArgsMap, Context,
-                                   ToolResponse, Runtime),
+    case adk_toolset:preflight(maps:get(tools, Runtime), Name, Args) of
+        {ok, {module_target, _Module}} ->
+            with_runner_agent_path_context(Context, Runtime);
+        _ ->
+            Context
+    end.
+
+resume_tool_confirmation(Runner, UserId, SessionId, InvId, Caller,
+                         NameBin, ArgsMap, Sig, CallId, Rest,
+                         #{<<"confirmed">> := true}, Runtime,
+                         LlmCalls, ToolRounds) ->
+    %% Resolve again after approval.  This rechecks the immutable catalog's
+    %% live backend, the current Runner policy, and a conditional confirmation
+    %% callback before any executor or credential-producing code is entered.
+    Call = {NameBin, ArgsMap, Sig, CallId},
+    Descriptor = resolve_runner_call(
+                   Runner, UserId, SessionId, InvId, Call, Runtime),
+    case execute_ready_serial_descriptor(
+           Runner, UserId, SessionId, InvId, Caller,
+           Descriptor, Rest, Runtime, LlmCalls, ToolRounds) of
+        ok ->
+            run_loop(Runner, UserId, SessionId, InvId, Caller, Runtime,
+                     LlmCalls, ToolRounds);
+        {paused, _PauseEvent} ->
+            ok
+    end;
+resume_tool_confirmation(Runner, UserId, SessionId, InvId, Caller,
+                         NameBin, ArgsMap, Sig, CallId, Rest,
+                         #{<<"confirmed">> := false}, Runtime,
+                         LlmCalls, ToolRounds) ->
+    ActionId = adk_tool_confirmation:action_id(
+                 NameBin, ArgsMap, InvId, CallId),
+    Result = adk_tool_confirmation:rejection_response(ActionId),
     record_tool_response(Runner, UserId, SessionId, InvId, Caller,
                          NameBin, Result, Sig, CallId, Runtime),
+    continue_resumed_invocation(
+      Runner, UserId, SessionId, InvId, Caller,
+      Rest, Runtime, LlmCalls, ToolRounds).
+
+continue_resumed_invocation(Runner, UserId, SessionId, InvId, Caller,
+                            Rest, Runtime, LlmCalls, ToolRounds) ->
     case execute_runner_tools(
            Runner, UserId, SessionId, InvId, Caller, Rest, Runtime,
            LlmCalls, ToolRounds) of
@@ -2175,14 +2389,18 @@ claim_pause_state_by_key(Runner, UserId, SessionId, Key,
                 ok ->
                     {ok, PauseState};
                 {error, _} = Error ->
-                    restore_pause_state_at_key(
-                      Runner, UserId, SessionId, Key, PauseState),
-                    Error
+                    case restore_pause_state_at_key(
+                           Runner, UserId, SessionId, Key, PauseState) of
+                        ok -> Error;
+                        {error, _} = RestoreError -> RestoreError
+                    end
             end;
         {ok, MalformedState} ->
-            restore_pause_state_at_key(
-              Runner, UserId, SessionId, Key, MalformedState),
-            {error, invalid_pause_state};
+            case restore_pause_state_at_key(
+                   Runner, UserId, SessionId, Key, MalformedState) of
+                ok -> {error, invalid_pause_state};
+                {error, _} = RestoreError -> RestoreError
+            end;
         {error, not_found} -> {error, no_paused_invocation};
         {error, _} = Error -> Error
     end.
@@ -2219,7 +2437,8 @@ validate_pause_continuation(PauseState) ->
     Remaining = maps:get(<<"remaining_calls">>, PauseState, []),
     Details = maps:get(<<"details">>, PauseState, undefined),
     case valid_json_optional(Signature) andalso valid_json_optional(CallId)
-         andalso valid_pause_details(Details) of
+         andalso valid_pause_details(Details)
+         andalso valid_pause_action(PauseState, Details) of
         false ->
             {error, invalid_pause_state};
         true ->
@@ -2237,6 +2456,17 @@ valid_pause_details(Details) when is_map(Details) ->
         _ -> false
     end;
 valid_pause_details(_) -> false.
+
+valid_pause_action(_PauseState, undefined) -> true;
+valid_pause_action(PauseState,
+                   #{<<"type">> := <<"tool_confirmation">>} = Details) ->
+    adk_tool_confirmation:matches_action(
+      Details,
+      maps:get(<<"tool_name">>, PauseState),
+      maps:get(<<"tool_args">>, PauseState),
+      maps:get(<<"invocation_id">>, PauseState),
+      from_json_optional(maps:get(<<"call_id">>, PauseState, null)));
+valid_pause_action(_PauseState, _OtherDetails) -> true.
 
 %% Version-1 continuations persist tool calls with the event content codec.
 %% Tuple lists remain readable so pauses created by v0.2.x can still resume.
@@ -2262,9 +2492,37 @@ valid_json_optional(Value) -> is_binary(Value).
 
 restore_pause_state_at_key(Runner, UserId, SessionId, Key, PauseState) ->
     SessionSvc = Runner#runner.session_svc,
-    _ = SessionSvc:update_state(Runner#runner.app_name, UserId, SessionId,
-                                #{Key => PauseState}),
-    ok.
+    try SessionSvc:update_state(
+          Runner#runner.app_name, UserId, SessionId,
+          #{Key => PauseState}) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            continuation_restore_error(
+              adk_failure:external(
+                runner, continuation_restore, Reason));
+        InvalidReply ->
+            continuation_restore_error(
+              adk_failure:external(
+                runner, continuation_restore,
+                {invalid_update_state_reply, InvalidReply}))
+    catch
+        Class:Reason:_Stack ->
+            continuation_restore_error(
+              adk_failure:exception(
+                runner, continuation_restore, Class, Reason))
+    end.
+
+restore_or_original_error(Runner, UserId, SessionId, Key, PauseState,
+                          OriginalReason) ->
+    case restore_pause_state_at_key(
+           Runner, UserId, SessionId, Key, PauseState) of
+        ok -> OriginalReason;
+        {error, RestoreReason} -> RestoreReason
+    end.
+
+continuation_restore_error(Failure) ->
+    {error, {continuation_restore_failed, Failure}}.
 
 pause_candidates(Runner, UserId, SessionId) ->
     SessionSvc = Runner#runner.session_svc,
@@ -2391,6 +2649,9 @@ check_runtime_content_policy(Runtime, Subject, Content) ->
         {deny, Decision} -> {deny, Decision}
     end.
 
+apply_tool_runtime_policy(#{kind := invalid_tool_arguments} = Descriptor,
+                          _Runtime) ->
+    Descriptor;
 apply_tool_runtime_policy(Descriptor,
                           #{runtime_policy := disabled}) ->
     Descriptor;
@@ -2403,7 +2664,7 @@ apply_tool_runtime_policy(Descriptor, Runtime) ->
         {deny, Decision} ->
             %% Drop all executable resolution data. The remaining descriptor
             %% is structural and can only take the denial path.
-            (maps:without([module, resolved_call, sub_agent_spec,
+            (maps:without([module, resolved_call, tool_target, sub_agent_spec,
                            sub_agents, reason], Descriptor))#{
                 kind => policy_denied,
                 policy_decision => Decision}

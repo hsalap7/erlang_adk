@@ -16,7 +16,7 @@ new(Config) when is_map(Config) ->
           <<"protocolBinding">> => <<"JSONRPC">>,
           <<"protocolVersion">> => <<"1.0">>}
       ],
-      <<"version">> => maps:get(version, Config, <<"0.3.0">>),
+      <<"version">> => maps:get(version, Config, <<"0.4.0">>),
       <<"capabilities">> => #{
         <<"streaming">> => maps:get(streaming, Config, true),
         <<"pushNotifications">> => false,

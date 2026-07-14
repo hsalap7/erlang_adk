@@ -37,6 +37,15 @@ deterministic_pagination_and_cursor_validation() ->
                       ?APP, ?USER, #{session_id => Id})
       end,
       [<<"c">>, <<"a">>, <<"b">>]),
+    %% Creation uses millisecond wall time. Pin fixture timestamps so the test
+    %% verifies timestamp-descending order plus the ID tie-break without
+    %% depending on whether these three calls cross a millisecond boundary.
+    true = ets:update_element(
+             adk_sessions, {?APP, ?USER, <<"c">>}, {4, 1}),
+    true = ets:update_element(
+             adk_sessions, {?APP, ?USER, <<"a">>}, {4, 2}),
+    true = ets:update_element(
+             adk_sessions, {?APP, ?USER, <<"b">>}, {4, 2}),
     Opts = #{limit => 2, cursor_secret => ?SECRET},
     {ok, First1} = adk_session_query:list(
                      erlang_adk_session, ?APP, ?USER, Opts),

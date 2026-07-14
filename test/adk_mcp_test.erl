@@ -57,6 +57,54 @@ mcp_stdio_request_timeout_test_() ->
 streamable_http_round_trip_test_() ->
     {timeout, 20, fun streamable_http_round_trip/0}.
 
+streamable_http_does_not_replay_tool_after_session_loss_test_() ->
+    {timeout, 20, fun streamable_http_does_not_replay_tool_after_session_loss/0}.
+
+streamable_http_does_not_replay_tool_after_session_loss() ->
+    TestPid = self(),
+    Tool = #{schema =>
+                 #{<<"name">> => <<"side_effect">>,
+                   <<"description">> => <<"Count executions">>,
+                   <<"inputSchema">> => #{<<"type">> => <<"object">>}},
+             execute => fun(_Args, _Context) ->
+                 TestPid ! side_effect_executed,
+                 {ok, <<"done">>}
+             end},
+    {ok, Server} = adk_mcp_server:start(
+                     <<"streamable_http">>,
+                     #{port => 0, tools => [Tool]}),
+    try
+        {ok, #{url := Url}} = adk_mcp_server:endpoint(Server),
+        {ok, Client} = adk_mcp_client:connect(
+                         <<"streamable_http">>, Url),
+        try
+            OldSession = maps:get(session_id, sys:get_state(Client)),
+            ok = adk_mcp_server:delete_session(
+                   Server, OldSession, <<"2025-11-25">>),
+            ?assertEqual(
+               {error, {mcp_session_lost, request_not_replayed}},
+               adk_mcp_client:execute_tool(
+                 Client, <<"side_effect">>, #{})),
+            receive side_effect_executed -> ?assert(false)
+            after 0 -> ok
+            end,
+            ?assertNotEqual(
+               OldSession, maps:get(session_id, sys:get_state(Client))),
+            {ok, _Result} = adk_mcp_client:execute_tool(
+                              Client, <<"side_effect">>, #{}),
+            receive side_effect_executed -> ok
+            after 1000 -> ?assert(false)
+            end,
+            receive side_effect_executed -> ?assert(false)
+            after 0 -> ok
+            end
+        after
+            ok = adk_mcp_client:close(Client)
+        end
+    after
+        ok = adk_mcp_server:stop(Server)
+    end.
+
 streamable_http_round_trip() ->
     Token = <<"fixture-token-at-least-16-bytes">>,
     Resource = #{uri => <<"memo://readme">>,

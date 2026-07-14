@@ -16,8 +16,8 @@ global_instruction_test_() ->
 
 root_global_instruction_reaches_dynamic_sub_agent_tree() ->
     Suffix = integer_to_binary(erlang:unique_integer([positive])),
-    SubName = <<"GlobalInstructionSub-", Suffix/binary>>,
-    RootName = <<"GlobalInstructionRoot-", Suffix/binary>>,
+    SubName = <<"GlobalInstructionSub_", Suffix/binary>>,
+    RootName = <<"GlobalInstructionRoot_", Suffix/binary>>,
     App = <<"global-instruction-app">>,
     User = <<"user-1">>,
     Session = <<"global-instruction-session-", Suffix/binary>>,
@@ -78,8 +78,8 @@ root_global_instruction_reaches_dynamic_sub_agent_tree() ->
 
 empty_root_global_still_suppresses_child_global() ->
     Suffix = integer_to_binary(erlang:unique_integer([positive])),
-    SubName = <<"EmptyGlobalSub-", Suffix/binary>>,
-    RootName = <<"EmptyGlobalRoot-", Suffix/binary>>,
+    SubName = <<"EmptyGlobalSub_", Suffix/binary>>,
+    RootName = <<"EmptyGlobalRoot_", Suffix/binary>>,
     {ok, SubPid} = erlang_adk:spawn_agent(
                      SubName,
                      #{provider => adk_llm_probe,
@@ -115,9 +115,9 @@ empty_root_global_still_suppresses_child_global() ->
 
 nested_delegation_keeps_root_global_scope() ->
     Suffix = integer_to_binary(erlang:unique_integer([positive])),
-    LeafName = <<"NestedGlobalLeaf-", Suffix/binary>>,
-    MiddleName = <<"NestedGlobalMiddle-", Suffix/binary>>,
-    RootName = <<"NestedGlobalRoot-", Suffix/binary>>,
+    LeafName = <<"NestedGlobalLeaf_", Suffix/binary>>,
+    MiddleName = <<"NestedGlobalMiddle_", Suffix/binary>>,
+    RootName = <<"NestedGlobalRoot_", Suffix/binary>>,
     App = <<"nested-global-instruction-app">>,
     User = <<"user-1">>,
     Session = <<"nested-global-instruction-session-", Suffix/binary>>,

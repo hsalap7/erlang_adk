@@ -28,6 +28,35 @@ provider_validation_errors_are_values_test() ->
     ?assertEqual({error, {invalid_llm_config, invalid}},
                  adk_llm:validate_config(invalid)).
 
+live_gemini_wrapper_preserves_provider_contract_test() ->
+    {ok, Capabilities} =
+        adk_llm:capabilities(readme_live_gemini_SUITE),
+    ?assertEqual(true, maps:get(generation_config, Capabilities)),
+    ?assertEqual(true, maps:get(content_streaming, Capabilities)),
+    ?assertEqual(
+       ok,
+       adk_llm:validate_config(
+         #{provider => readme_live_gemini_SUITE,
+           model => <<"gemini-3.1-flash-lite">>,
+           max_tokens => 512,
+           request_timeout => 15000})).
+
+live_gemini_wrapper_recognizes_both_rate_limit_shapes_test() ->
+    ?assert(
+       readme_live_gemini_SUITE:retryable_rate_limit(
+         {error, {http_status, 429, <<"must-not-be-logged">>}})),
+    ?assert(
+       readme_live_gemini_SUITE:retryable_rate_limit(
+         {error, {adk_failure,
+                  #{component => llm_provider,
+                    operation => generate,
+                    class => external,
+                    status => 429,
+                    reason => http_status}}})),
+    ?assertNot(
+       readme_live_gemini_SUITE:retryable_rate_limit(
+         {error, {http_status, 503, <<"unavailable">>}})).
+
 gemini_config_validation_and_redaction_test() ->
     Valid = #{provider => adk_llm_gemini,
               model => <<"gemini-3.1-flash-lite">>,
@@ -63,7 +92,7 @@ gemini_config_validation_and_redaction_test() ->
 
 gemini_agent_rejects_unknown_config_at_start_test() ->
     {ok, _} = application:ensure_all_started(erlang_adk),
-    Name = <<"StrictGeminiConfig-",
+    Name = <<"StrictGeminiConfig_",
              (integer_to_binary(
                 erlang:unique_integer([positive])))/binary>>,
     ?assertEqual(

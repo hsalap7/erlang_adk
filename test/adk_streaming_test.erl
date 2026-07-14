@@ -269,4 +269,4 @@ delete_session(SessionId) ->
 unique(Prefix) ->
     Suffix = integer_to_binary(
                erlang:unique_integer([positive, monotonic])),
-    <<Prefix/binary, "-", Suffix/binary>>.
+    <<Prefix/binary, "_", Suffix/binary>>.

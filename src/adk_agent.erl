@@ -1,7 +1,7 @@
 -module(adk_agent).
 -behaviour(gen_server).
 
--export([start_link/1, start_link/3, stop/1, prompt/2, prompt/3,
+-export([start_link/1, start_link/3, stop/1, prompt/2, prompt/3, invoke/3,
          delegate/2, delegate/3, delegate/4,
          run_with_events/3, run_with_events/4,
          stream_with_events/6,
@@ -20,12 +20,19 @@
     agent_spec :: adk_agent_spec:spec(),
     config_ref = undefined :: undefined | binary(),
     turn_timeout = infinity :: infinity | non_neg_integer(),
+    max_concurrent_invocations = 32 :: pos_integer(),
     pending = undefined :: undefined | queue:queue(map()),
-    active = undefined :: undefined | map()
+    active = undefined :: undefined | map(),
+    lane_pending = #{} :: map(),
+    lane_active = #{} :: map(),
+    ready_lanes = undefined :: undefined | queue:queue(term()),
+    ready_lane_set = #{} :: map()
 }).
 
 -define(DEFAULT_CALL_TIMEOUT, 60000).
 -define(DEFAULT_TURN_TIMEOUT, 60000).
+-define(DEFAULT_MAX_CONCURRENT_INVOCATIONS, 32).
+-define(MAX_DELEGATION_DEPTH, 64).
 -define(DEFAULT_MAX_STREAM_OUTPUT_BYTES, 16777216).
 -define(MAX_STREAM_OUTPUT_BYTES_CEILING, 67108864).
 
@@ -71,6 +78,15 @@ prompt(Pid, Message) ->
 %% boundaries; callers should normally use prompt/2.
 prompt(Pid, Message, Context) when is_map(Context) ->
     gen_server:call(Pid, {prompt, Message, Context}, agent_call_timeout()).
+
+%% @doc Run one invocation-scoped prompt without reading or mutating the
+%% compatibility prompt history stored by the agent process. Runner sessions,
+%% AgentTool calls, and collaboration branches must use this entry point so a
+%% reusable agent specification cannot leak conversation history between
+%% users or sessions.
+-spec invoke(pid(), term(), map()) -> {ok, term()} | {error, term()}.
+invoke(Pid, Message, Context) when is_pid(Pid), is_map(Context) ->
+    gen_server:call(Pid, {invoke, Message, Context}, agent_call_timeout()).
 
 delegate(Pid, Message) ->
     gen_server:cast(Pid, {delegate, Message, undefined}).
@@ -163,13 +179,20 @@ init([Name, LLMConfig, Tools]) ->
 init_agent(Name, LLMConfig, Tools, ConfigRef) ->
     case resolve_turn_timeout(LLMConfig) of
         {ok, TurnTimeout} ->
-            init_agent_with_timeout(
-              Name, LLMConfig, Tools, ConfigRef, TurnTimeout);
+            case resolve_max_concurrent_invocations(LLMConfig) of
+                {ok, MaxConcurrentInvocations} ->
+                    init_agent_with_timeout(
+                      Name, LLMConfig, Tools, ConfigRef, TurnTimeout,
+                      MaxConcurrentInvocations);
+                {error, Reason} ->
+                    {stop, {invalid_max_concurrent_invocations, Reason}}
+            end;
         {error, Reason} ->
             {stop, {invalid_agent_turn_timeout, Reason}}
     end.
 
-init_agent_with_timeout(Name, LLMConfig, Tools, ConfigRef, TurnTimeout) ->
+init_agent_with_timeout(Name, LLMConfig, Tools, ConfigRef, TurnTimeout,
+                        MaxConcurrentInvocations) ->
     case adk_llm:capabilities(LLMConfig) of
         {ok, Capabilities} ->
             case adk_agent_spec:from_config(LLMConfig, Capabilities) of
@@ -178,7 +201,8 @@ init_agent_with_timeout(Name, LLMConfig, Tools, ConfigRef, TurnTimeout) ->
                         ok ->
                             init_validated_agent(
                               Name, LLMConfig, Tools, AgentSpec,
-                              ConfigRef, TurnTimeout);
+                              ConfigRef, TurnTimeout,
+                              MaxConcurrentInvocations);
                         {error, Reason} ->
                             {stop, {invalid_llm_config, Reason}}
                     end;
@@ -190,17 +214,19 @@ init_agent_with_timeout(Name, LLMConfig, Tools, ConfigRef, TurnTimeout) ->
     end.
 
 init_validated_agent(Name, LLMConfig, Tools, AgentSpec,
-                     ConfigRef, TurnTimeout) ->
-    case adk_toolset:expand_tools(Tools) of
+                     ConfigRef, TurnTimeout, MaxConcurrentInvocations) ->
+    SubAgents = maps:get(sub_agents, LLMConfig, #{}),
+    case model_tools(Tools, SubAgents) of
         {ok, _ModelTools} ->
             init_validated_tools(Name, LLMConfig, Tools, AgentSpec,
-                                 ConfigRef, TurnTimeout);
+                                 ConfigRef, TurnTimeout,
+                                 MaxConcurrentInvocations);
         {error, Reason} ->
             {stop, {invalid_tools, Reason}}
     end.
 
 init_validated_tools(Name, LLMConfig, Tools, AgentSpec,
-                     ConfigRef, TurnTimeout) ->
+                     ConfigRef, TurnTimeout, MaxConcurrentInvocations) ->
     SessionId = maps:get(session_id, LLMConfig, undefined),
     SessionStore = maps:get(session_store, LLMConfig, erlang_adk_session),
     ok = ensure_session_store(SessionStore),
@@ -225,7 +251,9 @@ init_validated_tools(Name, LLMConfig, Tools, AgentSpec,
                 session_id = SessionId, session_store = SessionStore,
                 memory = Memory1, sub_agents = SubAgents,
                 agent_spec = AgentSpec, config_ref = ConfigRef,
-                turn_timeout = TurnTimeout, pending = queue:new()}}.
+                turn_timeout = TurnTimeout,
+                max_concurrent_invocations = MaxConcurrentInvocations,
+                pending = queue:new(), ready_lanes = queue:new()}}.
 
 handle_call({prompt, Message}, From, State) ->
     handle_call({prompt, Message, #{}}, From, State);
@@ -236,16 +264,32 @@ handle_call({prompt, Message, InvocationContext}, From, State)
                            context => InvocationContext}),
     {noreply, enqueue_turn(Turn, State)};
 
+handle_call({invoke, Message, InvocationContext}, From, State)
+  when is_map(InvocationContext) ->
+    Turn = new_sync_turn(invoke, From,
+                         #{message => Message,
+                           context => InvocationContext,
+                           schedule_key =>
+                               invocation_lane(InvocationContext)}),
+    {noreply, enqueue_turn(Turn, State)};
+
 handle_call({run_with_events, HistoryEvents, InvocationId}, From, State) ->
-    handle_call({run_with_events, HistoryEvents, InvocationId, #{}},
-                From, State);
+    %% The context-free compatibility API stays on the legacy FIFO. Only the
+    %% scoped API below is eligible for per-session concurrency.
+    Turn = new_sync_turn(
+             run_with_events, From,
+             #{history_events => HistoryEvents,
+               invocation_id => InvocationId,
+               context => #{}}),
+    {noreply, enqueue_turn(Turn, State)};
 handle_call({run_with_events, HistoryEvents, InvocationId, Context},
             From, State) when is_map(Context) ->
     Turn = new_sync_turn(
              run_with_events, From,
              #{history_events => HistoryEvents,
                invocation_id => InvocationId,
-               context => Context}),
+               context => Context,
+               schedule_key => invocation_lane(Context)}),
     {noreply, enqueue_turn(Turn, State)};
 
 handle_call({prepare_stream, HistoryEvents, _InvocationId, Context},
@@ -279,19 +323,19 @@ handle_cast({delegate, Message, ReplyToPid}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({agent_turn_result, TurnRef, WorkerPid, Result},
-            State = #state{active = Active})
-  when is_map(Active) ->
-    case active_matches(TurnRef, WorkerPid, Active) of
-        true -> {noreply, complete_turn(Result, State)};
-        false -> {noreply, State}
+handle_info({agent_turn_result, TurnRef, WorkerPid, Result}, State) ->
+    case locate_active(TurnRef, WorkerPid, State) of
+        legacy -> {noreply, complete_turn(Result, State)};
+        {lane, Lane} ->
+            {noreply, complete_lane_turn(Lane, Result, State)};
+        not_found -> {noreply, State}
     end;
-handle_info({agent_turn_failure, TurnRef, WorkerPid, Failure},
-            State = #state{active = Active})
-  when is_map(Active) ->
-    case active_matches(TurnRef, WorkerPid, Active) of
-        true -> {noreply, fail_turn(turn_failure_reason(Failure), State)};
-        false -> {noreply, State}
+handle_info({agent_turn_failure, TurnRef, WorkerPid, Failure}, State) ->
+    Reason = turn_failure_reason(Failure),
+    case locate_active(TurnRef, WorkerPid, State) of
+        legacy -> {noreply, fail_turn(Reason, State)};
+        {lane, Lane} -> {noreply, fail_lane_turn(Lane, Reason, State)};
+        not_found -> {noreply, State}
     end;
 handle_info({'DOWN', Monitor, process, _Pid, Reason}, State) ->
     {noreply, handle_turn_down(Monitor, Reason, State)};
@@ -302,7 +346,9 @@ handle_info(_Info, State) ->
 
 terminate(Reason, State) ->
     cancel_active_worker(State#state.active),
+    cancel_lane_workers(State#state.lane_active),
     demonitor_pending(State#state.pending),
+    demonitor_lane_pending(State#state.lane_pending),
     maybe_delete_config_ref(Reason, State#state.config_ref),
     ok.
 
@@ -315,10 +361,14 @@ code_change(_OldVsn, State, _Extra) ->
 format_status(Status) ->
     maps:map(
       fun(state, State = #state{}) ->
+              ActiveTurns = active_turn_count(State),
               #{session_configured =>
                     State#state.session_id =/= undefined,
-                queued_turns => safe_queue_len(State#state.pending),
-                active_turn => is_map(State#state.active)};
+                queued_turns => queued_turn_count(State),
+                active_turn => ActiveTurns > 0,
+                active_turns => ActiveTurns,
+                max_concurrent_invocations =>
+                    State#state.max_concurrent_invocations};
          (message, _Message) -> adk_secret_redactor:marker();
          (log, _Log) -> [];
          (reason, _Reason) -> adk_secret_redactor:marker();
@@ -337,6 +387,17 @@ resolve_turn_timeout(Config) ->
         Invalid -> {error, Invalid}
     end.
 
+resolve_max_concurrent_invocations(Config) ->
+    Value = maps:get(
+              max_concurrent_invocations, Config,
+              application:get_env(
+                erlang_adk, max_concurrent_invocations,
+                ?DEFAULT_MAX_CONCURRENT_INVOCATIONS)),
+    case Value of
+        Max when is_integer(Max), Max > 0 -> {ok, Max};
+        _Invalid -> {error, expected_positive_integer}
+    end.
+
 new_sync_turn(Kind, From, Payload) ->
     Caller = caller_pid(From),
     Monitor = erlang:monitor(process, Caller),
@@ -351,8 +412,20 @@ new_sync_turn(Kind, From, Payload) ->
 caller_pid({Pid, _Tag}) when is_pid(Pid) -> Pid.
 
 enqueue_turn(Turn, State0) ->
+    case maps:get(schedule_key, Turn, legacy) of
+        legacy -> enqueue_legacy_turn(Turn, State0);
+        Lane -> enqueue_lane_turn(Lane, Turn, State0)
+    end.
+
+enqueue_legacy_turn(Turn, State0) ->
     Pending0 = ensure_queue(State0#state.pending),
     dispatch_next(State0#state{pending = queue:in(Turn, Pending0)}).
+
+enqueue_lane_turn(Lane, Turn, State0) ->
+    PendingByLane0 = State0#state.lane_pending,
+    Pending0 = maps:get(Lane, PendingByLane0, queue:new()),
+    PendingByLane1 = PendingByLane0#{Lane => queue:in(Turn, Pending0)},
+    dispatch_lane(Lane, State0#state{lane_pending = PendingByLane1}).
 
 dispatch_next(State = #state{active = Active}) when is_map(Active) ->
     State;
@@ -371,6 +444,78 @@ dispatch_next(State0) ->
             end
     end.
 
+dispatch_lane(Lane, State = #state{lane_active = ActiveByLane}) ->
+    State1 = case maps:is_key(Lane, ActiveByLane) of
+        true -> State;
+        false -> mark_lane_ready(Lane, State)
+    end,
+    dispatch_ready_lanes(State1).
+
+mark_lane_ready(Lane, State0) ->
+    PendingByLane0 = State0#state.lane_pending,
+    Pending0 = maps:get(Lane, PendingByLane0, queue:new()),
+    ReadySet0 = State0#state.ready_lane_set,
+    case queue:is_empty(Pending0) orelse maps:is_key(Lane, ReadySet0) of
+        true -> State0;
+        false ->
+            Ready0 = ensure_queue(State0#state.ready_lanes),
+            State0#state{
+              ready_lanes = queue:in(Lane, Ready0),
+              ready_lane_set = ReadySet0#{Lane => true}}
+    end.
+
+dispatch_ready_lanes(
+  State = #state{lane_active = ActiveByLane,
+                 max_concurrent_invocations = Max}) ->
+    case maps:size(ActiveByLane) >= Max of
+        true -> State;
+        false -> dispatch_next_ready_lane(State)
+    end.
+
+dispatch_next_ready_lane(State0) ->
+    Ready0 = ensure_queue(State0#state.ready_lanes),
+    case queue:out(Ready0) of
+        {empty, _} ->
+            State0#state{ready_lanes = Ready0,
+                         ready_lane_set = #{}};
+        {{value, Lane}, Ready1} ->
+            ReadySet1 = maps:remove(Lane, State0#state.ready_lane_set),
+            State1 = State0#state{ready_lanes = Ready1,
+                                  ready_lane_set = ReadySet1},
+            case maps:is_key(Lane, State1#state.lane_active) of
+                true -> dispatch_ready_lanes(State1);
+                false -> dispatch_ready_lane_turn(Lane, State1)
+            end
+    end.
+
+dispatch_ready_lane_turn(Lane, State0) ->
+    case take_live_lane_turn(Lane, State0) of
+        {none, State1} -> dispatch_ready_lanes(State1);
+        {turn, Turn, State1} ->
+            dispatch_ready_lanes(start_lane_turn(Lane, Turn, State1))
+    end.
+
+take_live_lane_turn(Lane, State0) ->
+    PendingByLane0 = State0#state.lane_pending,
+    Pending0 = maps:get(Lane, PendingByLane0, queue:new()),
+    case queue:out(Pending0) of
+        {empty, _} ->
+            {none,
+             State0#state{
+               lane_pending = maps:remove(Lane, PendingByLane0)}};
+        {{value, Turn}, Pending1} ->
+            PendingByLane1 = put_lane_queue(
+                               Lane, Pending1, PendingByLane0),
+            State1 = State0#state{lane_pending = PendingByLane1},
+            case turn_caller_alive(Turn) of
+                true -> {turn, Turn, State1};
+                false ->
+                    demonitor_ref(
+                      maps:get(caller_monitor, Turn, undefined)),
+                    take_live_lane_turn(Lane, State1)
+            end
+    end.
+
 turn_caller_alive(#{caller := Caller})
   when is_pid(Caller), node(Caller) =:= node() ->
     is_process_alive(Caller);
@@ -384,8 +529,7 @@ start_turn(Turn, State0) ->
     TurnRef = maps:get(turn_ref, Turn),
     ExecutionTurn = maps:without(
                       [from, caller, caller_monitor, reply_to], Turn),
-    ExecutionState = State0#state{pending = queue:new(),
-                                  active = undefined},
+    ExecutionState = execution_state(State0),
     Owner = self(),
     Work = fun() ->
         execute_agent_turn(ExecutionTurn, ExecutionState, Owner)
@@ -413,11 +557,71 @@ start_turn(Turn, State0) ->
                 agent, turn_worker_start, Reason), State1)
     end.
 
+start_lane_turn(Lane, Turn, State0) ->
+    TurnRef = maps:get(turn_ref, Turn),
+    ExecutionTurn = maps:without(
+                      [from, caller, caller_monitor, reply_to,
+                       schedule_key], Turn),
+    ExecutionState = execution_state(State0),
+    Owner = self(),
+    Work = fun() ->
+        execute_agent_turn(ExecutionTurn, ExecutionState, Owner)
+    end,
+    ActiveByLane0 = State0#state.lane_active,
+    State1 = State0#state{
+               lane_active = ActiveByLane0#{Lane => Turn}},
+    case adk_agent_turn_sup:start_turn(
+           Owner, TurnRef, Work, State0#state.turn_timeout) of
+        {ok, WorkerPid} ->
+            activate_lane_worker(Lane, Turn, WorkerPid, State1);
+        {ok, WorkerPid, _Info} ->
+            activate_lane_worker(Lane, Turn, WorkerPid, State1);
+        {error, Reason} ->
+            fail_lane_turn(
+              Lane,
+              adk_failure:external(
+                agent, turn_worker_start, Reason), State1)
+    end.
+
+activate_lane_worker(Lane, Turn, WorkerPid, State0) ->
+    WorkerMonitor = erlang:monitor(process, WorkerPid),
+    Active = Turn#{worker_pid => WorkerPid,
+                   worker_monitor => WorkerMonitor,
+                   abandoned => false},
+    ActiveByLane = (State0#state.lane_active)#{Lane => Active},
+    ok = adk_agent_turn_worker:begin_work(WorkerPid),
+    State0#state{lane_active = ActiveByLane}.
+
+execution_state(State) ->
+    %% A worker closure must retain only immutable agent runtime state and the
+    %% one turn it executes, never other queued callers' prompts or contexts.
+    State#state{pending = queue:new(),
+                active = undefined,
+                lane_pending = #{},
+                lane_active = #{},
+                ready_lanes = queue:new(),
+                ready_lane_set = #{}}.
+
+invocation_lane(#{app_name := App,
+                  user_id := User,
+                  session_id := Session})
+  when App =/= undefined, User =/= undefined, Session =/= undefined ->
+    {session, App, User, Session};
+invocation_lane(_Context) ->
+    %% Scoped calls without an exact Runner session remain isolated from the
+    %% legacy history lane, but serialize with one another deterministically.
+    unscoped_invocations.
+
 execute_agent_turn(#{kind := prompt,
                      message := Message,
                      context := InvocationContext}, State, Owner) ->
     put('$adk_agent_owner', Owner),
     execute_prompt_like(prompt, Message, InvocationContext, State);
+execute_agent_turn(#{kind := invoke,
+                     message := Message,
+                     context := InvocationContext}, State, Owner) ->
+    put('$adk_agent_owner', Owner),
+    execute_invocation_prompt(Message, InvocationContext, State);
 execute_agent_turn(#{kind := delegate, message := Message}, State, Owner) ->
     put('$adk_agent_owner', Owner),
     execute_prompt_like(delegate, Message, direct_context(State), State);
@@ -455,6 +659,34 @@ execute_prompt_like(Kind, Message, InvocationContext, State) ->
     save_direct_memory(State, Memory2),
     {Reply, Memory2}.
 
+execute_invocation_prompt(Message, InvocationContext, State) ->
+    telemetry:execute([erlang_adk, agent, invoke, start], #{},
+                      #{agent => State#state.name}),
+    StartTime = erlang:monotonic_time(millisecond),
+    FreshMemory = ensure_system_instruction(
+                    adk_memory:new(), State#state.llm_config),
+    Memory1 = adk_memory:add_message(FreshMemory, user, Message),
+    RunResult = case prepare_agent_turn(
+                       State, Message, Memory1, InvocationContext) of
+        {ok, EffectiveConfig, PreparedMemory, PreparedContext} ->
+            run_agent_invocation(
+              State, Message, PreparedMemory, EffectiveConfig,
+              PreparedContext);
+        {error, PrepareReason} ->
+            {error, PrepareReason, Memory1}
+    end,
+    {Reply, Memory2} = case RunResult of
+        {ok, Response, UpdatedMemory} ->
+            {{ok, Response}, UpdatedMemory};
+        {error, Reason, UpdatedMemory} ->
+            {{error, Reason}, UpdatedMemory}
+    end,
+    Duration = erlang:monotonic_time(millisecond) - StartTime,
+    telemetry:execute([erlang_adk, agent, invoke, stop],
+                      #{duration => Duration},
+                      #{agent => State#state.name}),
+    {Reply, Memory2}.
+
 execute_event_turn(HistoryEvents, InvocationId, Context, State) ->
     telemetry:execute([erlang_adk, agent, run_with_events, start], #{},
                       #{agent => State#state.name}),
@@ -487,6 +719,21 @@ active_matches(TurnRef, WorkerPid, Active) ->
     maps:get(turn_ref, Active) =:= TurnRef andalso
         maps:get(worker_pid, Active, undefined) =:= WorkerPid.
 
+locate_active(TurnRef, WorkerPid,
+              #state{active = Active, lane_active = ActiveByLane}) ->
+    case is_map(Active) andalso
+         active_matches(TurnRef, WorkerPid, Active) of
+        true -> legacy;
+        false -> locate_lane_active(TurnRef, WorkerPid, ActiveByLane)
+    end.
+
+locate_lane_active(TurnRef, WorkerPid, ActiveByLane) ->
+    case [Lane || {Lane, Active} <- maps:to_list(ActiveByLane),
+                  active_matches(TurnRef, WorkerPid, Active)] of
+        [Lane | _] -> {lane, Lane};
+        [] -> not_found
+    end.
+
 complete_turn(_Result, State = #state{active = #{abandoned := true}}) ->
     dispatch_next(clear_active(State));
 complete_turn(Result, State = #state{active = Active}) ->
@@ -499,6 +746,12 @@ complete_turn(Result, State = #state{active = Active}) ->
             gen_server:reply(maps:get(from, Active), Reply),
             dispatch_next(
               (clear_active(State))#state{memory = Memory});
+        {invoke, {{ok, _Value} = Reply, Memory}} when is_list(Memory) ->
+            gen_server:reply(maps:get(from, Active), Reply),
+            dispatch_next(clear_active(State));
+        {invoke, {{error, _Reason} = Reply, Memory}} when is_list(Memory) ->
+            gen_server:reply(maps:get(from, Active), Reply),
+            dispatch_next(clear_active(State));
         {delegate, {{ok, _Value} = Reply, Memory}} when is_list(Memory) ->
             notify_delegate(maps:get(reply_to, Active), Reply),
             dispatch_next(
@@ -520,11 +773,42 @@ complete_turn(Result, State = #state{active = Active}) ->
             fail_turn({invalid_agent_turn_result, Kind}, State)
     end.
 
+complete_lane_turn(Lane, Result, State) ->
+    Active = maps:get(Lane, State#state.lane_active),
+    case maps:get(abandoned, Active, false) of
+        true ->
+            dispatch_lane(Lane, clear_lane_active(Lane, State));
+        false ->
+            complete_live_lane_turn(Lane, Active, Result, State)
+    end.
+
+complete_live_lane_turn(Lane, Active, Result, State) ->
+    case {maps:get(kind, Active), Result} of
+        {invoke, {{ok, _Value} = Reply, Memory}} when is_list(Memory) ->
+            reply_and_dispatch_lane(Lane, Active, Reply, State);
+        {invoke, {{error, _Reason} = Reply, Memory}} when is_list(Memory) ->
+            reply_and_dispatch_lane(Lane, Active, Reply, State);
+        {run_with_events, {ok, _Event} = Reply} ->
+            reply_and_dispatch_lane(Lane, Active, Reply, State);
+        {run_with_events, {tool_calls, _Event, _Calls} = Reply} ->
+            reply_and_dispatch_lane(Lane, Active, Reply, State);
+        {run_with_events, {error, _Reason} = Reply} ->
+            reply_and_dispatch_lane(Lane, Active, Reply, State);
+        {Kind, _Invalid} ->
+            fail_lane_turn(
+              Lane, {invalid_agent_turn_result, Kind}, State)
+    end.
+
+reply_and_dispatch_lane(Lane, Active, Reply, State) ->
+    gen_server:reply(maps:get(from, Active), Reply),
+    dispatch_lane(Lane, clear_lane_active(Lane, State)).
+
 fail_turn(_Reason, State = #state{active = #{abandoned := true}}) ->
     dispatch_next(clear_active(State));
 fail_turn(Reason, State = #state{active = Active}) ->
     case maps:get(kind, Active) of
         prompt -> gen_server:reply(maps:get(from, Active), {error, Reason});
+        invoke -> gen_server:reply(maps:get(from, Active), {error, Reason});
         run_with_events ->
             gen_server:reply(maps:get(from, Active), {error, Reason});
         delegate ->
@@ -532,10 +816,33 @@ fail_turn(Reason, State = #state{active = Active}) ->
     end,
     dispatch_next(clear_active(State)).
 
+fail_lane_turn(Lane, Reason, State) ->
+    Active = maps:get(Lane, State#state.lane_active),
+    case maps:get(abandoned, Active, false) of
+        true -> ok;
+        false ->
+            case maps:get(kind, Active) of
+                invoke ->
+                    gen_server:reply(
+                      maps:get(from, Active), {error, Reason});
+                run_with_events ->
+                    gen_server:reply(
+                      maps:get(from, Active), {error, Reason})
+            end
+    end,
+    dispatch_lane(Lane, clear_lane_active(Lane, State)).
+
 clear_active(State = #state{active = Active}) when is_map(Active) ->
     demonitor_ref(maps:get(worker_monitor, Active, undefined)),
     demonitor_ref(maps:get(caller_monitor, Active, undefined)),
     State#state{active = undefined}.
+
+clear_lane_active(Lane, State0) ->
+    ActiveByLane0 = State0#state.lane_active,
+    Active = maps:get(Lane, ActiveByLane0),
+    demonitor_ref(maps:get(worker_monitor, Active, undefined)),
+    demonitor_ref(maps:get(caller_monitor, Active, undefined)),
+    State0#state{lane_active = maps:remove(Lane, ActiveByLane0)}.
 
 turn_failure_reason({timeout, Timeout}) ->
     adk_failure:external(agent, turn_timeout, {timeout, Timeout});
@@ -546,11 +853,9 @@ turn_failure_reason({worker_exited, Reason}) ->
 turn_failure_reason(Other) ->
     adk_failure:external(agent, turn_worker_failure, Other).
 
-handle_turn_down(Monitor, Reason,
-                 State = #state{active = Active}) when is_map(Active) ->
-    case {maps:get(worker_monitor, Active, undefined),
-          maps:get(caller_monitor, Active, undefined)} of
-        {Monitor, _} ->
+handle_turn_down(Monitor, Reason, State) ->
+    case locate_active_monitor(Monitor, State) of
+        {legacy, worker, Active} ->
             case maps:get(abandoned, Active, false) of
                 true -> dispatch_next(clear_active(State));
                 false ->
@@ -558,14 +863,59 @@ handle_turn_down(Monitor, Reason,
                       adk_failure:external(
                         agent, turn_worker_exit, Reason), State)
             end;
-        {_, Monitor} ->
+        {legacy, caller, Active} ->
             cancel_active_worker(Active),
             State#state{active = Active#{abandoned => true,
                                         caller_monitor => undefined}};
-        _ -> remove_queued_monitor(Monitor, State)
-    end;
-handle_turn_down(Monitor, _Reason, State) ->
-    remove_queued_monitor(Monitor, State).
+        {lane, Lane, worker, Active} ->
+            case maps:get(abandoned, Active, false) of
+                true ->
+                    dispatch_lane(
+                      Lane, clear_lane_active(Lane, State));
+                false ->
+                    fail_lane_turn(
+                      Lane,
+                      adk_failure:external(
+                        agent, turn_worker_exit, Reason), State)
+            end;
+        {lane, Lane, caller, Active} ->
+            cancel_active_worker(Active),
+            ActiveByLane = (State#state.lane_active)#{
+                Lane => Active#{abandoned => true,
+                                caller_monitor => undefined}},
+            State#state{lane_active = ActiveByLane};
+        not_found ->
+            remove_queued_monitor(Monitor, State)
+    end.
+
+locate_active_monitor(Monitor,
+                      #state{active = Active,
+                             lane_active = ActiveByLane}) ->
+    case active_monitor_kind(Monitor, Active) of
+        worker -> {legacy, worker, Active};
+        caller -> {legacy, caller, Active};
+        not_found -> locate_lane_active_monitor(Monitor, ActiveByLane)
+    end.
+
+locate_lane_active_monitor(Monitor, ActiveByLane) ->
+    Matches = [{Lane, Kind, Active}
+               || {Lane, Active} <- maps:to_list(ActiveByLane),
+                  Kind <- [active_monitor_kind(Monitor, Active)],
+                  Kind =/= not_found],
+    case Matches of
+        [{Lane, Kind, Active} | _] -> {lane, Lane, Kind, Active};
+        [] -> not_found
+    end.
+
+active_monitor_kind(_Monitor, Active) when not is_map(Active) ->
+    not_found;
+active_monitor_kind(Monitor, Active) ->
+    case {maps:get(worker_monitor, Active, undefined),
+          maps:get(caller_monitor, Active, undefined)} of
+        {Monitor, _} -> worker;
+        {_, Monitor} -> caller;
+        _ -> not_found
+    end.
 
 remove_queued_monitor(Monitor, State0) ->
     Pending0 = ensure_queue(State0#state.pending),
@@ -573,7 +923,16 @@ remove_queued_monitor(Monitor, State0) ->
                  [Turn || Turn <- queue:to_list(Pending0),
                           maps:get(caller_monitor, Turn, undefined)
                               =/= Monitor]),
-    State0#state{pending = Pending1}.
+    PendingByLane1 = maps:fold(
+                       fun(Lane, Pending, Acc) ->
+                           Filtered = queue:from_list(
+                                        [Turn || Turn <- queue:to_list(Pending),
+                                         maps:get(caller_monitor, Turn,
+                                                  undefined) =/= Monitor]),
+                           put_lane_queue(Lane, Filtered, Acc)
+                       end, #{}, State0#state.lane_pending),
+    State0#state{pending = Pending1,
+                 lane_pending = PendingByLane1}.
 
 notify_delegate(undefined, _Response) -> ok;
 notify_delegate({TargetPid, Ref}, Response) when is_pid(TargetPid) ->
@@ -590,12 +949,22 @@ cancel_active_worker(Active) when is_map(Active) ->
     end;
 cancel_active_worker(_Active) -> ok.
 
+cancel_lane_workers(ActiveByLane) ->
+    lists:foreach(
+      fun cancel_active_worker/1, maps:values(ActiveByLane)),
+    ok.
+
 demonitor_pending(undefined) -> ok;
 demonitor_pending(Pending) ->
     lists:foreach(
       fun(Turn) ->
           demonitor_ref(maps:get(caller_monitor, Turn, undefined))
       end, queue:to_list(Pending)),
+    ok.
+
+demonitor_lane_pending(PendingByLane) ->
+    lists:foreach(
+      fun demonitor_pending/1, maps:values(PendingByLane)),
     ok.
 
 maybe_delete_config_ref(normal, ConfigRef) ->
@@ -613,6 +982,24 @@ delete_config_ref(ConfigRef) ->
 
 safe_queue_len(undefined) -> 0;
 safe_queue_len(Pending) -> queue:len(Pending).
+
+queued_turn_count(State) ->
+    safe_queue_len(State#state.pending) +
+        lists:sum([queue:len(Pending)
+                   || Pending <- maps:values(State#state.lane_pending)]).
+
+active_turn_count(State) ->
+    Legacy = case is_map(State#state.active) of
+        true -> 1;
+        false -> 0
+    end,
+    Legacy + maps:size(State#state.lane_active).
+
+put_lane_queue(Lane, Pending, PendingByLane) ->
+    case queue:is_empty(Pending) of
+        true -> maps:remove(Lane, PendingByLane);
+        false -> PendingByLane#{Lane => Pending}
+    end.
 
 ensure_queue(undefined) -> queue:new();
 ensure_queue(Pending) -> Pending.
@@ -639,15 +1026,23 @@ run_agent_loop(Config, Memory, Tools, State, InvocationContext, Round) ->
                                         Memory, agent, ResponseText),
                             {ok, ResponseText, Memory1};
                         {tool_calls, Calls} ->
-                            Memory1 = adk_memory:add_message(
-                                        Memory, agent,
-                                        {tool_calls, Calls}),
-                            Memory2 = execute_tools(
-                                        Calls, Tools, Memory1, State, Config,
-                                        InvocationContext),
-                            run_agent_loop(
-                              Config, Memory2, Tools, State,
-                              InvocationContext, Round + 1);
+                            case adk_tool_call:validate_list(Calls) of
+                                ok ->
+                                    Memory1 = adk_memory:add_message(
+                                                Memory, agent,
+                                                {tool_calls, Calls}),
+                                    Memory2 = execute_tools(
+                                                Calls, Tools, Memory1, State,
+                                                Config, InvocationContext),
+                                    run_agent_loop(
+                                      Config, Memory2, Tools, State,
+                                      InvocationContext, Round + 1);
+                                {error, Reason} ->
+                                    {error, adk_failure:external(
+                                              agent_model,
+                                              invalid_tool_calls, Reason),
+                                     Memory}
+                            end;
                         {error, Reason} ->
                             {error, Reason, Memory};
                         Other ->
@@ -682,28 +1077,46 @@ execute_tools([{NameBin, ArgsMap, Sig, CallId} | Rest], ToolsList,
 
 execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList,
                     MemoryAcc, State, Config, InvocationContext) ->
+    ScopedInvocation = maps:with(
+                         [state, app_name, user_id, session_id,
+                          invocation_id, artifact_service, artifact_scope,
+                          state_ref, memory_service], InvocationContext),
     Context0 = maps:merge(
                  direct_context(State),
-                 maps:with([state, app_name, user_id, session_id,
-                            invocation_id, artifact_service, artifact_scope,
-                            state_ref, memory_service], InvocationContext)),
+                 ScopedInvocation),
     Context = Context0#{
                 invocation_id => maps:get(invocation_id, Context0, undefined),
                 call_id => CallId,
                 state_ref => State#state.session_store},
+    LocalContext = copy_agent_path(InvocationContext, Context),
     Handlers = maps:get(callbacks, State#state.llm_config, []),
     Result = case adk_toolset:resolve(
                     ToolsList, NameBin, ArgsMap, Context) of
         {ok, {module, Mod}} ->
-            execute_tool_with_callbacks(
-              Mod, NameBin, ArgsMap, Context, Handlers);
+            execute_direct_module_tool(
+              Mod, NameBin, ArgsMap, LocalContext, Handlers);
         {ok, {resolved, ResolvedCall}} ->
-            execute_resolved_tool_with_callbacks(
-              ResolvedCall, NameBin, ArgsMap, Context, Handlers);
+            ResolvedContext = resolved_execution_context(
+                                ResolvedCall, Context, LocalContext),
+            execute_direct_resolved_tool(
+              ResolvedCall, NameBin, ArgsMap,
+              ResolvedContext, Handlers);
         {error, not_found} ->
-            execute_sub_agent_with_callbacks(
-              NameBin, ArgsMap, Context, State#state.sub_agents,
-              Handlers, Config);
+            case validate_sub_agent_arguments(
+                   NameBin, ArgsMap, State#state.sub_agents) of
+                ok ->
+                    execute_sub_agent_with_callbacks(
+                      NameBin, ArgsMap, LocalContext, LocalContext,
+                      State#state.sub_agents, Handlers, Config);
+                {error, {invalid_tool_arguments, _} = Reason} ->
+                    adk_toolset:invalid_arguments_response(Reason);
+                {error, not_found} ->
+                    execute_sub_agent_with_callbacks(
+                      NameBin, ArgsMap, LocalContext, LocalContext,
+                      State#state.sub_agents, Handlers, Config)
+            end;
+        {error, {invalid_tool_arguments, _} = Reason} ->
+            adk_toolset:invalid_arguments_response(Reason);
         {error, Reason} ->
             execute_failed_tool_with_callbacks(
               Reason, NameBin, ArgsMap, Context, Handlers)
@@ -713,6 +1126,55 @@ execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList,
                 tool_response(NameBin, Result, Sig, CallId)),
     execute_tools(Rest, ToolsList, Memory1, State, Config,
                   InvocationContext).
+
+execute_direct_module_tool(Mod, NameBin, ArgsMap, Context, Handlers) ->
+    case adk_tool_confirmation:module_requirement(Mod, ArgsMap, Context) of
+        {ok, Requirement} ->
+            case adk_tool_confirmation:is_required(Requirement) of
+                true -> direct_confirmation_required(Requirement);
+                false ->
+                    execute_tool_with_callbacks(
+                      Mod, NameBin, ArgsMap, Context, Handlers)
+            end;
+        {error, Reason} -> direct_confirmation_error(Reason)
+    end.
+
+execute_direct_resolved_tool(ResolvedCall, NameBin, ArgsMap,
+                             Context, Handlers) ->
+    case adk_tool_confirmation:resolved_requirement(
+           ResolvedCall, ArgsMap, Context) of
+        {ok, Requirement} ->
+            case adk_tool_confirmation:is_required(Requirement) of
+                true -> direct_confirmation_required(Requirement);
+                false ->
+                    execute_resolved_tool_with_callbacks(
+                      ResolvedCall, NameBin, ArgsMap, Context, Handlers)
+            end;
+        {error, Reason} -> direct_confirmation_error(Reason)
+    end.
+
+%% A dynamic resolver never receives private ancestry. If it explicitly
+%% returns a local module executor, that trusted module gets the same private
+%% execution context as a directly configured module. Opaque execute closures
+%% retain the minimal resolver context and cannot observe the path.
+resolved_execution_context(#{module := Module}, _Context, LocalContext)
+  when is_atom(Module) ->
+    LocalContext;
+resolved_execution_context(_ResolvedCall, Context, _LocalContext) ->
+    Context.
+
+direct_confirmation_required(Requirement) ->
+    Error0 = #{<<"kind">> => <<"tool_confirmation_requires_runner">>},
+    Error = case maps:find(hint, Requirement) of
+        {ok, Hint} -> Error0#{<<"hint">> => Hint};
+        error -> Error0
+    end,
+    #{<<"success">> => false, <<"error">> => Error}.
+
+direct_confirmation_error(Reason) ->
+    #{<<"success">> => false,
+      <<"error">> => adk_failure:model_response(
+                        tool_confirmation, evaluate, Reason)}.
 
 tool_response(Name, Result, Sig, undefined) ->
     {tool_response, Name, Result, Sig};
@@ -829,13 +1291,15 @@ execute_resolved_call(ResolvedCall, NameBin, ArgsMap, Context) ->
     end.
 
 execute_sub_agent_with_callbacks(NameBin, ArgsMap, Context,
-                                 SubAgents, Handlers, Config) ->
+                                 DelegationContext, SubAgents,
+                                 Handlers, Config) ->
     adk_callbacks:execute(Handlers, on_tool_start, [NameBin, ArgsMap]),
     RawResult = case adk_callbacks:run(Handlers, before_tool,
                                        [NameBin, ArgsMap, Context]) of
         {halt, Replacement} -> {ok, Replacement};
         {replace, Replacement} -> {ok, Replacement};
-        _ -> execute_sub_agent(NameBin, ArgsMap, SubAgents, Context, Config)
+        _ -> execute_sub_agent(
+               NameBin, ArgsMap, SubAgents, DelegationContext, Config)
     end,
     FinalResult = case adk_callbacks:run(
                          Handlers, after_tool,
@@ -853,11 +1317,13 @@ execute_sub_agent_with_callbacks(NameBin, ArgsMap, Context,
         {error, SubError} ->
             #{<<"success">> => false,
               <<"error">> => adk_failure:model_response(
-                                sub_agent, execute, SubError)};
-        Other ->
-            #{<<"success">> => false,
-              <<"error">> => adk_failure:model_response(
-                                sub_agent, invalid_result, Other)}
+                                sub_agent, execute, SubError)}
+    end.
+
+copy_agent_path(Source, Target) ->
+    case maps:find('$adk_agent_path', Source) of
+        {ok, Path} -> Target#{'$adk_agent_path' => Path};
+        error -> Target
     end.
 
 execute_sub_agent(NameBin, ArgsMap, SubAgents, Context, Config) ->
@@ -1306,7 +1772,8 @@ run_agent_invocation(State, Message, Memory, Config, InvocationContext) ->
                     FinalMemory = persist_agent_response(
                                     Memory, UpdatedMemory,
                                     Response0, Response),
-                    case apply_direct_state_delta(State, StateDelta) of
+                    case apply_direct_state_delta(
+                           State, InvocationContext, StateDelta) of
                         ok ->
                             adk_callbacks:execute(
                               Handlers, on_agent_end,
@@ -1348,7 +1815,15 @@ replace_latest_agent_response([], Response) ->
 %% generate_with_callbacks/3 reverses it.
 prepare_agent_turn(State, Input0, Memory, Context0) ->
     Input = case Input0 of undefined -> <<>>; _ -> Input0 end,
-    Context = maps:merge(direct_context(State), Context0),
+    Context1 = maps:merge(direct_context(State), Context0),
+    case enter_agent_context(State#state.name, Context1) of
+        {ok, Context} ->
+            prepare_agent_turn_with_context(
+              State, Input, Memory, Context);
+        {error, _} = Error -> Error
+    end.
+
+prepare_agent_turn_with_context(State, Input, Memory, Context) ->
     Chronological0 = adk_memory:get_history(Memory),
     Chronological = [Message || Message <- Chronological0,
                                 maps:get(role, Message, undefined) =/= system],
@@ -1356,34 +1831,80 @@ prepare_agent_turn(State, Input0, Memory, Context0) ->
     case adk_agent_spec:prepare(
            State#state.agent_spec, Input, Prior, Context) of
         {ok, Prepared} ->
-            case effective_global_instruction(State, Prepared, Context) of
-                {ok, GlobalInstruction, GlobalSource} ->
-                    CanonicalInput = model_input_value(
-                                       maps:get(input, Prepared)),
-                    Current1 = Current#{role => user,
-                                       content => CanonicalInput},
-                    LocalInstruction = maps:get(instructions, Prepared),
-                    Instructions0 = combine_instructions(
-                                      GlobalInstruction, LocalInstruction),
-                    Instructions = append_additional_instructions(
-                                     Instructions0,
-                                     maps:get(additional_instructions,
-                                              Context, undefined)),
-                    System = #{role => system, content => Instructions,
-                               timestamp => erlang:system_time(millisecond)},
-                    ProviderHistory = [System |
-                                       maps:get(history, Prepared) ++
-                                       [Current1 | After]],
-                    EffectiveConfig = effective_model_config(
-                                        State#state.llm_config,
-                                        Instructions, Prepared,
-                                        GlobalSource),
-                    {ok, EffectiveConfig,
-                     lists:reverse(ProviderHistory), Context};
-                {error, _} = Error -> Error
-            end;
+            prepare_effective_agent_turn(
+              State, Prepared, Current, After, Context);
         {error, _} = Error -> Error
     end.
+
+prepare_effective_agent_turn(State, Prepared, Current, After, Context) ->
+    case effective_global_instruction(State, Prepared, Context) of
+        {ok, GlobalInstruction, GlobalSource} ->
+            CanonicalInput = model_input_value(maps:get(input, Prepared)),
+            Current1 = Current#{role => user, content => CanonicalInput},
+            LocalInstruction = maps:get(instructions, Prepared),
+            Instructions0 = combine_instructions(
+                              GlobalInstruction, LocalInstruction),
+            Instructions = append_additional_instructions(
+                             Instructions0,
+                             maps:get(additional_instructions,
+                                      Context, undefined)),
+            System = #{role => system, content => Instructions,
+                       timestamp => erlang:system_time(millisecond)},
+            ProviderHistory = [System |
+                               maps:get(history, Prepared) ++
+                               [Current1 | After]],
+            EffectiveConfig = effective_model_config(
+                                State#state.llm_config,
+                                Instructions, Prepared, GlobalSource),
+            {ok, EffectiveConfig, lists:reverse(ProviderHistory), Context};
+        {error, _} = Error -> Error
+    end.
+
+%% The path contains ancestors only when an invocation crosses an agent
+%% boundary.  Entering the target appends its normalized name.  It is private
+%% runtime metadata: it is never copied into provider configuration or model
+%% history, but it follows model-visible sub-agent calls so a dynamically
+%% resolved/restarted graph cannot deadlock on A -> B -> A.
+enter_agent_context(Name, Context) ->
+    case adk_agent_tree:validate_name(Name) of
+        {ok, NameBin} ->
+            case normalize_agent_path(
+                   maps:get('$adk_agent_path', Context, []), [], 0) of
+                {ok, Path, Depth} when Depth < ?MAX_DELEGATION_DEPTH ->
+                    case lists:member(NameBin, Path) of
+                        true -> {error, {delegation_cycle_detected, NameBin}};
+                        false ->
+                            {ok, Context#{'$adk_agent_path' =>
+                                              Path ++ [NameBin]}}
+                    end;
+                {ok, _Path, _Depth} ->
+                    {error, {delegation_depth_exceeded,
+                             ?MAX_DELEGATION_DEPTH}};
+                {error, _} = Error -> Error
+            end;
+        {error, _} ->
+            {error, invalid_agent_runtime_name}
+    end.
+
+normalize_agent_path([], Acc, Depth) ->
+    {ok, lists:reverse(Acc), Depth};
+normalize_agent_path(_Path, _Acc, Depth)
+  when Depth >= ?MAX_DELEGATION_DEPTH ->
+    {error, {delegation_depth_exceeded, ?MAX_DELEGATION_DEPTH}};
+normalize_agent_path([Name | Rest], Acc, Depth) ->
+    case adk_agent_tree:validate_name(Name) of
+        {ok, NameBin} ->
+            case lists:member(NameBin, Acc) of
+                true -> {error, invalid_delegation_path};
+                false ->
+                    normalize_agent_path(
+                      Rest, [NameBin | Acc], Depth + 1)
+            end;
+        {error, _} ->
+            {error, invalid_delegation_path}
+    end;
+normalize_agent_path(_Improper, _Acc, _Depth) ->
+    {error, invalid_delegation_path}.
 
 split_latest_user(Chronological, Input) ->
     split_latest_user_rev(lists:reverse(Chronological), [], Input,
@@ -1528,11 +2049,9 @@ finish_stream_provider_result(Pid, InvocationId, Author, ProviderResult) ->
         {ok, {ok, _Output}, _ProviderMetadata} ->
             finalize_output(Pid, ProviderResult, InvocationId);
         {ok, {tool_calls, Calls}, ProviderMetadata} ->
-            AgentEvent = adk_event:new(
-                           Author, {tool_calls, Calls},
-                           #{invocation_id => InvocationId,
-                             actions => provider_actions(ProviderMetadata)}),
-            {tool_calls, AgentEvent, Calls};
+            tool_calls_event(
+              Author, Calls, InvocationId,
+              provider_actions(ProviderMetadata));
         {ok, streamed, _ProviderMetadata} ->
             {error, unmaterialized_stream_provider_result};
         {error, _} = Error -> Error;
@@ -1546,12 +2065,9 @@ model_result_to_event(State, {provider_result, _} = ProviderResult,
             finalize_event_output(
               State, ModelOutput, InvocationId, ProviderMetadata);
         {ok, {tool_calls, Calls}, ProviderMetadata} ->
-            AgentEvent = adk_event:new(
-                           to_binary(State#state.name),
-                           {tool_calls, Calls},
-                           #{invocation_id => InvocationId,
-                             actions => provider_actions(ProviderMetadata)}),
-            {tool_calls, AgentEvent, Calls};
+            tool_calls_event(
+              to_binary(State#state.name), Calls, InvocationId,
+              provider_actions(ProviderMetadata));
         {ok, streamed, _ProviderMetadata} ->
             {error, invalid_nonstream_provider_outcome};
         {error, _} = Error -> Error;
@@ -1560,16 +2076,26 @@ model_result_to_event(State, {provider_result, _} = ProviderResult,
 model_result_to_event(State, {ok, ModelOutput}, InvocationId) ->
     finalize_event_output(State, ModelOutput, InvocationId);
 model_result_to_event(State, {tool_calls, Calls}, InvocationId) ->
-    AgentEvent = adk_event:new(
-                   to_binary(State#state.name),
-                   {tool_calls, Calls},
-                   #{invocation_id => InvocationId}),
-    {tool_calls, AgentEvent, Calls};
+    tool_calls_event(
+      to_binary(State#state.name), Calls, InvocationId, #{});
 model_result_to_event(_State, {error, Reason}, _InvocationId) ->
     {error, Reason};
 model_result_to_event(_State, Other, _InvocationId) ->
     {error, adk_failure:external(
               agent_model, invalid_result, Other)}.
+
+tool_calls_event(Author, Calls, InvocationId, Actions) ->
+    case adk_tool_call:validate_list(Calls) of
+        ok ->
+            AgentEvent = adk_event:new(
+                           Author, {tool_calls, Calls},
+                           #{invocation_id => InvocationId,
+                             actions => Actions}),
+            {tool_calls, AgentEvent, Calls};
+        {error, Reason} ->
+            {error, adk_failure:external(
+                      agent_model, invalid_tool_calls, Reason)}
+    end.
 
 finalize_model_output(State, {provider_result, _} = ProviderResult,
                       InvocationId) ->
@@ -1657,7 +2183,8 @@ direct_context(State) ->
     Base = #{state => ScopedState,
              app_name => App,
              user_id => User,
-             session_id => Session},
+             session_id => Session,
+             state_ref => State#state.session_store},
     case direct_artifact_service(Config) of
         undefined -> Base;
         ArtifactService when is_binary(App), is_binary(User),
@@ -1687,15 +2214,19 @@ direct_artifact_service(Config) ->
     maps:get(artifact_svc, Config,
              maps:get(artifact_service, Config, undefined)).
 
-apply_direct_state_delta(_State, Delta) when map_size(Delta) =:= 0 -> ok;
-apply_direct_state_delta(State, Delta) ->
+apply_direct_state_delta(_State, _Context, Delta)
+  when map_size(Delta) =:= 0 -> ok;
+apply_direct_state_delta(State, Context, Delta) ->
     Config = State#state.llm_config,
-    App = maps:get(app_name, Config, undefined),
-    User = maps:get(user_id, Config, undefined),
-    Session = State#state.session_id,
-    Store = State#state.session_store,
+    App = maps:get(app_name, Context,
+                   maps:get(app_name, Config, undefined)),
+    User = maps:get(user_id, Context,
+                    maps:get(user_id, Config, undefined)),
+    Session = maps:get(session_id, Context, State#state.session_id),
+    Store = maps:get(state_ref, Context, State#state.session_store),
     case is_binary(App) andalso is_binary(User) andalso
          is_binary(Session) andalso
+         is_atom(Store) andalso
          erlang:function_exported(Store, update_state, 4) of
         false -> {error, output_key_requires_runner_or_scoped_session};
         true ->
@@ -1725,11 +2256,29 @@ ensure_system_instruction(Memory, Config) ->
 model_tools(Tools, SubAgents) ->
     case adk_toolset:expand_tools(Tools) of
         {ok, Expanded} ->
-            {ok, Expanded ++
-                 [sub_agent_schema(Name, Spec)
-                  || {Name, Spec} <- maps:to_list(SubAgents)]};
+            SubSchemas = [sub_agent_schema(Name, Spec)
+                          || {Name, Spec} <- maps:to_list(SubAgents)],
+            case unique_model_tool_names(Expanded ++ SubSchemas, #{}) of
+                ok -> {ok, Expanded ++ SubSchemas};
+                {error, _} = Error -> Error
+            end;
         {error, _} = Error -> Error
     end.
+
+unique_model_tool_names([], _Names) -> ok;
+unique_model_tool_names([Tool | Rest], Names) ->
+    case model_tool_name(Tool) of
+        {ok, Name} ->
+            case maps:is_key(Name, Names) of
+                true -> {error, {duplicate_tool_name, Name}};
+                false -> unique_model_tool_names(Rest, Names#{Name => true})
+            end;
+        {error, _} = Error -> Error
+    end.
+
+model_tool_name(#{<<"name">> := Name}) when is_binary(Name) ->
+    {ok, Name};
+model_tool_name(_Tool) -> {error, invalid_tool_schema}.
 
 sub_agent_schema(Name, Spec) ->
     Description = case Spec of
@@ -1738,6 +2287,17 @@ sub_agent_schema(Name, Spec) ->
     end,
     adk_agent_tool:schema(#{name => to_binary(Name),
                             description => to_binary(Description)}).
+
+validate_sub_agent_arguments(Name, Args, SubAgents) ->
+    case maps:find(Name, SubAgents) of
+        {ok, Spec} ->
+            Schema = sub_agent_schema(Name, Spec),
+            case adk_toolset:validate_arguments(Schema, Args) of
+                {ok, _CanonicalArgs} -> ok;
+                {error, _} = Error -> Error
+            end;
+        error -> {error, not_found}
+    end.
 
 sub_agent_pid(Name, #{pid := Pid}) ->
     resolve_sub_agent(Name, Pid);
@@ -1763,7 +2323,7 @@ safe_sub_agent_prompt(SubPid, SubPrompt, Context) ->
         SubPid ->
             {error, self_delegation_not_allowed};
         _OtherAgent ->
-            try prompt(SubPid, SubPrompt, Context) of
+            try invoke(SubPid, SubPrompt, Context) of
                 Result -> Result
             catch
                 Class:Reason ->
@@ -1775,7 +2335,8 @@ safe_sub_agent_prompt(SubPid, SubPrompt, Context) ->
 delegation_context(Config, Context) ->
     Base = maps:with(
              [state, app_name, user_id, session_id, invocation_id,
-              artifact_service, artifact_scope], Context),
+              state_ref, artifact_service, artifact_scope,
+              '$adk_agent_path'], Context),
     Source = maps:get(
                '$adk_inherited_global_instruction', Config,
                maps:get(global_instruction, Config, <<>>)),

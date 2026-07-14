@@ -5,7 +5,7 @@
 %% structural path and constraint name, never the rejected value.
 -module(adk_json_schema).
 
--export([compile/1, validate/2]).
+-export([compile/1, validate/2, validate_compiled/2]).
 
 -type path_part() :: binary() | non_neg_integer().
 -type schema() :: undefined | true | false | map().
@@ -39,17 +39,27 @@ compile(_Schema) ->
 validate(Schema, Value0) ->
     case validate_schema(Schema, []) of
         ok ->
-            case adk_json:normalize(Value0) of
-                {ok, Value} ->
-                    case validate_value(Schema, Value, []) of
-                        ok -> {ok, Value};
-                        {error, _} = Error -> Error
-                    end;
-                {error, Reason} ->
-                    {error, {invalid_json_value, safe_reason(Reason)}}
-            end;
+            validate_compiled(Schema, Value0);
         {error, _} = Error ->
             Error
+    end.
+
+%% @doc Validate a value against a schema already returned by `compile/1'.
+%%
+%% This is deliberately a separate trust boundary: callers must not pass an
+%% arbitrary schema. Catalogs can compile immutable contracts once and avoid
+%% recursively checking the schema again for every model-generated value.
+-spec validate_compiled(schema(), term()) ->
+    {ok, term()} | {error, error_reason()}.
+validate_compiled(Schema, Value0) ->
+    case adk_json:normalize(Value0) of
+        {ok, Value} ->
+            case validate_value(Schema, Value, []) of
+                ok -> {ok, Value};
+                {error, _} = Error -> Error
+            end;
+        {error, Reason} ->
+            {error, {invalid_json_value, safe_reason(Reason)}}
     end.
 
 validate_schema(undefined, _Path) -> ok;

@@ -247,7 +247,8 @@ test_strict_config(#{config := Config}) ->
                  callback_config => #{application_value => 1},
                  callback_pid => self(),
                  sub_agents => #{},
-                 max_tool_rounds => 4})),
+                 max_tool_rounds => 4,
+                 max_concurrent_invocations => 2})),
     ?assertEqual(
        {error, {conflicting_gemini_options,
                 [max_output_tokens, max_tokens]}},

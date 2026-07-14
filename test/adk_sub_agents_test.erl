@@ -8,6 +8,13 @@ sub_agents_routing_test_() ->
      [
       fun test_sub_agent_delegation/0,
       fun test_sub_agent_uses_tool_callback_lifecycle/0,
+      fun test_runtime_delegation_cycle_fails_before_provider/0,
+      fun test_runtime_delegation_depth_is_bounded/0,
+      fun test_agent_tool_bridge_preserves_runtime_path/0,
+      fun test_runner_agent_tool_bridge_preserves_runtime_path/0,
+      fun test_resolved_module_bridge_preserves_runtime_path/0,
+      fun test_runner_resolved_module_bridge_preserves_runtime_path/0,
+      fun test_agent_tool_invocations_have_fresh_history/0,
       fun test_unknown_tool_fallback/0,
       fun test_restarted_sub_agent_is_resolved_by_name/0
      ]}.
@@ -46,6 +53,14 @@ test_sub_agent_delegation() ->
     after 1000 ->
         ?assert(false)
     end,
+    %% The probe is entered again after the delegated tool result.  Consume
+    %% that notification as part of this test so no asynchronous evidence is
+    %% left for the next setup-list case.
+    receive
+        {probe_generate, _FinalHistory, _FinalTools} -> ok
+    after 1000 ->
+        ?assert(false)
+    end,
     ok = erlang_adk:stop_agent(MasterPid),
     ok = erlang_adk:stop_agent(SubPid).
 
@@ -75,6 +90,190 @@ test_sub_agent_uses_tool_callback_lifecycle() ->
         _ = catch erlang_adk:stop_agent(MasterPid),
         _ = catch erlang_adk:stop_agent(SubPid),
         persistent_term:erase({adk_callback_lifecycle_test, target})
+    end.
+
+test_runtime_delegation_cycle_fails_before_provider() ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    ChildName = <<"RuntimeCycleChild_", Suffix/binary>>,
+    ParentName = <<"RuntimeCycleParent_", Suffix/binary>>,
+    {ok, ChildPid} = erlang_adk:spawn_agent(
+                       ChildName,
+                       #{provider => adk_llm_probe,
+                         test_pid => self(),
+                         response => <<"must not run">>}, []),
+    {ok, ParentPid} = erlang_adk:spawn_agent(
+                        ParentName,
+                        #{provider => adk_llm_probe,
+                          mode => sub_agent_call,
+                          call_name => ChildName,
+                          sub_agents => #{ChildName => ChildPid}}, []),
+    try
+        %% Pretend this invocation has already crossed the child.  The parent
+        %% may run, but its attempted call back into the child must be rejected
+        %% before the child's provider is entered.
+        ?assertEqual(
+           {ok, <<"delegation complete">>},
+           erlang_adk:invoke(
+             ParentPid, <<"delegate">>,
+             #{'$adk_agent_path' => [ChildName]})),
+        receive
+            {probe_generate, _History, _Tools} ->
+                ?assert(false)
+        after 50 ->
+            ok
+        end,
+        ?assert(is_process_alive(ParentPid)),
+        ?assert(is_process_alive(ChildPid))
+    after
+        _ = catch erlang_adk:stop_agent(ParentPid),
+        _ = catch erlang_adk:stop_agent(ChildPid)
+    end.
+
+test_runtime_delegation_depth_is_bounded() ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    AgentName = <<"RuntimeDepthAgent_", Suffix/binary>>,
+    Path = [<<"Ancestor", (integer_to_binary(N))/binary>>
+            || N <- lists:seq(1, 64)],
+    {ok, AgentPid} = erlang_adk:spawn_agent(
+                       AgentName,
+                       #{provider => adk_llm_probe,
+                         test_pid => self(),
+                         response => <<"must not run">>}, []),
+    try
+        ?assertEqual(
+           {error, {delegation_depth_exceeded, 64}},
+           erlang_adk:invoke(
+             AgentPid, <<"too deep">>,
+             #{'$adk_agent_path' => Path})),
+        receive
+            {probe_generate, _History, _Tools} ->
+                ?assert(false)
+        after 50 ->
+            ok
+        end,
+        ?assert(is_process_alive(AgentPid))
+    after
+        _ = catch erlang_adk:stop_agent(AgentPid)
+    end.
+
+test_agent_tool_bridge_preserves_runtime_path() ->
+    run_agent_tool_cycle_case(direct, configured_module).
+
+test_runner_agent_tool_bridge_preserves_runtime_path() ->
+    run_agent_tool_cycle_case(runner, configured_module).
+
+test_resolved_module_bridge_preserves_runtime_path() ->
+    run_agent_tool_cycle_case(direct, resolved_module).
+
+test_runner_resolved_module_bridge_preserves_runtime_path() ->
+    run_agent_tool_cycle_case(runner, resolved_module).
+
+run_agent_tool_cycle_case(Mode, ToolKind) ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    RootName = <<"AgentToolCycleRoot_", Suffix/binary>>,
+    ChildName = <<"AgentToolCycleChild_", Suffix/binary>>,
+    TestPid = self(),
+    RootProbe = spawn(fun() -> tagged_probe(TestPid, root) end),
+    ChildProbe = spawn(fun() -> tagged_probe(TestPid, child) end),
+    RootConfig = #{provider => adk_llm_probe,
+                   mode => tool_call,
+                   call_name => <<"delegate_via_agent_tool">>,
+                   call_args => #{<<"prompt">> => <<"call root again">>},
+                   test_pid => RootProbe},
+    RootTools = case ToolKind of
+        configured_module ->
+            [adk_agent_tool_bridge];
+        resolved_module ->
+            {ok, BridgeToolset} = adk_toolset:new(
+                                    adk_resolved_module_toolset,
+                                    {module, adk_agent_tool_bridge}),
+            [BridgeToolset]
+    end,
+    {ok, RootPid} = erlang_adk:spawn_agent(
+                      RootName, RootConfig, RootTools),
+    ChildConfig = #{provider => adk_llm_probe,
+                    mode => sub_agent_call,
+                    call_name => RootName,
+                    test_pid => ChildProbe,
+                    sub_agents => #{RootName => RootPid}},
+    {ok, ChildPid} = erlang_adk:spawn_agent(ChildName, ChildConfig, []),
+    persistent_term:put({adk_agent_tool_bridge, target}, ChildPid),
+    App = <<"agent-tool-cycle-app">>,
+    User = <<"agent-tool-cycle-user">>,
+    Session = <<"agent-tool-cycle-", Suffix/binary>>,
+    try
+        Result = case Mode of
+            direct ->
+                erlang_adk:prompt(RootPid, <<"start bridge">>);
+            runner ->
+                Runner = adk_runner:new(
+                           RootPid, App, erlang_adk_session,
+                           #{run_timeout => 2000}),
+                adk_runner:run(Runner, User, Session, <<"start bridge">>)
+        end,
+        ?assertEqual({ok, <<"tool complete">>}, Result),
+        Counts = collect_tagged_probes(#{root => 0, child => 0}),
+        ?assertEqual(2, maps:get(root, Counts)),
+        ?assertEqual(2, maps:get(child, Counts)),
+        ?assert(is_process_alive(RootPid)),
+        ?assert(is_process_alive(ChildPid))
+    after
+        persistent_term:erase({adk_agent_tool_bridge, target}),
+        RootProbe ! stop,
+        ChildProbe ! stop,
+        _ = catch erlang_adk:stop_agent(ChildPid),
+        _ = catch erlang_adk:stop_agent(RootPid),
+        _ = erlang_adk_session:delete_session(App, User, Session)
+    end.
+
+tagged_probe(Target, Tag) ->
+    receive
+        {probe_generate, History, Tools} ->
+            Target ! {tagged_probe, Tag, History, Tools},
+            tagged_probe(Target, Tag);
+        stop -> ok;
+        _Other -> tagged_probe(Target, Tag)
+    end.
+
+collect_tagged_probes(Counts) ->
+    receive
+        {tagged_probe, Tag, _History, _Tools} ->
+            collect_tagged_probes(
+              Counts#{Tag => maps:get(Tag, Counts, 0) + 1})
+    after 50 ->
+        Counts
+    end.
+
+test_agent_tool_invocations_have_fresh_history() ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    AgentName = <<"AgentToolIsolation_", Suffix/binary>>,
+    First = <<"first invocation secret">>,
+    Second = <<"second invocation request">>,
+    {ok, AgentPid} = erlang_adk:spawn_agent(
+                       AgentName,
+                       #{provider => adk_llm_probe,
+                         test_pid => self(),
+                         response => <<"specialist result">>}, []),
+    try
+        ?assertEqual(
+           {ok, <<"specialist result">>},
+           adk_agent_tool:execute(
+             AgentPid, #{<<"prompt">> => First}, #{})),
+        FirstHistory = receive_probe_history(),
+        ?assert(lists:member(First, history_contents(FirstHistory))),
+        ?assertEqual(
+           {ok, <<"specialist result">>},
+           adk_agent_tool:execute(
+             AgentName, #{<<"prompt">> => Second}, #{})),
+        SecondHistory = receive_probe_history(),
+        ?assert(lists:member(Second, history_contents(SecondHistory))),
+        ?assertNot(lists:member(First, history_contents(SecondHistory)))
+    after
+        _ = catch erlang_adk:stop_agent(AgentPid)
     end.
 
 test_unknown_tool_fallback() ->
@@ -128,3 +327,13 @@ collect_callback_events(Remaining, Acc) ->
 
 callback_count(Event, Events) ->
     length([ok || Seen <- Events, Seen =:= Event]).
+
+receive_probe_history() ->
+    receive
+        {probe_generate, History, _Tools} -> History
+    after 1000 ->
+        ?assert(false)
+    end.
+
+history_contents(History) ->
+    [Content || #{content := Content} <- History].

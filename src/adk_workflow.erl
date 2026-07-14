@@ -57,11 +57,17 @@ compile(Spec) when is_map(Spec) ->
             {ok, Kind} ->
                 case compile_kind(Kind, Spec) of
                     {ok, Data} ->
-                        {ok, #{?COMPILED_MARKER => true,
-                               version => Version,
-                               id => Id,
-                               kind => Kind,
-                               data => Data}};
+                        case compile_workflow_schemas(Spec) of
+                            {ok, InputSchema, OutputSchema} ->
+                                {ok, #{?COMPILED_MARKER => true,
+                                       version => Version,
+                                       id => Id,
+                                       kind => Kind,
+                                       data => Data,
+                                       input_schema => InputSchema,
+                                       output_schema => OutputSchema}};
+                            {error, _} = Error -> Error
+                        end;
                     {error, _} = Error -> Error
                 end;
             {error, _} = Error -> Error
@@ -324,6 +330,7 @@ validate_checkpoint_body(Compiled, Checkpoint) ->
             Steps = maps:get(<<"steps">>, Remaining, undefined),
             Transfers = maps:get(<<"transfers">>, Remaining, undefined),
             case valid_non_neg(Steps) andalso valid_non_neg(Transfers)
+                 andalso valid_checkpoint_output(Checkpoint)
                  andalso valid_cursor(maps:get(kind, Compiled),
                                       maps:get(data, Compiled), Cursor) of
                 true ->
@@ -335,6 +342,12 @@ validate_checkpoint_body(Compiled, Checkpoint) ->
                 false -> {error, invalid_checkpoint}
             end;
         _ -> {error, invalid_checkpoint}
+    end.
+
+valid_checkpoint_output(Checkpoint) ->
+    case maps:find(<<"output">>, Checkpoint) of
+        error -> true;
+        {ok, Output} -> json_safe_exact(Output)
     end.
 
 checkpoint_map(Compiled, State, Cursor, Steps, Transfers, Completed) ->
@@ -366,9 +379,10 @@ initial_cursor(graph, Data) ->
 
 valid_cursor(sequential, Data,
              #{<<"type">> := <<"sequential">>,
-               <<"next_index">> := Index}) ->
+               <<"next_index">> := Index} = Cursor) ->
     is_integer(Index) andalso Index >= 1
-    andalso Index =< length(maps:get(steps, Data)) + 1;
+    andalso Index =< length(maps:get(steps, Data)) + 1
+    andalso valid_sequential_phase(Index, Cursor, Data);
 valid_cursor(parallel, _Data,
              #{<<"type">> := <<"parallel">>,
                <<"status">> := <<"pending">>}) -> true;
@@ -386,6 +400,25 @@ valid_cursor(graph, Data,
              #{<<"type">> := <<"graph">>, <<"node">> := Node} = Cursor) ->
     valid_graph_cursor(Node, Cursor, Data);
 valid_cursor(_, _, _) -> false.
+
+valid_sequential_phase(_Index, Cursor, _Data)
+  when not is_map_key(<<"phase">>, Cursor) -> true;
+valid_sequential_phase(Index, Cursor, Data) ->
+    Steps = maps:get(steps, Data),
+    case maps:get(<<"phase">>, Cursor) of
+        <<"awaiting_resume">> when Index =< length(Steps) ->
+            Step = lists:nth(Index, Steps),
+            case maps:get(run, Step) of
+                {workflow, _Child, _Opts} ->
+                    is_map(maps:get(<<"pause">>, Cursor, undefined))
+                    andalso is_map(
+                              maps:get(<<"nested_checkpoint">>, Cursor,
+                                       undefined))
+                    andalso json_safe_exact(Cursor);
+                _ -> false
+            end;
+        _ -> false
+    end.
 
 valid_graph_cursor(Node, Cursor, Data) ->
     Nodes = maps:get(nodes, Data),
@@ -428,8 +461,33 @@ valid_graph_pause_cursor(NodeId, Cursor, Nodes) ->
         <<"node">> ->
             PauseValid andalso graph_node_requires_edge(
                                   maps:get(NodeId, Nodes));
+        <<"nested_workflow">> ->
+            PauseValid andalso
+            maps:get(type, maps:get(NodeId, Nodes), action) =:= workflow
+            andalso is_map(maps:get(<<"nested_checkpoint">>, Cursor,
+                                    undefined));
+        <<"fork_nested_workflow">> ->
+            PauseValid andalso
+            valid_fork_nested_pause_cursor(NodeId, Cursor, Nodes);
         <<"fork_branch">> ->
             PauseValid andalso valid_fork_pause_cursor(NodeId, Cursor, Nodes);
+        _ -> false
+    end.
+
+valid_fork_nested_pause_cursor(NodeId, Cursor, Nodes) ->
+    Results = maps:get(<<"fork_results">>, Cursor, undefined),
+    ForkCursor = Cursor#{<<"phase">> => <<"fork">>,
+                         <<"results">> => Results},
+    BaseValid = valid_fork_cursor(NodeId, ForkCursor, Nodes),
+    ForkNode = maps:get(NodeId, Nodes),
+    case {maps:find(<<"paused_branch">>, Cursor),
+          maps:find(<<"nested_checkpoint">>, Cursor)} of
+        {{ok, BranchId}, {ok, ChildCheckpoint}} ->
+            BaseValid andalso is_binary(BranchId)
+            andalso lists:member(BranchId, maps:get(branches, ForkNode))
+            andalso maps:get(type, maps:get(BranchId, Nodes), action)
+                        =:= workflow
+            andalso is_map(ChildCheckpoint);
         _ -> false
     end.
 
@@ -437,7 +495,18 @@ valid_fork_pause_cursor(NodeId, Cursor, Nodes) ->
     Results = maps:get(<<"fork_results">>, Cursor, undefined),
     ForkCursor = Cursor#{<<"phase">> => <<"fork">>,
                          <<"results">> => Results},
-    valid_fork_cursor(NodeId, ForkCursor, Nodes).
+    BaseValid = valid_fork_cursor(NodeId, ForkCursor, Nodes),
+    case {maps:find(<<"paused_branch">>, Cursor),
+          maps:find(<<"paused_delta">>, Cursor)} of
+        {error, error} -> BaseValid;
+        {{ok, BranchId}, {ok, Delta}} ->
+            BaseValid andalso is_binary(BranchId)
+            andalso lists:member(
+                      BranchId,
+                      maps:get(branches, maps:get(NodeId, Nodes)))
+            andalso is_map(Delta);
+        _ -> false
+    end.
 
 valid_fork_cursor(NodeId, Cursor, Nodes) ->
     Node = maps:get(NodeId, Nodes),
@@ -446,12 +515,17 @@ valid_fork_cursor(NodeId, Cursor, Nodes) ->
         {fork, Value} when is_map(Value) ->
             Branches = maps:get(branches, Node),
             maps:fold(
-              fun(Id, Delta, Valid) ->
+              fun(Id, Result, Valid) ->
                       Valid andalso lists:member(Id, Branches)
-                      andalso is_map(Delta)
+                      andalso valid_fork_result(Result)
               end, true, Value);
         _ -> false
     end.
+
+valid_fork_result(#{<<"result_version">> := 1,
+                    <<"output">> := _Output,
+                    <<"delta">> := Delta}) -> is_map(Delta);
+valid_fork_result(LegacyDelta) -> is_map(LegacyDelta).
 
 json_safe_exact(Value) ->
     case adk_json:normalize(Value) of
@@ -459,7 +533,8 @@ json_safe_exact(Value) ->
         _ -> false
     end.
 
-prepare_resume_checkpoint(#{kind := graph}, Checkpoint, Opts) ->
+prepare_resume_checkpoint(#{kind := Kind}, Checkpoint, Opts)
+  when Kind =:= graph; Kind =:= sequential ->
     Cursor = maps:get(<<"cursor">>, Checkpoint),
     case maps:get(<<"phase">>, Cursor, <<"ready">>) of
         <<"awaiting_resume">> ->
@@ -604,6 +679,16 @@ compile_kind(graph, Spec) ->
         {error, _} = Error -> Error
     end.
 
+compile_workflow_schemas(Spec) ->
+    Input0 = get_field(input_schema, Spec, undefined),
+    Output0 = get_field(output_schema, Spec, undefined),
+    case {adk_json_schema:compile(Input0),
+          adk_json_schema:compile(Output0)} of
+        {{ok, Input}, {ok, Output}} -> {ok, Input, Output};
+        {{error, Reason}, _} -> invalid([input_schema], Reason);
+        {_, {error, Reason}} -> invalid([output_schema], Reason)
+    end.
+
 compile_graph_nodes(Value) when is_list(Value) ->
     compile_graph_nodes(Value, 1, [], #{});
 compile_graph_nodes(_Value) ->
@@ -658,11 +743,13 @@ compile_graph_node(Item, Index, Id) ->
         error -> invalid([nodes, Index, type], unsupported_graph_node_type)
     end.
 
-compile_graph_action_node(_Item, Index, Id, Type, Action) ->
-    case compile_action(Action) of
-        {ok, CompiledAction} ->
-            {ok, #{id => Id, type => Type, run => CompiledAction}};
-        {error, _} -> invalid([nodes, Index, run], invalid_action)
+compile_graph_action_node(Item, Index, Id, Type, Action) ->
+    case {compile_action(Action), compile_action_policy(Item)} of
+        {{ok, CompiledAction}, {ok, Policy}} ->
+            {ok, #{id => Id, type => Type, run => CompiledAction,
+                   policy => Policy}};
+        {{error, _}, _} -> invalid([nodes, Index, run], invalid_action);
+        {_, {error, Reason}} -> invalid([nodes, Index, policy], Reason)
     end.
 
 compile_graph_tool_node(Item, Index, Id) ->
@@ -672,21 +759,26 @@ compile_graph_tool_node(Item, Index, Id) ->
     ArgsValid = is_map(Args) orelse is_function(Args, 1)
         orelse is_function(Args, 2) orelse valid_mfa(Args),
     ResultValid = ResultKey =:= undefined orelse valid_id(ResultKey),
-    case is_atom(Module) andalso ArgsValid andalso ResultValid of
-        true ->
+    case {is_atom(Module) andalso ArgsValid andalso ResultValid,
+          compile_action_policy(Item)} of
+        {true, {ok, Policy}} ->
             {ok, #{id => Id, type => tool,
-                   run => {tool, Module, Args, ResultKey}}};
-        false -> invalid([nodes, Index], invalid_tool_node)
+                   run => {tool, Module, Args, ResultKey},
+                   policy => Policy}};
+        {false, _} -> invalid([nodes, Index], invalid_tool_node);
+        {_, {error, Reason}} -> invalid([nodes, Index, policy], Reason)
     end.
 
 compile_graph_workflow_node(Item, Index, Id) ->
     Workflow = get_field(workflow, Item, undefined),
     Opts = get_field(options, Item, #{}),
-    case is_compiled(Workflow) andalso valid_nested_workflow_options(Opts) of
-        true ->
+    case {is_compiled(Workflow) andalso valid_nested_workflow_options(Opts),
+          compile_action_policy(Item)} of
+        {true, {ok, Policy}} ->
             {ok, #{id => Id, type => workflow,
-                   run => {workflow, Workflow, Opts}}};
-        false -> invalid([nodes, Index], invalid_nested_workflow_node)
+                   run => {workflow, Workflow, Opts}, policy => Policy}};
+        {false, _} -> invalid([nodes, Index], invalid_nested_workflow_node);
+        {_, {error, Reason}} -> invalid([nodes, Index, policy], Reason)
     end.
 
 valid_nested_workflow_options(Opts) when is_map(Opts) ->
@@ -825,10 +917,16 @@ compile_named_actions([Item | Rest], Field, Index, Acc, Seen)
                 false ->
                     case compile_action(Action) of
                         {ok, CompiledAction} ->
-                            compile_named_actions(
-                              Rest, Field, Index + 1,
-                              [#{id => Id, run => CompiledAction} | Acc],
-                              Seen#{Id => true});
+                            case compile_action_policy(Item) of
+                                {ok, Policy} ->
+                                    compile_named_actions(
+                                      Rest, Field, Index + 1,
+                                      [#{id => Id, run => CompiledAction,
+                                         policy => Policy} | Acc],
+                                      Seen#{Id => true});
+                                {error, Reason} ->
+                                    invalid([Field, Index, policy], Reason)
+                            end;
                         {error, _} -> invalid([Field, Index, run], invalid_action)
                     end
             end
@@ -842,10 +940,16 @@ compile_members(Members) when is_map(Members) ->
               case valid_id(Id) of
                   false -> invalid([members, Id], invalid_member_id);
                   true ->
-                      case compile_action(get_field(run, Member, undefined)) of
-                          {ok, Action} ->
-                              {ok, Acc#{Id => #{id => Id, run => Action}}};
-                          {error, _} -> invalid([members, Id, run], invalid_action)
+                      case {compile_action(
+                              get_field(run, Member, undefined)),
+                            compile_action_policy(Member)} of
+                          {{ok, Action}, {ok, Policy}} ->
+                              {ok, Acc#{Id => #{id => Id, run => Action,
+                                                policy => Policy}}};
+                          {{error, _}, _} ->
+                              invalid([members, Id, run], invalid_action);
+                          {_, {error, Reason}} ->
+                              invalid([members, Id, policy], Reason)
                       end
               end;
          (_Id, _Member, {ok, _Acc}) ->
@@ -974,6 +1078,36 @@ compile_action({Module, Function, ExtraArgs})
 compile_action(_) ->
     {error, invalid_action}.
 
+compile_action_policy(Item) ->
+    Timeout = get_field(timeout, Item, infinity),
+    Retry = get_field(retry, Item, #{}),
+    case {valid_action_timeout(Timeout), compile_retry_policy(Retry)} of
+        {true, {ok, RetryPolicy}} ->
+            {ok, RetryPolicy#{timeout => Timeout}};
+        {false, _} -> {error, invalid_timeout};
+        {_, {error, Reason}} -> {error, Reason}
+    end.
+
+valid_action_timeout(infinity) -> true;
+valid_action_timeout(Value) -> valid_non_neg(Value).
+
+compile_retry_policy(Retry) when is_map(Retry) ->
+    Allowed = [max_attempts, backoff_ms,
+               <<"max_attempts">>, <<"backoff_ms">>],
+    MaxAttempts = get_field(max_attempts, Retry, 1),
+    BackoffMs = get_field(backoff_ms, Retry, 0),
+    case {lists:all(fun(Key) -> lists:member(Key, Allowed) end,
+                    maps:keys(Retry)),
+          positive(MaxAttempts), valid_non_neg(BackoffMs)} of
+        {true, true, true} ->
+            {ok, #{max_attempts => MaxAttempts,
+                   backoff_ms => BackoffMs}};
+        {false, _, _} -> {error, invalid_retry_option};
+        {_, false, _} -> {error, invalid_retry_max_attempts};
+        {_, _, false} -> {error, invalid_retry_backoff}
+    end;
+compile_retry_policy(_) -> {error, invalid_retry_policy}.
+
 compile_agent_action(Name, Prompt, Decide) ->
     PromptValid = is_binary(Prompt)
         orelse is_list(Prompt)
@@ -984,9 +1118,11 @@ compile_agent_action(Name, Prompt, Decide) ->
         orelse is_function(Decide, 2)
         orelse is_function(Decide, 3)
         orelse valid_mfa(Decide),
-    case valid_id(Name) andalso PromptValid andalso DecideValid of
-        true -> {ok, {agent, Name, Prompt, Decide}};
-        false -> {error, invalid_agent_action}
+    case {adk_agent_tree:validate_name(Name), PromptValid, DecideValid} of
+        {{ok, CanonicalName}, true, true} ->
+            {ok, {agent, CanonicalName, Prompt, Decide}};
+        _ ->
+            {error, invalid_agent_action}
     end.
 
 valid_mfa({Module, Function, ExtraArgs}) ->
@@ -1066,6 +1202,15 @@ failure_reason({budget_exhausted, {graph_loop_iterations, NodeId}}) ->
     {budget_exhausted, {graph_loop_iterations, safe_identifier(NodeId)}};
 failure_reason({resume_input_required, NodeId}) ->
     {resume_input_required, safe_identifier(NodeId)};
+failure_reason({action_timed_out, Timeout})
+  when Timeout =:= infinity;
+       is_integer(Timeout), Timeout >= 0 ->
+    {action_timed_out, Timeout};
+failure_reason({retry_exhausted, Attempts, Reason})
+  when is_integer(Attempts), Attempts > 0 ->
+    {retry_exhausted, Attempts, retry_failure_reason(Reason)};
+failure_reason({output_schema_validation_failed, Reason}) ->
+    {output_schema_validation_failed, schema_failure_reason(Reason)};
 failure_reason({Tag, Id, Reason}) ->
     case nested_failure_tag(Tag) of
         true ->
@@ -1080,6 +1225,26 @@ failure_reason({Tag, Reason}) ->
     end;
 failure_reason(Reason) ->
     adk_failure:external(adk_workflow, execute, Reason).
+
+retry_failure_reason({action_timed_out, Timeout})
+  when Timeout =:= infinity;
+       is_integer(Timeout), Timeout >= 0 ->
+    {action_timed_out, Timeout};
+retry_failure_reason({returned_error, Reason}) when is_atom(Reason) ->
+    {returned_error, Reason};
+retry_failure_reason({action_exception, _Class, _Reason} = Failure) ->
+    failure_reason(Failure);
+retry_failure_reason({attempt_worker_down, Failure}) ->
+    {attempt_worker_down, failure_reason(Failure)};
+retry_failure_reason(Reason) -> failure_reason(Reason).
+
+schema_failure_reason({schema_validation_failed, Path, Constraint}) ->
+    {schema_validation_failed, safe_identifiers(Path),
+     sanitize_reason(Constraint)};
+schema_failure_reason({invalid_json_value, Reason}) ->
+    {invalid_json_value, sanitize_reason(Reason)};
+schema_failure_reason(Reason) ->
+    external_reason(adk_workflow, output_schema, Reason).
 
 terminal_outcome(failed, {failed, Reason, _EmbeddedCheckpoint}, Checkpoint) ->
     {failed, failure_reason(Reason), Checkpoint};
@@ -1315,17 +1480,32 @@ safe_call(Pid, Request, Timeout) ->
     end.
 
 start_supervised(Compiled, InitialState, Opts) ->
-    try adk_workflow_sup:start_workflow(Compiled, InitialState, Opts) of
-        {ok, Pid} -> {ok, Pid};
-        {ok, Pid, _Info} -> {ok, Pid};
-        {error, Reason} ->
-            {error, {workflow_start_failed,
-                     external_reason(adk_workflow, start, Reason)}}
-    catch
-        exit:{noproc, _} -> {error, workflow_supervisor_not_started};
-        exit:Reason ->
-            {error, {workflow_start_failed,
-                     external_reason(adk_workflow, start, Reason)}}
+    case validate_workflow_input(Compiled, InitialState, Opts) of
+        ok ->
+            try adk_workflow_sup:start_workflow(
+                  Compiled, InitialState, Opts) of
+                {ok, Pid} -> {ok, Pid};
+                {ok, Pid, _Info} -> {ok, Pid};
+                {error, Reason} ->
+                    {error, {workflow_start_failed,
+                             external_reason(adk_workflow, start, Reason)}}
+            catch
+                exit:{noproc, _} ->
+                    {error, workflow_supervisor_not_started};
+                exit:Reason ->
+                    {error, {workflow_start_failed,
+                             external_reason(adk_workflow, start, Reason)}}
+            end;
+        {error, _} = Error -> Error
+    end.
+
+validate_workflow_input(_Compiled, _InitialState,
+                        #{resume_checkpoint := _}) -> ok;
+validate_workflow_input(Compiled, InitialState, _Opts) ->
+    Schema = maps:get(input_schema, Compiled, undefined),
+    case adk_json_schema:validate_compiled(Schema, InitialState) of
+        {ok, _} -> ok;
+        {error, Reason} -> {error, {input_schema_validation_failed, Reason}}
     end.
 
 invalid(Path, Reason) ->

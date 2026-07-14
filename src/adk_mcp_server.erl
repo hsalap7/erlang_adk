@@ -578,7 +578,7 @@ initialize_result(State, Version) ->
     #{<<"protocolVersion">> => Version,
       <<"capabilities">> => Cap3,
       <<"serverInfo">> => #{<<"name">> => <<"erlang_adk">>,
-                             <<"version">> => <<"0.3.0">>}}.
+                             <<"version">> => <<"0.4.0">>}}.
 
 normalize_config(Config0) when is_map(Config0) ->
     Config1 = #{ip => maps:get(ip, Config0, {127, 0, 0, 1}),

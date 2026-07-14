@@ -7,11 +7,14 @@ workflow_test_() ->
      fun cleanup/1,
      [fun supervisor_and_public_facade_case/0,
       fun compile_validation_case/0,
+      fun workflow_schema_contracts_case/0,
       fun sequential_delta_case/0,
+      fun output_stop_and_legacy_complete_contract_case/0,
       fun cancellation_stops_blocked_worker_case/0,
       fun coordinator_death_stops_blocked_worker_case/0,
       fun absolute_deadline_stops_blocked_worker_case/0,
       fun parallel_is_bounded_and_merge_is_ordered_case/0,
+      fun parallel_outputs_are_collected_by_branch_id_case/0,
       fun parallel_conflict_is_deterministic_case/0,
       fun parallel_failure_stops_sibling_case/0,
       fun loop_budget_and_completion_case/0,
@@ -19,6 +22,7 @@ workflow_test_() ->
       fun transfer_resolves_restarted_agent_by_name_case/0,
       fun graph_route_and_step_budget_case/0,
       fun checkpoint_resume_does_not_replay_committed_step_case/0,
+      fun sequential_nested_pause_resumes_child_without_replay_case/0,
       fun public_failures_are_sanitized_case/0]}.
 
 setup() ->
@@ -72,7 +76,102 @@ compile_validation_case() ->
     ?assertEqual(
        {error, {invalid_workflow, [max_steps],
                 expected_positive_integer}},
-       adk_workflow:compile(InvalidMax)).
+       adk_workflow:compile(InvalidMax)),
+
+    InvalidAgentName = base_spec(
+                         sequential,
+                         #{steps =>
+                               [step(<<"agent">>,
+                                     {agent, <<"bad-name">>,
+                                      <<"work">>})]}),
+    ?assertEqual(
+       {error, {invalid_workflow, [steps, 1, run], invalid_action}},
+       adk_workflow:compile(InvalidAgentName)),
+
+    ReservedAgentName = base_spec(
+                          graph,
+                          #{entry => <<"agent">>,
+                            nodes =>
+                                [#{id => <<"agent">>, type => agent,
+                                   agent => <<"user">>,
+                                   prompt => <<"work">>}],
+                            edges => #{<<"agent">> => end_node}}),
+    ?assertEqual(
+       {error, {invalid_workflow, [nodes, 1, run], invalid_action}},
+       adk_workflow:compile(ReservedAgentName)),
+
+    CanonicalAgentName = base_spec(
+                           sequential,
+                           #{steps =>
+                                 [step(<<"agent">>,
+                                       {agent, "workflow_agent",
+                                        <<"work">>})]}),
+    {ok, CanonicalAgentWorkflow} =
+        adk_workflow:compile(CanonicalAgentName),
+    [#{run := {agent, <<"workflow_agent">>, <<"work">>, undefined}}] =
+        maps:get(steps, maps:get(data, CanonicalAgentWorkflow)).
+
+workflow_schema_contracts_case() ->
+    Parent = self(),
+    InputSchema = #{<<"type">> => <<"object">>,
+                    <<"required">> => [<<"topic">>],
+                    <<"properties">> =>
+                        #{<<"topic">> => #{<<"type">> => <<"string">>}}},
+    OutputSchema = #{<<"type">> => <<"string">>},
+    Valid = compile_ok(
+              base_spec(
+                sequential,
+                #{input_schema => InputSchema,
+                  output_schema => OutputSchema,
+                  steps =>
+                      [step(
+                         <<"contract">>,
+                         fun(_State) ->
+                             Parent ! schema_action_ran,
+                             {output, <<"valid-output">>, #{}}
+                         end)]})),
+    ?assertMatch(
+       {error,
+        {input_schema_validation_failed,
+         {schema_validation_failed, _, _}}},
+       adk_workflow:start(Valid, #{})),
+    receive schema_action_ran -> error(input_contract_ran_action)
+    after 0 -> ok
+    end,
+    {completed, _, ValidCheckpoint} =
+        adk_workflow:run(Valid, #{<<"topic">> => <<"Erlang">>}),
+    ?assertEqual(<<"valid-output">>,
+                 maps:get(<<"output">>, ValidCheckpoint)),
+
+    InvalidOutput = compile_ok(
+                      base_spec(
+                        sequential,
+                        #{output_schema => OutputSchema,
+                          steps =>
+                              [step(
+                                 <<"wrong-output">>,
+                                 fun(_State) ->
+                                     {output, 42, #{<<"ran">> => true}}
+                                 end)]})),
+    {failed,
+     {output_schema_validation_failed,
+      {schema_validation_failed, [], {expected_type, <<"string">>}}},
+     InvalidOutputCheckpoint} =
+        adk_workflow:run(InvalidOutput, #{}),
+    ?assertEqual(false, maps:get(<<"completed">>, InvalidOutputCheckpoint)),
+    ?assertEqual(true,
+                 maps:get(<<"ran">>,
+                          maps:get(<<"state">>, InvalidOutputCheckpoint))),
+
+    ?assertMatch(
+       {error,
+        {invalid_workflow, [output_schema],
+         {invalid_json_schema, _, _}}},
+       adk_workflow:compile(
+         base_spec(
+           sequential,
+           #{output_schema => #{<<"unsupported">> => true},
+             steps => [step(<<"noop">>, ok_action())]}))).
 
 sequential_delta_case() ->
     First = fun(State, Context) ->
@@ -95,6 +194,54 @@ sequential_delta_case() ->
     ?assertEqual(true, maps:get(<<"done">>, State)),
     ?assertEqual(true, maps:get(<<"completed">>, Checkpoint)),
     ?assertEqual(<<"finished">>, maps:get(<<"output">>, Checkpoint)).
+
+output_stop_and_legacy_complete_contract_case() ->
+    Parent = self(),
+    First = fun(_State) ->
+        {output, <<"intermediate">>, #{<<"first">> => true}}
+    end,
+    Stop = fun(State) ->
+        ?assertEqual(true, maps:get(<<"first">>, State)),
+        {stop, <<"stopped">>, #{<<"second">> => true}}
+    end,
+    MustNotRun = fun(_State) ->
+        Parent ! unexpected_sequential_step,
+        {ok, #{<<"third">> => true}}
+    end,
+    Compiled = compile_ok(
+                 base_spec(sequential,
+                           #{steps => [step(<<"first">>, First),
+                                       step(<<"stop">>, Stop),
+                                       step(<<"never">>, MustNotRun)],
+                             max_steps => 4})),
+    {completed, State, Checkpoint} = adk_workflow:run(Compiled, #{}),
+    ?assertEqual(true, maps:get(<<"first">>, State)),
+    ?assertEqual(true, maps:get(<<"second">>, State)),
+    ?assertEqual(false, maps:is_key(<<"third">>, State)),
+    ?assertEqual(<<"stopped">>, maps:get(<<"output">>, Checkpoint)),
+    receive unexpected_sequential_step -> ?assert(false)
+    after 0 -> ok
+    end,
+
+    Legacy = compile_ok(
+               base_spec(sequential,
+                         #{steps =>
+                               [step(<<"legacy">>,
+                                     fun(_) ->
+                                         {complete, <<"legacy-stop">>,
+                                          #{<<"legacy">> => true}}
+                                     end),
+                                step(<<"legacy-never">>, MustNotRun)],
+                           max_steps => 3})),
+    {completed, LegacyState, LegacyCheckpoint} =
+        adk_workflow:run(Legacy, #{}),
+    ?assertEqual(true, maps:get(<<"legacy">>, LegacyState)),
+    ?assertEqual(false, maps:is_key(<<"third">>, LegacyState)),
+    ?assertEqual(<<"legacy-stop">>,
+                 maps:get(<<"output">>, LegacyCheckpoint)),
+    receive unexpected_sequential_step -> ?assert(false)
+    after 0 -> ok
+    end.
 
 cancellation_stops_blocked_worker_case() ->
     Parent = self(),
@@ -215,6 +362,32 @@ parallel_is_bounded_and_merge_is_ordered_case() ->
     %% the declared branch order.
     ?assertEqual(3, maps:get(<<"winner">>, State)).
 
+parallel_outputs_are_collected_by_branch_id_case() ->
+    Branches =
+        [step(<<"left">>,
+              fun(_) ->
+                  {output, #{<<"answer">> => 1},
+                   #{<<"left_done">> => true}}
+              end),
+         step(<<"right">>,
+              fun(_) ->
+                  {output, #{<<"answer">> => 2},
+                   #{<<"right_done">> => true}}
+              end)],
+    Compiled = compile_ok(
+                 base_spec(
+                   parallel,
+                   #{branches => Branches,
+                     merge => reject_conflicts,
+                     max_concurrency => 2})),
+    {completed, State, Checkpoint} = adk_workflow:run(Compiled, #{}),
+    ?assertEqual(true, maps:get(<<"left_done">>, State)),
+    ?assertEqual(true, maps:get(<<"right_done">>, State)),
+    ?assertEqual(
+       #{<<"left">> => #{<<"answer">> => 1},
+         <<"right">> => #{<<"answer">> => 2}},
+       maps:get(<<"output">>, Checkpoint)).
+
 parallel_conflict_is_deterministic_case() ->
     Branches = [step(<<"left">>,
                      fun(_) -> {ok, #{<<"shared">> => 1}} end),
@@ -287,11 +460,12 @@ loop_budget_and_completion_case() ->
                             #{body => Body, until => fun(_) -> false end,
                               max_iterations => 2,
                               max_steps => 4})),
-    {failed, {budget_exhausted, iterations}, CP} =
+    {completed, ExhaustedState, CP} =
         adk_workflow:run(Exhausted, #{<<"count">> => 0}),
-    ?assertEqual(2, maps:get(<<"count">>, maps:get(<<"state">>, CP))),
-    ?assertEqual(2, maps:get(<<"iteration">>,
-                            maps:get(<<"cursor">>, CP))).
+    ?assertEqual(2, maps:get(<<"count">>, ExhaustedState)),
+    ?assertEqual(true, maps:get(<<"completed">>, CP)),
+    ?assertEqual(#{<<"type">> => <<"complete">>},
+                 maps:get(<<"cursor">>, CP)).
 
 transfer_state_budget_and_event_case() ->
     A = fun(_State, _Context) ->
@@ -334,12 +508,12 @@ transfer_state_budget_and_event_case() ->
                             maps:get(<<"state">>, BudgetCP))).
 
 transfer_resolves_restarted_agent_by_name_case() ->
-    AName = <<"workflow-registry-a">>,
-    BName = <<"workflow-registry-b">>,
+    AName = <<"workflow_registry_a">>,
+    BName = <<"workflow_registry_b">>,
     ensure_unregistered(AName),
     ensure_unregistered(BName),
-    AAgent = spawn(fun() -> dummy_agent(<<"a-response">>) end),
-    OldB = spawn(fun() -> dummy_agent(<<"old-b">>) end),
+    AAgent = spawn(fun() -> dummy_agent(AName, <<"a-response">>) end),
+    OldB = spawn(fun() -> dummy_agent(BName, <<"old-b">>) end),
     yes = adk_agent_registry:register_name(AName, AAgent),
     yes = adk_agent_registry:register_name(BName, OldB),
     Parent = self(),
@@ -369,7 +543,7 @@ transfer_resolves_restarted_agent_by_name_case() ->
         ?assert(is_pid(DecisionWorker)),
         ok = adk_agent_registry:unregister_name(BName),
         exit(OldB, kill),
-        NewB = spawn(fun() -> dummy_agent(<<"new-b">>) end),
+        NewB = spawn(fun() -> dummy_agent(BName, <<"new-b">>) end),
         yes = adk_agent_registry:register_name(BName, NewB),
         DecisionWorker ! continue_transfer,
         {completed, State, _} = adk_workflow:await(Ref, 1000),
@@ -425,9 +599,10 @@ checkpoint_resume_does_not_replay_committed_step_case() ->
     Parent = self(),
     First = fun(_State) ->
         ets:update_counter(Table, first_calls, 1),
-        {ok, #{<<"first_committed">> => true}}
+        {output, <<"first-output">>, #{<<"first_committed">> => true}}
     end,
-    Second = fun(_State) ->
+    Second = fun(_State, Context) ->
+        ?assertEqual(<<"first-output">>, maps:get(input, Context)),
         case ets:lookup_element(Table, allow_second, 2) of
             true -> {ok, #{<<"second_committed">> => true}};
             false ->
@@ -452,11 +627,16 @@ checkpoint_resume_does_not_replay_committed_step_case() ->
             andalso maps:get(<<"first_committed">>,
                              maps:get(<<"state">>, CP), false)
         end),
+        ?assertEqual(
+           {error, invalid_checkpoint},
+           adk_workflow:resume(
+             Compiled, CP0#{<<"output">> => self()})),
         ok = adk_workflow:cancel(Ref, checkpoint_test),
         {cancelled, checkpoint_test, CancelCP} =
             adk_workflow:await(Ref, 1000),
         ?assertEqual(maps:get(<<"state">>, CP0),
                      maps:get(<<"state">>, CancelCP)),
+        ?assertEqual(<<"first-output">>, maps:get(<<"output">>, CancelCP)),
         ets:insert(Table, {allow_second, true}),
         {ok, ResumedRef} = adk_workflow:resume(
                             Compiled, CancelCP,
@@ -464,9 +644,87 @@ checkpoint_resume_does_not_replay_committed_step_case() ->
         {completed, State, CompleteCP} =
             adk_workflow:await(ResumedRef, 1000),
         ?assertEqual(true, maps:get(<<"second_committed">>, State)),
+        ?assertEqual(<<"first-output">>,
+                     maps:get(<<"output">>, CompleteCP)),
         ?assertEqual(1, ets:lookup_element(Table, first_calls, 2)),
         ?assertEqual({error, checkpoint_complete},
                      adk_workflow:resume(Compiled, CompleteCP))
+    after
+        ets:delete(Table)
+    end.
+
+sequential_nested_pause_resumes_child_without_replay_case() ->
+    Table = ets:new(sequential_nested_pause, [set, public]),
+    ets:insert(Table, [{before_calls, 0}, {pause_calls, 0},
+                       {after_calls, 0}]),
+    Child = compile_ok(
+              base_spec(
+                graph,
+                #{entry => <<"before">>,
+                  nodes =>
+                      [step(
+                         <<"before">>,
+                         fun(_State) ->
+                             ets:update_counter(Table, before_calls, 1),
+                             {output, <<"before">>,
+                              #{<<"before">> => true}}
+                         end),
+                       step(
+                         <<"pause">>,
+                         fun(_State) ->
+                             ets:update_counter(Table, pause_calls, 1),
+                             {pause, approval, <<"Approve sequential child">>,
+                              #{<<"requested">> => true}}
+                         end),
+                       step(
+                         <<"after">>,
+                         fun(_State, Context) ->
+                             ets:update_counter(Table, after_calls, 1),
+                             ?assertEqual(<<"approved">>,
+                                          maps:get(input, Context)),
+                             {output, <<"child-final">>,
+                              #{<<"child_done">> => true}}
+                         end)],
+                  edges => #{<<"before">> => <<"pause">>,
+                             <<"pause">> => <<"after">>,
+                             <<"after">> => end_node},
+                  max_steps => 6})),
+    Parent = compile_ok(
+               base_spec(
+                 sequential,
+                 #{steps =>
+                       [step(<<"child">>, {workflow, Child, #{}}),
+                        step(
+                          <<"final">>,
+                          fun(State, Context) ->
+                              ?assertEqual(true,
+                                           maps:get(<<"child_done">>, State)),
+                              ?assertEqual(<<"child-final">>,
+                                           maps:get(input, Context)),
+                              {output, <<"parent-final">>,
+                               #{<<"parent_done">> => true}}
+                          end)],
+                   max_steps => 4})),
+    try
+        {paused, Details, Checkpoint} = adk_workflow:run(Parent, #{}),
+        ?assertEqual(<<"child">>, maps:get(<<"step_id">>, Details)),
+        ?assertEqual(<<"pause">>,
+                     maps:get(<<"nested_node_id">>, Details)),
+        ?assertEqual(1, ets:lookup_element(Table, before_calls, 2)),
+        ?assertEqual(1, ets:lookup_element(Table, pause_calls, 2)),
+        ?assertEqual(0, ets:lookup_element(Table, after_calls, 2)),
+        {ok, Ref} = adk_workflow:resume(
+                      Parent, Checkpoint,
+                      #{resume_input => <<"approved">>,
+                        retention_ms => 1000}),
+        {completed, State, CompleteCheckpoint} =
+            adk_workflow:await(Ref, 1000),
+        ?assertEqual(true, maps:get(<<"parent_done">>, State)),
+        ?assertEqual(<<"parent-final">>,
+                     maps:get(<<"output">>, CompleteCheckpoint)),
+        ?assertEqual(1, ets:lookup_element(Table, before_calls, 2)),
+        ?assertEqual(1, ets:lookup_element(Table, pause_calls, 2)),
+        ?assertEqual(1, ets:lookup_element(Table, after_calls, 2))
     after
         ets:delete(Table)
     end.
@@ -524,13 +782,19 @@ wait_for_checkpoint(Ref, Predicate, Attempts) ->
             wait_for_checkpoint(Ref, Predicate, Attempts - 1)
     end.
 
-dummy_agent(Response) ->
+dummy_agent(Name, Response) ->
     receive
+        {'$gen_call', From, get_runtime} ->
+            gen_server:reply(From, {ok, Name, #{}, [], #{}}),
+            dummy_agent(Name, Response);
         {'$gen_call', From, {prompt, _Prompt}} ->
             gen_server:reply(From, {ok, Response}),
-            dummy_agent(Response);
+            dummy_agent(Name, Response);
+        {'$gen_call', From, {invoke, _Prompt, _Context}} ->
+            gen_server:reply(From, {ok, Response}),
+            dummy_agent(Name, Response);
         stop -> ok;
-        _ -> dummy_agent(Response)
+        _ -> dummy_agent(Name, Response)
     end.
 
 ensure_unregistered(Name) ->

@@ -6,3 +6,12 @@
 
 %% Callback for getting the schema/description of the tool.
 -callback schema() -> map().
+
+%% Optional confirmation gates.  The argument-aware callback takes precedence
+%% when a tool exports both forms.  A callback returns a boolean or an internal
+%% metadata map such as #{required => true, hint => <<"Publish release">>}.
+-callback require_confirmation() -> boolean() | map().
+-callback require_confirmation(Args :: map(), Context :: map()) ->
+    boolean() | map().
+
+-optional_callbacks([require_confirmation/0, require_confirmation/2]).

@@ -12,6 +12,7 @@ agent_runtime_spec_test_() ->
      fun cleanup/1,
      [fun runner_applies_instruction_history_generation_and_output_contract/0,
       fun direct_agent_uses_scoped_state_and_commits_output_key/0,
+      fun invocation_output_key_uses_caller_session_scope/0,
       fun invalid_input_never_reaches_the_provider/0,
       fun after_agent_replacement_rebuilds_output_delta/0,
       fun before_agent_short_circuit_cannot_bypass_output_schema/0]}.
@@ -27,6 +28,7 @@ cleanup(_) ->
           _ = erlang_adk_session:delete_session(?APP, ?USER, SessionId)
       end,
       [<<"contract">>, <<"direct-contract">>, <<"bad-input">>,
+       <<"configured-scope">>, <<"invocation-scope">>,
        <<"callback-delta">>,
        <<"callback-invalid">>]),
     flush_probe_messages(),
@@ -133,6 +135,54 @@ direct_agent_uses_scoped_state_and_commits_output_key() ->
     after
         _ = catch erlang_adk:stop_agent(Agent),
         _ = erlang_adk_session:delete(SessionId)
+    end.
+
+invocation_output_key_uses_caller_session_scope() ->
+    ConfiguredSession = <<"configured-scope">>,
+    InvocationSession = <<"invocation-scope">>,
+    {ok, _} = erlang_adk_session:create_session(
+                ?APP, ?USER,
+                #{session_id => ConfiguredSession,
+                  state => #{<<"owner">> => <<"configured">>}}),
+    {ok, _} = erlang_adk_session:create_session(
+                ?APP, ?USER,
+                #{session_id => InvocationSession,
+                  state => #{<<"owner">> => <<"invocation">>}}),
+    Config = #{provider => adk_llm_agent_spec_probe,
+               test_pid => self(),
+               app_name => ?APP,
+               user_id => ?USER,
+               session_id => ConfiguredSession,
+               output_key => <<"delegated_answer">>,
+               response => <<"caller scoped">>},
+    {ok, Agent} = erlang_adk:spawn_agent(
+                    "AgentSpecInvocationScope", Config, []),
+    Context = #{app_name => ?APP,
+                user_id => ?USER,
+                session_id => InvocationSession,
+                state_ref => erlang_adk_session,
+                state => #{<<"owner">> => <<"invocation">>}},
+    try
+        ?assertEqual({ok, <<"caller scoped">>},
+                     erlang_adk:invoke(
+                       Agent, <<"write in this session">>, Context)),
+        receive
+            {agent_spec_probe, _EffectiveConfig, _History, []} -> ok
+        after 1000 ->
+            ?assert(false)
+        end,
+        {ok, Configured} = erlang_adk_session:get_session(
+                             ?APP, ?USER, ConfiguredSession),
+        {ok, Invoked} = erlang_adk_session:get_session(
+                          ?APP, ?USER, InvocationSession),
+        ?assertEqual(false,
+                     maps:is_key(<<"delegated_answer">>,
+                                 maps:get(state, Configured))),
+        ?assertEqual(<<"caller scoped">>,
+                     maps:get(<<"delegated_answer">>,
+                              maps:get(state, Invoked)))
+    after
+        _ = catch erlang_adk:stop_agent(Agent)
     end.
 
 invalid_input_never_reaches_the_provider() ->

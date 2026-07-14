@@ -17,6 +17,7 @@ readme_test_() ->
         fun sync_and_async_runner/0,
         fun supervised_run_api/0,
         fun ambient_background_runtime/0,
+        fun tool_confirmation_contract/0,
         fun suspension_and_pkce_contract/0,
         fun runner_provider_streaming/0,
         fun supervised_content_streaming/0,
@@ -36,7 +37,8 @@ readme_test_() ->
 
 setup() ->
     {ok, _StartedApps} = application:ensure_all_started(erlang_adk),
-    Modules = [readme_weather_tool, readme_audit_callback,
+    Modules = [readme_weather_tool, readme_release_tool,
+               readme_audit_callback,
                readme_policy_plugin, readme_observability_exporter,
                readme_agent_eval_adapter, readme_exact_metric,
                readme_planner, readme_plan_executor],
@@ -83,6 +85,12 @@ example_modules_compile_and_load() ->
         {ok, #{<<"city">> => <<"Tokyo">>, <<"forecast">> => <<"sunny">>}},
         readme_weather_tool:execute(#{<<"city">> => <<"Tokyo">>}, #{})
     ),
+    {ok, ReleaseRequirement} =
+        adk_tool_confirmation:module_requirement(
+          readme_release_tool,
+          #{<<"environment">> => <<"production">>,
+            <<"dry_run">> => false}, #{}),
+    ?assert(adk_tool_confirmation:is_required(ReleaseRequirement)),
     ?assert(
         erlang:function_exported(
             readme_audit_callback, before_model, 3
@@ -186,7 +194,10 @@ direct_agent_and_provider_error() ->
                 History
             )
         ),
-        ?assert(lists:member(readme_weather_tool, ModelTools))
+        ?assert(lists:any(
+                  fun(#{<<"name">> := <<"get_weather">>}) -> true;
+                     (_) -> false
+                  end, ModelTools))
     after
         safe_stop_agent(WeatherPid)
     end,
@@ -995,7 +1006,7 @@ openapi_toolset_as_agent_tools() ->
                         allowed_hosts =>
                             [<<"petstore3.swagger.io">>]}),
     {ok, Tools} = adk_toolset:new(adk_openapi_toolset, Toolset),
-    AgentName = unique_binary(<<"readme-openapi-agent">>),
+    AgentName = unique_binary(<<"ReadmeOpenapiAgent">>),
     {ok, Agent} = erlang_adk:spawn_agent(
                     AgentName,
                     #{provider => adk_llm_probe,
@@ -1367,6 +1378,51 @@ memory_and_artifacts() ->
         stop_memory(MemoryPid)
     end.
 
+tool_confirmation_contract() ->
+    AppName = unique_binary(<<"readme_confirmation_app">>),
+    UserId = <<"readme-confirmation-user">>,
+    SessionId = unique_binary(<<"confirmation-session">>),
+    AgentName = unique_binary(<<"ReadmeConfirmationAgent">>),
+    Args = #{<<"environment">> => <<"production">>,
+             <<"dry_run">> => false},
+    {ok, AgentPid} = erlang_adk:spawn_agent(
+                       AgentName,
+                       #{provider => adk_llm_probe,
+                         mode => tool_call,
+                         call_name => <<"publish_release">>,
+                         call_args => Args,
+                         call_id => <<"readme-release-call">>},
+                       [readme_release_tool]),
+    Runner = adk_runner:new(
+               AgentPid, AppName, erlang_adk_session,
+               #{run_timeout => 2000}),
+    try
+        {ok, PausedRun} = adk_run:start(
+                            Runner, UserId, SessionId,
+                            <<"Publish the prepared production release.">>,
+                            #{retention_ms => 2000}),
+        {paused, PauseEvent} = adk_run:await(PausedRun, 2000),
+        PublicPause = maps:get(<<"pause">>, PauseEvent#adk_event.actions),
+        Details = maps:get(<<"details">>, PublicPause),
+        ?assertEqual(<<"tool_confirmation">>,
+                     maps:get(<<"type">>, Details)),
+        ?assertMatch(<<"tool-confirm-", _/binary>>,
+                     maps:get(<<"action_id">>, Details)),
+        {ok, ResumedRun} = adk_run:resume(
+                             PausedRun,
+                             #{<<"confirmed">> => true},
+                             #{retention_ms => 2000}),
+        ?assertEqual({completed, <<"tool complete">>},
+                     adk_run:await(ResumedRun, 2000)),
+        ?assertEqual(
+           {error, {already_resumed, ResumedRun}},
+           adk_run:resume(PausedRun, #{<<"confirmed">> => true}))
+    after
+        safe_stop_agent(AgentPid),
+        _ = erlang_adk_session:delete_session(
+              AppName, UserId, SessionId)
+    end.
+
 suspension_and_pkce_contract() ->
     ?assertThrow(
        {adk_pause, {long_running, <<"export-42">>},
@@ -1556,4 +1612,4 @@ unique_binary(Prefix) ->
     Suffix = integer_to_binary(
         erlang:unique_integer([positive, monotonic])
     ),
-    <<Prefix/binary, "-", Suffix/binary>>.
+    <<Prefix/binary, "_", Suffix/binary>>.

@@ -3,7 +3,9 @@
 -include("../include/adk_event.hrl").
 
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
--export([generate/3, stream/4]).
+-export([generate/3, stream/4, stream_content/4,
+         capabilities/0, validate_config/1]).
+-export([retryable_rate_limit/1]).
 -export([
     direct_text/1,
     google_search_grounding/1,
@@ -83,6 +85,12 @@ end_per_suite(_Config) ->
 %% The live suite deliberately uses itself as a thin provider wrapper. This
 %% keeps quota pacing out of production code while applying it to every Gemini
 %% turn, including calls made from agents, Runner workers and parallel flows.
+capabilities() ->
+    adk_llm_gemini:capabilities().
+
+validate_config(Config) ->
+    adk_llm_gemini:validate_config(gemini_config(Config)).
+
 generate(Config, Memory, Tools) ->
     live_request(
       fun() ->
@@ -94,6 +102,14 @@ stream(Config, Memory, Tools, Callback) ->
     live_request(
       fun() ->
           adk_llm_gemini:stream(
+            gemini_config(Config), Memory, Tools, Callback)
+      end,
+      0).
+
+stream_content(Config, Memory, Tools, Callback) ->
+    live_request(
+      fun() ->
+          adk_llm_gemini:stream_content(
             gemini_config(Config), Memory, Tools, Callback)
       end,
       0).
@@ -563,8 +579,27 @@ live_request(Fun, TransportRetriesLeft) ->
               [?LIVE_REQUEST_TIMEOUT_MS]),
             live_request(Fun, TransportRetriesLeft - 1);
         Result ->
-            Result
+            case TransportRetriesLeft > 0
+                 andalso retryable_rate_limit(Result) of
+                true ->
+                    Backoff = max(request_interval_ms(), 10000),
+                    ct:pal(
+                      "Gemini returned HTTP 429; backing off ~p ms and "
+                      "retrying once",
+                      [Backoff]),
+                    timer:sleep(Backoff),
+                    live_request(Fun, TransportRetriesLeft - 1);
+                false ->
+                    Result
+            end
     end.
+
+%% Direct adapter calls expose the raw HTTP tuple. Calls which have already
+%% crossed adk_llm's provider boundary expose the bounded structural failure.
+%% Match both without inspecting or logging the response body.
+retryable_rate_limit({error, {http_status, 429, _Body}}) -> true;
+retryable_rate_limit({error, {adk_failure, #{status := 429}}}) -> true;
+retryable_rate_limit(_) -> false.
 
 request_interval_ms() ->
     case os:getenv("ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS") of
@@ -761,7 +796,7 @@ compile_example(Module) ->
 unique(Prefix) ->
     Suffix = integer_to_binary(
                erlang:unique_integer([positive, monotonic])),
-    <<Prefix/binary, "-", Suffix/binary>>.
+    <<Prefix/binary, "_", Suffix/binary>>.
 
 free_port() ->
     {ok, Socket} = gen_tcp:listen(

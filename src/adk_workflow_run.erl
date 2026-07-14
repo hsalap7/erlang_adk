@@ -388,6 +388,7 @@ normalize_runtime(Compiled, Opts) ->
                        MaxConcurrency, Retention, EventReceiver) of
         true ->
             {ok, #{deadline => Deadline,
+                   execution_id => workflow_execution_id(),
                    steps_remaining => MaxSteps,
                    transfers_remaining => MaxTransfers,
                    transfers_initial => MaxTransfers,
@@ -396,6 +397,10 @@ normalize_runtime(Compiled, Opts) ->
                    event_receiver => EventReceiver}};
         false -> {error, invalid_workflow_options}
     end.
+
+workflow_execution_id() ->
+    Counter = erlang:unique_integer([positive, monotonic]),
+    <<"workflow-", (integer_to_binary(Counter))/binary>>.
 
 valid_runtime(Deadline, Steps, Transfers, Concurrency, Retention, Receiver) ->
     (Deadline =:= infinity orelse is_integer(Deadline))

@@ -3,6 +3,8 @@
 %% A resolved call is a map containing name, args, and either module or an
 %% internal zero-arity execute function. Optional
 %% thought_signature and call_id values are copied unchanged to the result.
+%% Toolsets may also attach validated internal confirmation metadata; the
+%% executor preserves it but does not interpret or expose it to providers.
 %% Serial execution is the default. In parallel mode, only calls explicitly
 %% marked parallel_safe (or whose module opts in through parallel_safe/0 or
 %% schema metadata) overlap; an unsafe call is a barrier.
@@ -29,6 +31,7 @@
     context => map(),
     parallel_safe => boolean(),
     pause_capable => boolean(),
+    confirmation => #{required := boolean(), hint => binary()},
     timeout => non_neg_integer() | infinity,
     deadline => integer() | infinity
 }.

@@ -1,6 +1,7 @@
 -module(erlang_adk).
 
--export([spawn_agent/3, stop_agent/1, prompt/2, delegate/2, delegate/3,
+-export([spawn_agent/3, stop_agent/1, prompt/2, invoke/3,
+         delegate/2, delegate/3,
          delegate/4, sequential/2, parallel/2, parallel/3, loop/4,
          compile_workflow/1,
          start_workflow/2, start_workflow/3,
@@ -35,6 +36,12 @@ stop_agent(AgentPid) ->
 %% @doc Synchronously prompt an agent.
 prompt(AgentPid, Message) ->
     adk_agent:prompt(AgentPid, Message).
+
+%% @doc Execute one fresh-history invocation in an explicit runtime context.
+%% Reusing an agent PID through this API never reads or mutates prompt/2's
+%% compatibility conversation history.
+invoke(AgentPid, Message, Context) when is_map(Context) ->
+    adk_agent:invoke(AgentPid, Message, Context).
 
 %% @doc Asynchronously delegate a task to an agent (fire and forget).
 delegate(Pid, Message) ->

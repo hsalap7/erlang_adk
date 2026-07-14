@@ -13,7 +13,7 @@ runner_safety_test_() ->
       fun invalid_runner_safety_options_case/0,
       fun agent_policy_denial_is_audited_before_model_case/0,
       fun hitl_tool_denial_precedes_callbacks_and_pause_case/0,
-      fun dynamic_toolset_denial_occurs_after_resolution_case/0,
+      fun dynamic_toolset_denial_precedes_live_resolution_case/0,
       fun tool_output_budget_replaces_private_result_case/0,
       fun final_output_budget_prevents_raw_persistence_case/0]}.
 
@@ -189,10 +189,11 @@ hitl_tool_denial_precedes_callbacks_and_pause_case() ->
         flush_plugin_calls()
     end.
 
-dynamic_toolset_denial_occurs_after_resolution_case() ->
+dynamic_toolset_denial_precedes_live_resolution_case() ->
     SessionId = unique(<<"dynamic-policy-denied">>),
     Name = <<"dynamic-policy-agent">>,
-    {ok, Toolset} = adk_toolset:new(adk_test_toolset, self()),
+    {ok, Toolset} = adk_toolset:new(
+                      adk_test_toolset, {resolution_probe, self()}),
     Calls = [{<<"dynamic_echo">>, #{<<"text">> => <<"private">>},
               undefined, <<"dynamic-call">>}],
     TestPid = self(),
@@ -213,6 +214,9 @@ dynamic_toolset_denial_occurs_after_resolution_case() ->
         ?assertEqual(
            {ok, <<"dynamic denial handled">>},
            adk_runner:run(Runner, ?USER, SessionId, <<"echo">>)),
+        receive {dynamic_tool_resolved, _, _} -> ?assert(false)
+        after 30 -> ok
+        end,
         receive {dynamic_tool_executed, _, _, _} -> ?assert(false)
         after 30 -> ok
         end,

@@ -100,7 +100,8 @@ known_config_keys() ->
      artifact_timeout_ms, max_instruction_bytes,
      session_id, session_store, sub_agents, callbacks, callback_config,
      callback_pid, max_tool_rounds, app_name, user_id, artifact_svc,
-     artifact_service, agent_turn_timeout, '$adk_invocation_context_api',
+     artifact_service, agent_turn_timeout, max_concurrent_invocations,
+     '$adk_invocation_context_api',
      '$adk_inherited_global_instruction'].
 
 generation_config_keys() ->

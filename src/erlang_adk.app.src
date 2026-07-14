@@ -1,7 +1,7 @@
 {application, erlang_adk, [
     {description, "An OTP-native Agent Development Kit for Erlang."},
     {tags, ["agents", "adk", "otp", "llm", "erlang"]},
-    {vsn, "0.3.0"},
+    {vsn, "0.4.0"},
     {registered, []},
     {mod, {erlang_adk_app, []}},
     {applications, [
@@ -25,6 +25,7 @@
         {dev_sse_max_bytes, 1048576},
         {dev_sse_max_duration_ms, 300000},
         {agent_turn_timeout, 60000},
+        {max_concurrent_invocations, 32},
         {agent_config_retention_ms, 60000},
         {callback_timeout_ms, 5000},
         {callback_max_heap_words, 262144},

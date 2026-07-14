@@ -16,6 +16,7 @@ runner_tool_execution_test_() ->
       fun test_runner_executes_tools_recursively/0,
       fun test_runner_callback_lifecycle/0,
       fun test_runner_sub_agent_callback_lifecycle/0,
+      fun test_runner_sub_agent_history_is_invocation_scoped/0,
       fun test_tool_execution_options_are_validated/0,
       fun test_serial_is_default_for_parallel_safe_tools/0,
       fun test_parallel_runner_is_bounded_and_commits_in_order/0,
@@ -143,6 +144,60 @@ test_runner_sub_agent_callback_lifecycle() ->
         persistent_term:erase({adk_callback_lifecycle_test, target}),
         _ = erlang_adk_session:delete_session(?APP, ?USER, SessionId)
     end.
+
+test_runner_sub_agent_history_is_invocation_scoped() ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    ChildName = <<"RunnerIsolationChild_", Suffix/binary>>,
+    MasterName = <<"RunnerIsolationMaster_", Suffix/binary>>,
+    SessionA = <<"runner-isolation-a-", Suffix/binary>>,
+    SessionB = <<"runner-isolation-b-", Suffix/binary>>,
+    UserA = <<"runner-isolation-user-a">>,
+    UserB = <<"runner-isolation-user-b">>,
+    SecretA = <<"session-a-secret">>,
+    MessageB = <<"session-b-request">>,
+    {ok, ChildPid} = erlang_adk:spawn_agent(
+                       ChildName,
+                       #{provider => adk_llm_probe,
+                         test_pid => self(),
+                         response => <<"child-result">>}, []),
+    {ok, MasterPid} = erlang_adk:spawn_agent(
+                        MasterName,
+                        #{provider => adk_llm_probe,
+                          mode => sub_agent_echo_call,
+                          call_name => ChildName,
+                          sub_agents => #{ChildName => ChildPid}}, []),
+    Runner = adk_runner:new(MasterPid, ?APP, erlang_adk_session,
+                            #{run_timeout => 2000}),
+    try
+        ?assertEqual(
+           {ok, <<"delegation complete">>},
+           adk_runner:run(Runner, UserA, SessionA, SecretA)),
+        FirstHistory = receive_probe_history(),
+        ?assert(lists:member(SecretA, history_contents(FirstHistory))),
+
+        ?assertEqual(
+           {ok, <<"delegation complete">>},
+           adk_runner:run(Runner, UserB, SessionB, MessageB)),
+        SecondHistory = receive_probe_history(),
+        ?assert(lists:member(MessageB, history_contents(SecondHistory))),
+        ?assertNot(lists:member(SecretA, history_contents(SecondHistory)))
+    after
+        _ = catch erlang_adk:stop_agent(MasterPid),
+        _ = catch erlang_adk:stop_agent(ChildPid),
+        _ = erlang_adk_session:delete_session(?APP, UserA, SessionA),
+        _ = erlang_adk_session:delete_session(?APP, UserB, SessionB)
+    end.
+
+receive_probe_history() ->
+    receive
+        {probe_generate, History, _Tools} -> History
+    after 1000 ->
+        ?assert(false)
+    end.
+
+history_contents(History) ->
+    [Content || #{content := Content} <- History].
 
 receive_callback_events(0, Acc) -> Acc;
 receive_callback_events(Remaining, Acc) ->

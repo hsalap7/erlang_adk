@@ -525,7 +525,7 @@ temp_path(Prefix) ->
 unique_binary(Prefix) ->
     Suffix = integer_to_binary(
                erlang:unique_integer([positive, monotonic])),
-    <<Prefix/binary, "-", Suffix/binary>>.
+    <<Prefix/binary, "_", Suffix/binary>>.
 
 restore_env(Name, false) ->
     true = os:unsetenv(Name);

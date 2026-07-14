@@ -1,35 +1,41 @@
-# Erlang ADK v0.3.0 (development)
+# Erlang ADK v0.4.0 (development)
 
 Erlang ADK is an experimental, Erlang-native toolkit for building Gemini-backed agents with OTP processes, supervision, tools, sessions, event streams, and concurrent multi-agent workflows.
 
-Version 0.3.0 is under active development on the `version_0.3.0` branch. The
-[v0.3.0 development contract](docs/VERSION_0_3_0.md) tracks the required core
-capabilities and their verification gates. The core checklist, deterministic
-test gate, and CLI packaging checks are complete: 573 EUnit tests, four Common
-Test scenarios, and Dialyzer over 131 project files passed on 2026-07-13, as
-did `escriptize`, `adk doctor`, and checked configuration validation. The
-billable live Gemini suite remains a separate opt-in provider gate in a shell
-that owns `GEMINI_API_KEY`.
+Version 0.4.0 is under active development on the `version_0.4.0` branch. The
+[v0.4.0 development contract](docs/VERSION_0_4_0.md) tracks its focus on
+agent, tool, and workflow behavior and the verification gates required before
+those capabilities are claimed complete. It builds on the completed 0.3.0
+runtime and developer-tooling foundation. The billable live Gemini suite
+remains a separate opt-in provider gate in a shell that owns
+`GEMINI_API_KEY`.
 
 The detailed [ADK behavior-parity matrix](docs/FEATURE_PARITY.md) maps the
 official ADK capability families to their Erlang/OTP-native implementation
 contracts and current branch status.
 
-The project follows the behavior of Google ADK where that behavior maps cleanly to Erlang. It is not a drop-in port and does not claim complete Google ADK feature parity. In particular, one agent is one `gen_server` for serial admission and state commits, while each accepted direct turn runs provider/tool work in a supervised lightweight process outside that mailbox. Independent agents and orchestration branches therefore run concurrently without making one stateful conversation nondeterministic.
+The project follows the behavior of Google ADK where that behavior maps
+cleanly to Erlang. It is not a drop-in port and does not claim complete Google
+ADK feature parity. One agent is one `gen_server` admission point and one
+immutable runtime specification. Legacy `prompt`/`delegate` turns share a
+stateful FIFO; Runner and explicit invocation turns use bounded, fair,
+session-scoped lanes whose provider/tool work runs in supervised lightweight
+processes. Independent sessions, agents, and workflow branches therefore use
+BEAM concurrency without making one conversation nondeterministic.
 
 ## Current scope
 
-| Area | Status on the v0.3.0 branch |
+| Area | Status on the v0.4.0 branch |
 | --- | --- |
 | Gemini text, versioned multimodal content, function calling, Google Search grounding, thinking levels/summaries, adjustable safety settings, thought signatures, call IDs, SSE text/content streaming, structured-output settings, and provider capability discovery | Implemented on this branch; the bidirectional Gemini Live WebSocket API is not implemented |
-| Erlang tools and agents exposed as model tools | Implemented |
-| Supervised sequential, bounded parallel, loop, transfer, and graph workflows with deadlines, budgets, cancellation, checkpoints, and resume | Implemented on this branch; legacy orchestration helpers remain supported |
+| Erlang tools and agents exposed as model tools | Compiled schemas, strict arguments, collision checks, isolated AgentTool calls, and Runner boolean confirmation are implemented; direct/workflow confirmation fails closed because those surfaces have no approval continuation |
+| Supervised sequential, bounded parallel, loop, transfer, and graph workflows with deadlines, budgets, cancellation, checkpoints, and resume | Output propagation, explicit stop, schemas, action retry/timeout, graph/fork/sequential nested resume, and legacy helpers are implemented; nested pauses in top-level parallel branches, loop bodies, and transfer members are not resumable |
 | Provider-neutral explicit planning and Gemini model-native thinking | Versioned JSON-safe plans, trusted planner/executor adapters, bounded replanning, monitored callbacks, owner-bound cancellation, and Gemini thinking levels/summaries are implemented; model-generated source is never executed |
 | ETS/Mnesia sessions with scoped state, HMAC snapshot pagination, filters, and non-destructive branch/rewind | The v0.3.0 core is implemented and release-gated; schema-migration and configurable conflict-policy adapters are not claimed |
-| Versioned JSON-safe events and human approval pause/resume | Implemented |
+| Versioned JSON-safe events and human approval pause/resume | Durable single-use Runner/stable-run boolean approve/reject plus long-running/credential pauses are implemented; structured argument modification is not |
 | Supervised stable runs with status, await, credit/ack subscribe/replay, cancellation, and retention | Implemented and release-gated on this branch |
 | Ambient/background invocation | Supervised local/event and fixed-delay schedule triggers use bounded concurrency, bounded queues, idempotency, deadlines, retry, stable status/await/cancel, and explicit per-event/shared/session-supplied policies; Pub/Sub/Eventarc remain application adapters |
-| Bounded supervised tasks and serial/parallel-safe tool execution | Implemented for Erlang modules plus dynamically resolved OpenAPI/MCP toolsets in direct agents and Runner |
+| Bounded supervised tasks and serial/parallel-safe tool execution | Implemented for compiled Erlang/OpenAPI/MCP catalogs in direct agents and Runner; descriptors are immutable snapshots and running agents do not support live catalog swap |
 | Admission control and runtime policy | Supervised global/per-agent limits, monitored reject/bounded-FIFO queue policies, fail-closed agent/tool allow-deny rules, byte budgets, and immutable denial audit events are implemented on this branch |
 | Agent/model/tool callbacks and Runner-global plugins | Ordered Runner plugins, bounded failure policy, intervention, and existing local callbacks are implemented on this branch; see lifecycle notes below |
 | Observability | Correlated invocation/model/tool telemetry, JSON-safe envelopes, bounded exporters, and opt-in content capture are implemented on this branch |
@@ -43,14 +49,14 @@ The project follows the behavior of Google ADK where that behavior maps cleanly 
 
 ## Installation
 
-While 0.3.0 is being developed, depend on this branch (or use a local path in
+While 0.4.0 is being developed, depend on this branch (or use a local path in
 the same way):
 
 ```erlang
 {deps, [
     {erlang_adk,
      {git, "https://github.com/hsalap7/erlang_adk.git",
-      {branch, "version_0.3.0"}}}
+      {branch, "version_0.4.0"}}}
 ]}.
 ```
 
@@ -341,7 +347,7 @@ the root of a new tree. Resolution remains bounded and secret-scrubbed; agent
 configuration is never mutated.
 
 Google's Python ADK currently marks its direct `global_instruction` field as
-deprecated in favor of `GlobalInstructionPlugin`. Erlang ADK 0.3.0 keeps the
+deprecated in favor of `GlobalInstructionPlugin`. Erlang ADK 0.4.0 keeps the
 explicit root field while providing the same tree-wide behavior through
 message-passed invocation context; an app-level instruction plugin can be
 added later without changing this contract.
@@ -378,6 +384,25 @@ execute(#{<<"city">> := City}, Context) ->
 ```
 
 For agent-driven calls, `Context` contains `app_name`, `session_id`, `user_id`, `invocation_id`, `call_id`, and `state_ref` when available. Tool exceptions and `{error, Reason}` results are returned to the model as failed function responses instead of terminating the agent.
+
+Before the provider sees a catalog, Erlang ADK loads every module/toolset
+schema, normalizes and compiles its supported JSON Schema, and rejects invalid
+schemas or duplicate names across Erlang tools, dynamic toolsets, and
+sub-agents. The whole provider call batch is structurally validated before it
+is persisted. Each call's arguments are then checked against the compiled
+schema before runtime policy, confirmation, callbacks, credentials, or side
+effects. Invalid values are never reflected in the model-visible structural
+error.
+
+An `adk_toolset` descriptor is an immutable catalog snapshot. `schemas/1` and
+resolution reuse its compiled contracts; `refresh/1` deliberately returns a
+replacement descriptor for a mutable MCP/OpenAPI backend. A running agent has
+no live catalog-swap API in 0.4.0, so new remote tools require a refreshed
+descriptor and replacement agent. A removed or changed operation fails closed
+as `tool_catalog_changed` instead of executing against a stale declaration.
+Trusted local Erlang tool contexts carry private bounded agent ancestry so an
+AgentTool wrapper cannot reset cycle protection; that metadata is not sent to
+remote toolsets or model providers.
 
 ### External-sandbox code execution
 
@@ -565,7 +590,27 @@ ok = erlang_adk:stop_agent(CoordinatorPid),
 ok = erlang_adk:stop_agent(SearchPid).
 ```
 
-The coordinator resolves a restarted sub-agent by its registered binary name, so a stale child PID does not have to crash the parent agent.
+The coordinator resolves a restarted sub-agent by its registered binary name,
+so a stale child PID does not have to crash the parent agent. Agent names use
+the portable `[A-Za-z_][A-Za-z0-9_]*` grammar; `user` is reserved. Spawn-time
+tree validation rejects alias/name mismatches, duplicate ownership,
+self-reference, cycles, more than 256 agents, depth above 64, and an
+unresponsive tree after one two-second deadline. Invocation-time ancestry
+tracking independently rejects a repeated agent or depth above 64 before its
+provider runs, including dynamically resolved replacements.
+
+`prompt/2` and asynchronous `delegate` retain the compatibility conversation
+and execute in one FIFO. `erlang_adk:invoke/3`, AgentTool, and Runner use fresh
+invocation history. The same `{app_name,user_id,session_id}` lane remains FIFO;
+different lanes may overlap up to `max_concurrent_invocations` (32 by default)
+with fair admission. A child owns its provider, model, local instructions, and
+tool catalog. Only the root global instruction and explicitly scoped safe
+context cross a delegation boundary—never compatibility memory or provider
+credentials. The safe scope includes the caller's state snapshot and opaque
+session-service module (`state_ref`) so an `output_key` commits to the exact
+invocation session rather than the reusable agent's configured default;
+AgentTool may additionally carry the explicitly configured memory-service
+reference.
 
 ## Supervised declarative workflows
 
@@ -584,17 +629,24 @@ durable storage; stable atom reasons remain compatible.
 Sequential and bounded-parallel workflows use the same compiled public API:
 
 ```erlang
-AddOne = fun(State) ->
-    {ok, #{<<"count">> => maps:get(<<"count">>, State, 0) + 1}}
+AddOne = fun(State, Context) ->
+    null = maps:get(input, Context),
+    {output, <<"counted">>,
+     #{<<"count">> => maps:get(<<"count">>, State, 0) + 1}}
 end,
-MarkDone = fun(_State) ->
-    {complete, <<"ready">>, #{<<"done">> => true}}
+MarkDone = fun(_State, Context) ->
+    <<"counted">> = maps:get(input, Context),
+    {output, <<"ready">>, #{<<"done">> => true}}
 end,
 SequentialSpec = #{
     version => 1,
     id => <<"readme-sequential-v1">>,
     kind => sequential,
     max_steps => 4,
+    input_schema =>
+        #{<<"type">> => <<"object">>,
+          <<"required">> => [<<"count">>]},
+    output_schema => #{<<"type">> => <<"string">>},
     steps => [
         #{id => <<"increment">>, run => AddOne},
         #{id => <<"finish">>, run => MarkDone}
@@ -606,6 +658,7 @@ SequentialSpec = #{
 1 = maps:get(<<"count">>, SequentialState),
 true = maps:get(<<"done">>, SequentialState),
 true = maps:get(<<"completed">>, SequentialCheckpoint),
+<<"ready">> = maps:get(<<"output">>, SequentialCheckpoint),
 
 ParallelSpec = #{
     version => 1,
@@ -615,16 +668,50 @@ ParallelSpec = #{
     merge => reject_conflicts,
     branches => [
         #{id => <<"left">>,
-          run => fun(_State) -> {ok, #{<<"left">> => 1}} end},
+          run => fun(_State) ->
+              {output, <<"left-output">>, #{<<"left">> => 1}}
+          end},
         #{id => <<"right">>,
-          run => fun(_State) -> {ok, #{<<"right">> => 2}} end}
+          run => fun(_State) ->
+              {output, <<"right-output">>, #{<<"right">> => 2}}
+          end}
     ]
 },
 {ok, Parallel} = erlang_adk:compile_workflow(ParallelSpec),
-{completed, ParallelState, _ParallelCheckpoint} =
+{completed, ParallelState, ParallelCheckpoint} =
     erlang_adk:run_workflow(Parallel, #{}),
 1 = maps:get(<<"left">>, ParallelState),
-2 = maps:get(<<"right">>, ParallelState).
+2 = maps:get(<<"right">>, ParallelState),
+#{<<"left">> := <<"left-output">>,
+  <<"right">> := <<"right-output">>} =
+    maps:get(<<"output">>, ParallelCheckpoint),
+
+RetryTable = ets:new(readme_workflow_retry, [set, public]),
+ets:insert(RetryTable, {attempts, 0}),
+RetryAction = fun(_State, Context) ->
+    Attempt = ets:update_counter(RetryTable, attempts, 1),
+    Attempt = maps:get(attempt, Context),
+    case Attempt of
+        1 -> {error, transient_failure};
+        2 -> {output, <<"recovered">>, #{<<"retried">> => true}}
+    end
+end,
+RetrySpec = #{
+    version => 1,
+    id => <<"readme-workflow-retry-v1">>,
+    kind => sequential,
+    max_steps => 1,
+    steps => [
+        #{id => <<"retryable">>, run => RetryAction,
+          timeout => 1000,
+          retry => #{max_attempts => 2, backoff_ms => 10}}
+    ]
+},
+{ok, Retrying} = erlang_adk:compile_workflow(RetrySpec),
+{completed, #{<<"retried">> := true}, RetryCheckpoint} =
+    erlang_adk:run_workflow(Retrying, #{}),
+<<"recovered">> = maps:get(<<"output">>, RetryCheckpoint),
+true = ets:delete(RetryTable).
 ```
 
 Parallel branches receive the same immutable input state. The default
@@ -642,14 +729,15 @@ LoopSpec = #{
     kind => loop,
     max_iterations => 3,
     body => fun(State) ->
-        {ok, #{<<"attempt">> =>
-                   maps:get(<<"attempt">>, State, 0) + 1}}
+        Attempt = maps:get(<<"attempt">>, State, 0) + 1,
+        {output, Attempt, #{<<"attempt">> => Attempt}}
     end,
     until => fun(State) -> maps:get(<<"attempt">>, State) >= 2 end
 },
 {ok, Loop} = erlang_adk:compile_workflow(LoopSpec),
-{completed, #{<<"attempt">> := 2}, _} =
+{completed, #{<<"attempt">> := 2}, LoopCheckpoint} =
     erlang_adk:run_workflow(Loop, #{}),
+2 = maps:get(<<"output">>, LoopCheckpoint),
 
 TransferSpec = #{
     version => 1,
@@ -665,7 +753,7 @@ TransferSpec = #{
         <<"specialist">> => #{run => fun(State, Context) ->
             true = maps:get(<<"triaged">>, State),
             <<"handoff">> = maps:get(input, Context),
-            {complete, <<"resolved">>,
+            {stop, <<"resolved">>,
              #{<<"resolved">> => true}}
         end}
     }
@@ -681,18 +769,21 @@ GraphSpec = #{
     entry => <<"counter">>,
     max_steps => 5,
     nodes => [#{id => <<"counter">>, run => fun(State) ->
-        {ok, #{<<"count">> => maps:get(<<"count">>, State, 0) + 1}}
+        Count = maps:get(<<"count">>, State, 0) + 1,
+        {output, Count, #{<<"count">> => Count}}
     end}],
-    edges => #{<<"counter">> => {route, fun(State) ->
-        case maps:get(<<"count">>, State) < 3 of
+    edges => #{<<"counter">> => {route, fun(_State, Context) ->
+        Count = maps:get(input, Context),
+        case Count < 3 of
             true -> <<"counter">>;
             false -> end_node
         end
     end}}
 },
 {ok, Graph} = erlang_adk:compile_workflow(GraphSpec),
-{completed, #{<<"count">> := 3}, _} =
-    erlang_adk:run_workflow(Graph, #{}).
+{completed, #{<<"count">> := 3}, GraphCheckpoint} =
+    erlang_adk:run_workflow(Graph, #{}),
+3 = maps:get(<<"output">>, GraphCheckpoint).
 ```
 
 Graph-native fork/join executes declared branch node IDs in bounded lightweight
@@ -709,20 +800,30 @@ ForkJoinSpec = #{
           branches => [<<"left">>, <<"right">>], join => <<"join">>,
           merge => reject_conflicts, max_concurrency => 2},
         #{id => <<"left">>, run => fun(_) ->
-            {ok, #{<<"left">> => 1}}
+            {output, <<"left-output">>, #{<<"left">> => 1}}
         end},
         #{id => <<"right">>, run => fun(_) ->
-            {ok, #{<<"right">> => 2}}
+            {output, <<"right-output">>, #{<<"right">> => 2}}
         end},
-        #{id => <<"join">>, type => join}
+        #{id => <<"join">>, type => join,
+          run => fun(_State, Context) ->
+              Outputs = maps:get(input, Context),
+              <<"left-output">> = maps:get(<<"left">>, Outputs),
+              <<"right-output">> = maps:get(<<"right">>, Outputs),
+              {output, Outputs, #{<<"joined">> => true}}
+          end}
     ],
     edges => #{<<"left">> => <<"join">>,
                <<"right">> => <<"join">>,
                <<"join">> => end_node}
 },
 {ok, ForkJoin} = erlang_adk:compile_workflow(ForkJoinSpec),
-{completed, #{<<"left">> := 1, <<"right">> := 2}, _} =
+{completed, #{<<"left">> := 1, <<"right">> := 2,
+              <<"joined">> := true}, ForkCheckpoint} =
     erlang_adk:run_workflow(ForkJoin, #{}),
+#{<<"left">> := <<"left-output">>,
+  <<"right">> := <<"right-output">>} =
+    maps:get(<<"output">>, ForkCheckpoint),
 
 ApprovalSpec = #{
     version => 1, id => <<"readme-graph-approval-v1">>, kind => graph,
@@ -802,7 +903,11 @@ replication, retention, and encryption-at-rest guidance.
 descriptors. No route may introduce an MFA, source string, or undeclared node
 at runtime. Completed fork branches and completed graph nodes are checkpointed
 individually; only an in-flight action that has not reached a commit boundary
-has at-least-once replay semantics.
+has at-least-once replay semantics. In particular, if one graph-fork branch
+pauses, an in-flight sibling is cancelled and, because it has no committed
+result, runs again after resume. Concurrent side-effecting branches must use
+the invocation/step context as an external idempotency key; a fork checkpoint
+does not make arbitrary external effects transactional.
 
 A transfer is an ownership handoff, unlike a sub-agent tool call which returns
 to its caller. Every accepted handoff emits an `adk_event` action named
@@ -810,6 +915,9 @@ to its caller. Every accepted handoff emits an `adk_event` action named
 actions can use `{agent, RegisteredName, Prompt}` or
 `{agent, RegisteredName, Prompt, DecisionFun}`; the binary name is resolved at
 dispatch time so a supervised replacement is used after an agent restart.
+Before invocation, the resolved process must report the same canonical runtime
+name through `adk_agent:get_runtime/1`; a registry alias mismatch fails closed
+as `agent_identity_mismatch`.
 
 Checkpoints are committed only at deterministic boundaries and retain the
 remaining budgets. Cancellation kills active workflow workers; resuming does
@@ -851,12 +959,22 @@ SecondWorker ! continue,
     erlang_adk:await_workflow(ResumedRef).
 ```
 
-The action-result contract is `{ok, Delta}`,
-`{complete, Output, Delta}`, `{route, TargetNode, Delta}`,
-`{transfer, TargetMember, NextInput, Delta}`, or `{error, Reason}`. Graph
-actions additionally accept `{pause, Reason, Summary, Delta}`. Runtime
-options include `timeout` or an absolute monotonic `deadline`, `max_steps`,
-`max_transfers`, `max_concurrency`, and terminal `retention_ms`.
+The action-result contract is `{ok, Delta}`, normal continuation
+`{output, Output, Delta}`, explicit terminal `{stop, Output, Delta}`,
+`{route, TargetNode, Delta}`, `{transfer, TargetMember, NextInput, Delta}`, or
+`{error, Reason}`. Legacy `{complete, Output, Delta}` remains terminal for
+compatibility. Graph actions additionally accept
+`{pause, Reason, Summary, Delta}`. A normal output is checkpointed and becomes
+the next sequential step, graph successor, or join node's `Context.input`;
+parallel/fork outputs are maps keyed by declared branch ID. Workflow-level
+`input_schema` and `output_schema` are compiled once. Individual action maps
+accept `timeout` and `retry => #{max_attempts, backoff_ms}`; each attempt runs
+in a monitored lightweight process under the workflow's absolute deadline.
+Retry counts cover one live execution of an uncommitted node and reset if that
+node is later reconstructed from a checkpoint, so external effects still need
+the documented idempotency key. Runtime options include `timeout` or an
+absolute monotonic `deadline`, `max_steps`, `max_transfers`,
+`max_concurrency`, and terminal `retention_ms`.
 
 ## Explicit planning and replanning
 
@@ -1224,9 +1342,62 @@ ok = erlang_adk:stop_agent(RunnerAgentPid).
 
 ## Human approval pause/resume
 
-Add `adk_long_running_tool` to let the model request approval. A pause is a distinct terminal result, not an error. Resume records a matching function response with the original invocation ID, thought signature, and Gemini function-call ID:
+A side-effecting `adk_tool` can export `require_confirmation/0` for a static
+gate or `require_confirmation/2` for an argument-dependent gate. The latter
+takes precedence and returns `false`, `true`, or a bounded map such as
+`#{required => true, hint => <<"Publish production">>}`. Runner evaluates it
+after schema validation and runtime policy, but before tool/plugin lifecycle
+callbacks or execution. A dynamic toolset is materialized after policy so its
+validated resolved call can declare confirmation; that resolver may obtain a
+scoped credential but must not perform the business side effect. A
+confirmation is a serial barrier even when neighboring calls are
+parallel-safe.
+
+The repository's release example requires confirmation for a real publication
+but lets `dry_run => true` proceed. Use the supervised run API so the approval
+survives the original caller:
 
 ```erlang
+{ok, readme_release_tool} = c("examples/readme_release_tool.erl"),
+ReleaseConfig = #{
+    provider => adk_llm_gemini,
+    model => <<"gemini-3.1-flash-lite">>,
+    instructions =>
+        <<"Call publish_release once for production with dry_run=false. "
+          "After its result, answer without calling it again.">>
+},
+{ok, ReleasePid} = erlang_adk:spawn_agent(
+    <<"ReleaseAgent">>, ReleaseConfig, [readme_release_tool]),
+ReleaseRunner = adk_runner:new(
+    ReleasePid, <<"readme_app">>, erlang_adk_session),
+{ok, ReleaseRun} = adk_run:start(
+    ReleaseRunner, <<"user-1">>, <<"release-session">>,
+    <<"Publish the prepared production release.">>),
+case adk_run:await(ReleaseRun, 120000) of
+    {paused, ConfirmationPause} ->
+        ConfirmationMap = adk_event:to_map(ConfirmationPause),
+        #{<<"pause">> :=
+              #{<<"details">> :=
+                    #{<<"type">> := <<"tool_confirmation">>,
+                      <<"action_id">> := _OpaqueActionId}}} =
+            maps:get(<<"actions">>, ConfirmationMap),
+        {ok, ApprovedReleaseRun} = adk_run:resume(
+            ReleaseRun, #{<<"confirmed">> => true}),
+        case adk_run:await(ApprovedReleaseRun, 120000) of
+            {completed, ReleaseAnswer} ->
+                io:format("~ts~n", [ReleaseAnswer]);
+            {paused, NextPause} ->
+                io:format("tool requested another pause: ~p~n",
+                          [adk_event:to_map(NextPause)])
+        end;
+    {completed, ReleaseAnswer} ->
+        io:format("model completed without using the tool: ~ts~n",
+                  [ReleaseAnswer])
+end,
+ok = erlang_adk:stop_agent(ReleasePid),
+
+%% Long-running work is a separate pause type. This compatibility example
+%% lets the model request an explicit human response itself.
 ApprovalConfig = #{
     provider => adk_llm_gemini,
     instructions =>
@@ -1270,6 +1441,23 @@ case ApprovalResult of
 end,
 ok = erlang_adk:stop_agent(ApprovalPid).
 ```
+
+Resume a generic confirmation with exactly
+`#{<<"confirmed">> => true | false}`. Approval re-resolves the tool and
+rechecks current policy before executing exactly once. Rejection executes no
+tool or tool callback; it records a correlated model-visible rejection and
+continues the invocation. An invalid response does not consume the
+continuation, while a valid continuation is single-use. The opaque action ID
+is a digest and contains no raw arguments. Non-Runner agent execution
+(`prompt/2`, fresh `invoke/3`, delegation, and AgentTool-backed child calls)
+and typed workflow tool actions have no durable approval channel, so a required
+confirmation fails closed as `tool_confirmation_requires_runner`; they never
+silently execute. Structured “modify arguments” confirmation responses are
+not supported in 0.4.0.
+
+`adk_long_running_tool` uses the distinct long-running suspension contract. A
+pause is not an error; resume records a matching function response with the
+original invocation ID, thought signature, and Gemini function-call ID.
 
 Use `resume/5` with the public continuation/invocation ID whenever concurrent
 invocations can share a session. `resume/4` is a compatibility convenience and
@@ -1581,7 +1769,7 @@ ok = adk_llm_gemini:stream_content(
 does not append a second buffered final content value. Gemini Live's
 bidirectional WebSocket lifecycle (audio/video input, interruption, session
 resumption, and backpressure) is a separate protocol and is explicitly
-unsupported in v0.3.0 rather than being simulated through REST SSE.
+unsupported in v0.4.0 rather than being simulated through REST SSE.
 
 To put that structured stream through sessions, plugins, stable run replay,
 and cancellation, select content streaming on the Runner:
@@ -1749,13 +1937,23 @@ This server returns JSON for POST and intentionally returns HTTP 405 for the
 optional unsolicited GET/SSE channel. The client accepts JSON and bounded SSE
 responses to POST. SSE resumability, resource subscriptions/templates,
 notifications, roots, sampling, elicitation, completion, MCP OAuth discovery,
-and a server-side stdio transport are explicit 0.3.0 limitations. Endpoint
+and a server-side stdio transport are explicit 0.4.0 limitations. Endpoint
 URLs containing user info, query strings, or fragments are rejected so bearer
 credentials cannot accidentally become request URLs. Deprecated
 HTTP+SSE (`<<"sse">>`) fails with
 `{error, {unsupported_transport, sse_deprecated_use_streamable_http}}`.
 The client and server also accept the finalized 2025-06-18 revision during
 version negotiation, while initiating new connections with 2025-11-25.
+If Streamable HTTP reports a lost/expired session, the client reinitializes
+and automatically retries only read-only protocol operations (`tools/list`,
+`resources/list`, `resources/read`, `prompts/list`, `prompts/get`, and
+`ping`). It never automatically replays `tools/call` or an unknown/mutating
+method whose first attempt may already have caused an effect; that call returns
+`{error, {mcp_session_lost, request_not_replayed}}`, and a later explicit
+application call uses the renewed session. Per-client HTTP request
+serialization and a separately bounded pending-request queue remain 0.4.0
+limitations; use independent supervised MCP clients for concurrency and
+failure isolation.
 
 ## Runner plugins and observability
 
@@ -2313,7 +2511,7 @@ _build/default/bin/adk session state adk-cli local scratch \
   --delta-json '{"developer:mode":"trace"}'
 _build/default/bin/adk session delete adk-cli local scratch
 _build/default/bin/adk resume RUN_ID \
-  --response-json '{"approved":true}'
+  --response-json '{"confirmed":true}'
 ```
 
 Plain HTTP inspection is restricted to loopback; remote URLs must use HTTPS.
@@ -2328,6 +2526,13 @@ still-running developer server (for example through `/dev`); for `resume` it
 must be the ID of the paused parent run. The ID printed by the one-shot `adk
 run` command is informational after that command exits—the ephemeral CLI VM is
 gone, so a later process cannot inspect or resume that in-memory run.
+
+The resume payload above is the exact contract for a pause whose details type
+is `tool_confirmation`; use `{"confirmed":false}` to reject it. The developer
+UI detects that type and fills the matching payload automatically. Other pause
+types, including application-defined long-running work and credential flows,
+retain their own validated response shape—inspect the pause details rather
+than sending `confirmed` indiscriminately.
 
 `developer_api_unavailable` with `connection_refused` means no process is
 listening at the selected URL; it is not an authentication or Gemini error.
@@ -2597,14 +2802,9 @@ defmodule MyAppWeb.AgentLive do
 
   def handle_event("approve", %{"decision" => decision},
                    %{assigns: %{run_id: paused_run_id}} = socket) do
-    tool_response =
-      case decision do
-        "approve" ->
-          %{"approved" => true, "approver" => socket.assigns.user_id}
-
-        "reject" ->
-          %{"approved" => false, "approver" => socket.assigns.user_id}
-      end
+    confirmed = decision == "approve"
+    tool_response = resume_payload(
+      socket.assigns.events, confirmed, socket.assigns.user_id)
 
     {:ok, resumed_run_id} = :adk_run.resume(paused_run_id, tool_response)
     {:ok, _subscription} =
@@ -2617,6 +2817,22 @@ defmodule MyAppWeb.AgentLive do
        events: [],
        outcome: nil
      )}
+  end
+
+  defp resume_payload(events, confirmed, user_id) do
+    pause_type =
+      Enum.find_value(Enum.reverse(events), fn
+        %{event: %{"actions" => %{"pause" =>
+          %{"details" => %{"type" => type}}}}} -> type
+        _ -> nil
+      end)
+
+    case pause_type do
+      "tool_confirmation" -> %{"confirmed" => confirmed}
+      nil -> %{"approved" => confirmed, "approver" => user_id}
+      unsupported -> raise ArgumentError,
+        "unsupported pause type: #{inspect(unsupported)}"
+    end
   end
 
   defp stop_subscription(socket, reason) do
@@ -2645,7 +2861,10 @@ the client must reload a session/status snapshot rather than pretend a partial
 replay is complete. Render event maps, not Erlang records, at the web boundary,
 and keep both rendered assigns and any browser DOM history bounded. Derive
 `user_id` and authorization from the authenticated Phoenix session rather than
-request parameters.
+request parameters. The example distinguishes the built-in
+`tool_confirmation` response from the legacy application-defined approval
+shape; add an explicit branch for every other pause type your UI supports and
+fail closed for unknown types in production.
 
 For local username/password accounts, Phoenix's generated auth flow is the
 maintained starting point. For enterprise identity, the selected design is
@@ -2700,15 +2919,14 @@ access, quota, and billable API calls.
 Some scenarios require multiple model turns, so the complete live suite makes
 roughly 31 Gemini requests, including Search grounding plus one-shot and SSE
 multimodal requests. By default, its test-only provider wrapper spaces request
-starts by 4.2 seconds,
-caps each transport wait at 15 seconds, and retries one non-streaming transport
-timeout. The suite raises its agent call and direct-turn worker timeouts to 120
-seconds; both production defaults remain 60 seconds. HTTP 429 responses are returned promptly
-rather than sleeping inside an agent and risking a caller timeout. The pacing
-accommodates a 15-requests-per-minute project limit without changing production
-request scheduling or the Erlang concurrency model. API limits are
-project-specific; accounts with a higher limit can shorten or disable the test
-pacing, for example:
+starts by 4.2 seconds, caps each transport wait at 15 seconds, and retries one
+non-streaming transport timeout. A non-streaming HTTP 429 receives one bounded
+retry after a test-only backoff of at least 10 seconds; a second 429 fails the
+case explicitly. The suite raises its agent call and direct-turn worker
+timeouts to 120 seconds; both production defaults remain 60 seconds. This
+pacing and retry policy do not change production request scheduling or the
+Erlang concurrency model. API limits are project-specific; accounts with a
+higher limit can shorten or disable the test pacing, for example:
 
 ```bash
 ERLANG_ADK_LIVE_GEMINI=1 \

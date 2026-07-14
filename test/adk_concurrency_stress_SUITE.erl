@@ -19,7 +19,7 @@ init_per_suite(Config) ->
     ok = erlang_adk_session:init(),
     Prefix = integer_to_binary(erlang:unique_integer([positive, monotonic])),
     Agents = [begin
-                  Name = <<"StressAgent-", Prefix/binary, "-",
+                  Name = <<"StressAgent_", Prefix/binary, "_",
                            (integer_to_binary(Index))/binary>>,
                   {ok, Pid} = erlang_adk:spawn_agent(
                                 Name,

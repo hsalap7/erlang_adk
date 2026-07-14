@@ -233,7 +233,7 @@ normalize_options(Options) ->
                         ?DEFAULT_MAX_RESPONSE_BYTES),
     ClientInfo = maps:get(client_info, Options,
                           #{<<"name">> => <<"erlang_adk">>,
-                            <<"version">> => <<"0.3.0">>}),
+                            <<"version">> => <<"0.4.0">>}),
     Capabilities = maps:get(capabilities, Options, #{}),
     Headers = maps:get(headers, Options, []),
     AuthFun = maps:get(auth_fun, Options, undefined),
@@ -630,13 +630,34 @@ http_operation(Method, Params, State0, RetrySession) ->
           when RetrySession, is_map_key(session_id, State0) ->
             case initialize_http(maps:remove(session_id,
                                              State2#{initialized => false})) of
-                {ok, State3} -> http_operation(Method, Params, State3, false);
+                {ok, State3} ->
+                    case retryable_after_session_loss(Method) of
+                        true ->
+                            http_operation(Method, Params, State3, false);
+                        false ->
+                            %% The server may have observed a mutating request
+                            %% before reporting a lost session. Replaying it
+                            %% could duplicate an external side effect. The
+                            %% new session is retained for the caller's next
+                            %% explicit operation, but this call is uncertain.
+                            {error,
+                             {mcp_session_lost, request_not_replayed},
+                             State3}
+                    end;
                 {error, Reason, State3} -> {error, Reason, State3}
             end;
         {ok, Status, _Headers, _Body, State2} ->
             {error, {http_status, Status}, State2};
         {error, Reason, State2} -> {error, Reason, State2}
     end.
+
+retryable_after_session_loss(<<"tools/list">>) -> true;
+retryable_after_session_loss(<<"resources/list">>) -> true;
+retryable_after_session_loss(<<"resources/read">>) -> true;
+retryable_after_session_loss(<<"prompts/list">>) -> true;
+retryable_after_session_loss(<<"prompts/get">>) -> true;
+retryable_after_session_loss(<<"ping">>) -> true;
+retryable_after_session_loss(_Method) -> false.
 
 http_send(Message, Kind, State) ->
     case request_headers(Kind, State) of
