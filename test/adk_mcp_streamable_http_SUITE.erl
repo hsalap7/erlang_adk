@@ -122,8 +122,11 @@ bounded_concurrency(_Config) ->
                        request_timeout => 5000, tools => [SlowTool]}),
     try
         {ok, #{url := Url}} = adk_mcp_server:endpoint(Server),
-        {ok, Client1} = adk_mcp_client:connect(<<"streamable_http">>, Url),
-        {ok, Client2} = adk_mcp_client:connect(<<"streamable_http">>, Url),
+        ClientOptions = #{allow_http_loopback => true},
+        {ok, Client1} = adk_mcp_client:connect(<<"streamable_http">>, Url,
+                                              ClientOptions),
+        {ok, Client2} = adk_mcp_client:connect(<<"streamable_http">>, Url,
+                                              ClientOptions),
         try
             Caller = self(),
             spawn(fun() ->

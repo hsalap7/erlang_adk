@@ -7,8 +7,12 @@
 client_credentials(_Provider, _ClientId, <<"leaky-client-secret">>, _Opts) ->
     {error, {token_endpoint_error,
              <<"client secret leaky-client-secret access_token=leaked">>}};
-client_credentials(_Provider, ClientId, _ClientSecret, _Opts) ->
-    {ok, #{access_token => <<"cc:", ClientId/binary>>,
+client_credentials(_Provider, ClientId, _ClientSecret, Opts) ->
+    AccessToken = case maps:get(resource, Opts, undefined) of
+        undefined -> <<"cc:", ClientId/binary>>;
+        Resource -> <<"cc:", ClientId/binary, "@", Resource/binary>>
+    end,
+    {ok, #{access_token => AccessToken,
            expires_in_ms => 60000,
            token_type => <<"Bearer">>}}.
 

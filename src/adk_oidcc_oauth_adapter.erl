@@ -61,5 +61,13 @@ normalize_token(#oidcc_token{
 normalize_token(_TokenRecord) ->
     {error, invalid_token_response}.
 
-oidcc_opts(#{scope := Scopes}) ->
-    #{scope => Scopes}.
+oidcc_opts(#{scope := Scopes} = Opts) ->
+    Base = #{scope => Scopes},
+    case maps:find(resource, Opts) of
+        {ok, Resource} ->
+            %% Oidcc exposes RFC 8707 extension parameters through the token
+            %% endpoint body_extension option.
+            Base#{body_extension => [{<<"resource">>, Resource}]};
+        error ->
+            Base
+    end.

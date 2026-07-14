@@ -9,6 +9,7 @@ openapi_toolset_test_() ->
      fun invalid_specs_and_limits_are_rejected/0,
      fun target_allowlist_and_ssrf_policy/0,
      fun bounded_transport_timeout_kills_worker/0,
+     fun bounded_worker_dies_with_request_owner/0,
      fun request_and_response_limits/0,
      fun status_redirect_and_json_handling/0].
 
@@ -132,6 +133,24 @@ auth_is_out_of_band_and_response_is_redacted() ->
 
 invalid_specs_and_limits_are_rejected() ->
     Opts = compile_opts(self()),
+    ?assertEqual(
+       {error, unsupported_openapi_version},
+       adk_openapi_toolset:compile(
+         (base_spec())#{<<"openapi">> => <<"3.1.latest">>}, Opts)),
+    ?assertEqual(
+       {error, unsupported_openapi_version},
+       adk_openapi_toolset:compile(
+         (base_spec())#{<<"openapi">> => <<"3.1.00">>}, Opts)),
+    TracePaths = maps:get(<<"paths">>, base_spec()),
+    TracePath = maps:get(<<"/pets/{petId}">>, TracePaths),
+    TraceSpec = (base_spec())#{
+      <<"paths">> => TracePaths#{
+        <<"/pets/{petId}">> => TracePath#{
+          <<"trace">> => #{<<"operationId">> => <<"tracePet">>,
+                            <<"responses">> =>
+                                success_responses(<<"200">>)}}}},
+    ?assertEqual({error, unsupported_openapi_method},
+                 adk_openapi_toolset:compile(TraceSpec, Opts)),
     MissingOperationId = update_operation(
                            base_spec(), <<"post">>,
                            fun(Operation) ->
@@ -210,6 +229,39 @@ bounded_transport_timeout_kills_worker() ->
     {Worker, Request} = receive_transport_request(),
     ?assertEqual(false, maps:get(follow_redirects, Request)),
     ?assertNot(is_process_alive(Worker)),
+    Transport ! stop.
+
+bounded_worker_dies_with_request_owner() ->
+    Parent = self(),
+    Transport = start_transport(Parent, fun(_Request) -> no_reply end),
+    {ok, Toolset} = adk_openapi_toolset:compile(
+                      base_spec(),
+                      (compile_opts(Transport))#{timeout_ms => 10000}),
+    RequestOwner = spawn(fun() ->
+        Result = adk_openapi_toolset:execute(
+                   Toolset, <<"getPet">>, #{<<"petId">> => <<"one">>}),
+        Parent ! {unexpected_openapi_owner_result, Result}
+    end),
+    OwnerMonitor = erlang:monitor(process, RequestOwner),
+    {ExecutionWorker, _Request} = receive_transport_request(),
+    WorkerMonitor = erlang:monitor(process, ExecutionWorker),
+    exit(RequestOwner, kill),
+    receive
+        {'DOWN', OwnerMonitor, process, RequestOwner, killed} -> ok
+    after 500 ->
+        error(openapi_request_owner_not_killed)
+    end,
+    receive
+        {'DOWN', WorkerMonitor, process, ExecutionWorker, killed} -> ok
+    after 500 ->
+        error(orphaned_openapi_execution_worker)
+    end,
+    receive
+        {unexpected_openapi_owner_result, Result} ->
+            error({unexpected_openapi_owner_result, Result})
+    after 0 ->
+        ok
+    end,
     Transport ! stop.
 
 request_and_response_limits() ->

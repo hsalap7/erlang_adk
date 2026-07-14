@@ -4,10 +4,25 @@
 
 -export([verify/2]).
 
-verify(Token, #{adapter_options := #{mode := throw,
-                                     secret := Secret}}) ->
-    erlang:error({fixture_verifier_failure, Token, Secret});
+verify(Token, #{adapter_options := Options}) ->
+    notify(Options, {jwt_verifier_started, self()}),
+    case maps:get(mode, Options, normal) of
+        throw -> erlang:error({fixture_verifier_failure, Token,
+                               maps:get(secret, Options, undefined)});
+        crash -> exit({fixture_verifier_crash,
+                       maps:get(secret, Options, undefined)});
+        sleep ->
+            timer:sleep(maps:get(delay_ms, Options, 1000)),
+            decode_token(Token);
+        heap -> exhaust_heap([]);
+        oversized ->
+            {ok, #{<<"padding">> => binary:copy(<<"x">>, 262144)}};
+        normal -> decode_token(Token)
+    end;
 verify(Token, _Config) ->
+    decode_token(Token).
+
+decode_token(Token) ->
     case binary:split(Token, <<".">>, [global]) of
         [_Header, Payload, _Signature] ->
             case decode_base64url(Payload) of
@@ -22,6 +37,15 @@ verify(Token, _Config) ->
             end;
         _ -> {error, invalid_token}
     end.
+
+notify(Options, Message) ->
+    case maps:get(observer, Options, undefined) of
+        Observer when is_pid(Observer) -> Observer ! Message;
+        _ -> ok
+    end.
+
+exhaust_heap(Acc) ->
+    exhaust_heap([make_ref(), make_ref(), make_ref(), make_ref() | Acc]).
 
 decode_base64url(Segment) ->
     Standard0 = binary:replace(Segment, <<"-">>, <<"+">>, [global]),

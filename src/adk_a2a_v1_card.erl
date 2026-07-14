@@ -1,7 +1,8 @@
 %% @doc Agent Card construction and selection for the A2A 1.0 JSON-RPC binding.
 -module(adk_a2a_v1_card).
 
--export([new/1, validate/1, json/1, jsonrpc_interface/1]).
+-export([new/1, validate/1, json/1, jsonrpc_interface/1,
+         required_extensions/1]).
 
 -spec new(map()) -> {ok, map()} | {error, term()}.
 new(Config) when is_map(Config) ->
@@ -16,11 +17,12 @@ new(Config) when is_map(Config) ->
           <<"protocolBinding">> => <<"JSONRPC">>,
           <<"protocolVersion">> => <<"1.0">>}
       ],
-      <<"version">> => maps:get(version, Config, <<"0.4.0">>),
+      <<"version">> => maps:get(version, Config, <<"0.6.0">>),
       <<"capabilities">> => #{
         <<"streaming">> => maps:get(streaming, Config, true),
         <<"pushNotifications">> => false,
-        <<"extendedAgentCard">> => false
+        <<"extendedAgentCard">> => false,
+        <<"extensions">> => maps:get(extensions, Config, [])
       },
       <<"defaultInputModes">> => maps:get(
                                     default_input_modes, Config,
@@ -86,6 +88,17 @@ jsonrpc_interface(#{<<"supportedInterfaces">> := Interfaces})
     end;
 jsonrpc_interface(_) ->
     {error, no_supported_a2a_1_0_jsonrpc_interface}.
+
+%% @doc Return the bounded set of extension URIs clients must acknowledge.
+-spec required_extensions(map()) -> [binary()].
+required_extensions(Card) when is_map(Card) ->
+    Capabilities = maps:get(<<"capabilities">>, Card, #{}),
+    Extensions = maps:get(<<"extensions">>, Capabilities, []),
+    [maps:get(<<"uri">>, Extension)
+     || Extension <- Extensions,
+        maps:get(<<"required">>, Extension, false) =:= true];
+required_extensions(_) ->
+    [].
 
 copy_optional([], _Config, Card) -> Card;
 copy_optional([{ConfigKey, JsonKey} | Rest], Config, Card0) ->

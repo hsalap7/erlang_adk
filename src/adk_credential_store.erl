@@ -10,7 +10,7 @@
 -type provider_id() :: binary() | atom().
 -type credential() :: adk_auth_provider:credential().
 -type error_reason() :: invalid_scope | invalid_credential | not_found |
-                        conflict | unavailable.
+                        conflict | capacity_reached | unavailable.
 
 -export_type([credential_ref/0, handle/0, principal/0, provider_id/0,
               credential/0, error_reason/0]).
@@ -47,7 +47,14 @@ new_ref() ->
     <<"cred_", Encoded/binary>>.
 
 -spec is_ref(term()) -> boolean().
-is_ref(<<"cred_", Encoded/binary>>) ->
-    byte_size(Encoded) >= 32;
+is_ref(<<"cred_", Encoded:32/binary>>) ->
+    lists:all(fun base64url_char/1, binary_to_list(Encoded));
 is_ref(_) ->
     false.
+
+base64url_char(Char) when Char >= $a, Char =< $z -> true;
+base64url_char(Char) when Char >= $A, Char =< $Z -> true;
+base64url_char(Char) when Char >= $0, Char =< $9 -> true;
+base64url_char($-) -> true;
+base64url_char($_) -> true;
+base64url_char(_) -> false.

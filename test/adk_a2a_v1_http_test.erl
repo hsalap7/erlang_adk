@@ -2,6 +2,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(LISTENER, adk_a2a_v1_http_test_listener).
+-define(EXT_LISTENER, adk_a2a_v1_extension_http_test_listener).
 
 a2a_v1_http_test_() ->
     {setup,
@@ -11,9 +12,11 @@ a2a_v1_http_test_() ->
          [?_test(well_known_and_unary_client_case(Context)),
           ?_test(stream_client_closes_on_terminal_case(Context)),
           ?_test(malformed_and_legacy_rpc_case(Context)),
+          ?_test(optional_methods_return_a2a_errors_case(Context)),
           ?_test(version_and_auth_are_enforced_case(Context)),
           ?_test(cross_principal_http_scope_case(Context)),
-          ?_test(resubscribe_replays_then_closes_case(Context))]
+          ?_test(resubscribe_replays_then_closes_case(Context)),
+          ?_test(required_extensions_are_enforced_case(Context))]
      end}.
 
 setup() ->
@@ -53,11 +56,13 @@ setup() ->
 
 cleanup(#{server := Server}) ->
     _ = catch cowboy:stop_listener(?LISTENER),
+    _ = catch cowboy:stop_listener(?EXT_LISTENER),
     _ = catch gen_server:stop(Server),
     ok.
 
 well_known_and_unary_client_case(#{base := Base}) ->
-    {ok, Card} = adk_a2a_v1_client:discover(Base),
+    {ok, Card} = adk_a2a_v1_client:discover(
+                   Base, local_client_options(#{})),
     [#{<<"protocolBinding">> := <<"JSONRPC">>,
        <<"protocolVersion">> := <<"1.0">>}] =
         maps:get(<<"supportedInterfaces">>, Card),
@@ -96,6 +101,32 @@ malformed_and_legacy_rpc_case(#{rpc_url := Url}) ->
     #{<<"error">> := #{<<"code">> := -32602}} =
         jsx:decode(KindBody, [return_maps]).
 
+optional_methods_return_a2a_errors_case(#{rpc_url := Url}) ->
+    PushMethods = [<<"CreateTaskPushNotificationConfig">>,
+                   <<"GetTaskPushNotificationConfig">>,
+                   <<"ListTaskPushNotificationConfigs">>,
+                   <<"DeleteTaskPushNotificationConfig">>],
+    lists:foreach(
+      fun(Method) ->
+          {200, Body} = raw_post(
+                          Url, jsx:encode(rpc(10, Method, #{})),
+                          alice, <<"1.0">>),
+          #{<<"error">> := #{<<"code">> := -32003}} =
+              jsx:decode(Body, [return_maps])
+      end, PushMethods),
+    {200, ExtendedBody} = raw_post(
+                            Url,
+                            jsx:encode(rpc(11, <<"GetExtendedAgentCard">>, #{})),
+                            alice, <<"1.0">>),
+    #{<<"error">> := #{<<"code">> := -32004}} =
+        jsx:decode(ExtendedBody, [return_maps]),
+    {200, CustomBody} = raw_post(
+                          Url,
+                          jsx:encode(rpc(12, <<"example.test/Custom">>, #{})),
+                          alice, <<"1.0">>),
+    #{<<"error">> := #{<<"code">> := -32601}} =
+        jsx:decode(CustomBody, [return_maps]).
+
 version_and_auth_are_enforced_case(#{rpc_url := Url}) ->
     Request = rpc(1, <<"GetTask">>, #{<<"id">> => <<"missing">>}),
     {200, VersionBody} = raw_post(Url, jsx:encode(Request), alice, undefined),
@@ -123,15 +154,67 @@ resubscribe_replays_then_closes_case(#{card := Card}) ->
     ?assertEqual(TaskId, maps:get(<<"id">>, Snapshot)),
     ?assert(lists:any(fun terminal_event/1, Events)).
 
+required_extensions_are_enforced_case(_Context) ->
+    Extension = <<"https://example.test/a2a/extensions/audit/v1">>,
+    Port = free_port(),
+    Base = <<"http://127.0.0.1:", (integer_to_binary(Port))/binary>>,
+    RpcUrl = <<Base/binary, "/a2a/v1">>,
+    {ok, Card} = adk_a2a_v1_card:new(
+                   #{url => RpcUrl,
+                     extensions => [#{<<"uri">> => Extension,
+                                      <<"required">> => true}]}),
+    Executor = fun(_Request, _Emit) -> {ok, <<"ok">>} end,
+    {ok, Server} = adk_a2a_v1_server:start_link(
+                     #{name => undefined, card => Card,
+                       executor => Executor}),
+    Handler = #{server => Server, auth => adk_a2a_v1_test_auth,
+                max_body_bytes => 65536, sse_heartbeat_ms => 1000,
+                max_extensions => 2, max_extension_header_bytes => 256},
+    Dispatch = cowboy_router:compile(
+                 [{'_', [{"/a2a/v1", adk_a2a_v1_handler,
+                          Handler#{endpoint => jsonrpc}}]}]),
+    {ok, _} = cowboy:start_clear(
+                ?EXT_LISTENER,
+                #{socket_opts => [{ip, {127, 0, 0, 1}}, {port, Port}]},
+                #{env => #{dispatch => Dispatch}}),
+    Request = jsx:encode(rpc(20, <<"GetTask">>,
+                             #{<<"id">> => <<"missing">>})),
+    try
+        {200, MissingBody} = raw_post(RpcUrl, Request, alice, <<"1.0">>),
+        #{<<"error">> := #{<<"code">> := -32008}} =
+            jsx:decode(MissingBody, [return_maps]),
+        {200, PresentBody} = raw_post_with_headers(
+                               RpcUrl, Request, alice, <<"1.0">>,
+                               [{"A2A-Extensions",
+                                 binary_to_list(Extension)}]),
+        #{<<"error">> := #{<<"code">> := -32001}} =
+            jsx:decode(PresentBody, [return_maps]),
+        Oversized = binary:copy(<<"x">>, 257),
+        {200, OversizedBody} = raw_post_with_headers(
+                                 RpcUrl, Request, alice, <<"1.0">>,
+                                 [{"A2A-Extensions",
+                                   binary_to_list(Oversized)}]),
+        #{<<"error">> := #{<<"code">> := -32008}} =
+            jsx:decode(OversizedBody, [return_maps])
+    after
+        _ = catch cowboy:stop_listener(?EXT_LISTENER),
+        _ = catch gen_server:stop(Server)
+    end.
+
 alice_options(Extra) ->
     maps:merge(#{auth_fun => fun() ->
         [{<<"authorization">>, <<"Bearer alice-secret">>}]
-    end, timeout => 3000}, Extra).
+    end, timeout => 3000, allow_http_loopback => true,
+      allow_undeclared_auth => true}, Extra).
 
 bob_options(Extra) ->
     maps:merge(#{auth_fun => fun() ->
         [{<<"authorization">>, <<"Bearer bob-secret">>}]
-    end, timeout => 3000}, Extra).
+    end, timeout => 3000, allow_http_loopback => true,
+      allow_undeclared_auth => true}, Extra).
+
+local_client_options(Extra) ->
+    maps:merge(#{timeout => 3000, allow_http_loopback => true}, Extra).
 
 message(Text) ->
     #{<<"messageId">> =>
@@ -145,14 +228,18 @@ rpc(Id, Method, Params) ->
       <<"method">> => Method, <<"params">> => Params}.
 
 raw_post(Url, Body, Principal, Version) ->
+    raw_post_with_headers(Url, Body, Principal, Version, []).
+
+raw_post_with_headers(Url, Body, Principal, Version, ExtraHeaders) ->
     Headers0 = case Principal of
         alice -> [{"Authorization", "Bearer alice-secret"}];
         bob -> [{"Authorization", "Bearer bob-secret"}];
         none -> []
     end,
     Headers = case Version of
-        undefined -> Headers0;
-        Value -> [{"A2A-Version", binary_to_list(Value)} | Headers0]
+        undefined -> ExtraHeaders ++ Headers0;
+        Value -> [{"A2A-Version", binary_to_list(Value)} |
+                  ExtraHeaders ++ Headers0]
     end,
     {ok, {{_, Status, _}, _ResponseHeaders, ResponseBody}} =
         httpc:request(

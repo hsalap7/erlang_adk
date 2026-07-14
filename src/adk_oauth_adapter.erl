@@ -8,7 +8,7 @@
     token_type => binary(),
     refresh_token => binary()
 }.
--type opts() :: #{scope := [binary()]}.
+-type opts() :: #{scope := [binary()], resource => binary()}.
 
 -export_type([provider/0, token/0, opts/0]).
 

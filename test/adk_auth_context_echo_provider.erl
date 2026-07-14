@@ -3,7 +3,9 @@
 
 -behaviour(adk_auth_provider).
 
--export([refresh/2]).
+-export([refresh/2, test_adapter/0]).
+
+test_adapter() -> true.
 
 refresh(_Credential, Context) ->
     {error, Context}.

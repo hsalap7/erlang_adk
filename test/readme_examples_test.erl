@@ -1109,7 +1109,8 @@ mcp_streamable_http_fixture() ->
         end,
         {ok, HttpMcpClient} = adk_mcp_client:connect(
                                 <<"streamable_http">>, McpUrl,
-                                #{auth_fun => AuthFun}),
+                                #{auth_fun => AuthFun,
+                                  allow_http_loopback => true}),
         try
             {ok, McpToolset} = adk_toolset:new(
                                  adk_mcp_client, HttpMcpClient),

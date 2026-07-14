@@ -22,6 +22,15 @@
 -define(DEFAULT_REQUEST_TIMEOUT, 30000).
 -define(DEFAULT_CONNECT_TIMEOUT, 10000).
 -define(DEFAULT_MAX_RESPONSE_BYTES, 4194304).
+-define(MAX_TIMEOUT, 120000).
+-define(PUBLIC_CALL_TIMEOUT, 125000).
+-define(CALL_REPLY_GRACE_MS, 1000).
+-define(MAX_HEADER_BYTES, 8192).
+-define(DEFAULT_CALLBACK_MAX_HEAP_WORDS, 262144).
+-define(MIN_CALLBACK_MAX_HEAP_WORDS, 1024).
+-define(MAX_CALLBACK_MAX_HEAP_WORDS, 4194304).
+-define(DEFAULT_MAX_RESOLVED_ADDRESSES, 64).
+-define(MAX_RESOLVED_ADDRESSES, 256).
 
 -type options() :: map().
 
@@ -40,7 +49,8 @@ connect(Transport, Target, Options)
                 ok -> case start_client(Init) of
                 {ok, Client} ->
                     Timeout = maps:get(initialize_timeout, Config),
-                    Result = safe_call(Client, initialize, Timeout,
+                    Result = safe_call(Client, initialize,
+                                       Timeout + ?CALL_REPLY_GRACE_MS,
                                        initialize),
                     case Result of
                         ok -> {ok, Client};
@@ -166,7 +176,7 @@ call(Client, Request) ->
     %% Transport workers enforce their configured request timeout and issue
     %% MCP cancellation for timed-out stdio requests. Avoid a second,
     %% inconsistent caller-side deadline here.
-    case safe_call(Client, Request, infinity, request) of
+    case safe_call(Client, Request, ?PUBLIC_CALL_TIMEOUT, request) of
         {error, {request_failed, {timeout, _}}} -> {error, timeout};
         Result -> Result
     end.
@@ -233,11 +243,21 @@ normalize_options(Options) ->
                         ?DEFAULT_MAX_RESPONSE_BYTES),
     ClientInfo = maps:get(client_info, Options,
                           #{<<"name">> => <<"erlang_adk">>,
-                            <<"version">> => <<"0.4.0">>}),
+                            <<"version">> => application_version()}),
     Capabilities = maps:get(capabilities, Options, #{}),
     Headers = maps:get(headers, Options, []),
     AuthFun = maps:get(auth_fun, Options, undefined),
     TlsOpts = maps:get(tls_opts, Options, default),
+    AllowHttpLoopback = maps:get(allow_http_loopback, Options, false),
+    AllowedHosts0 = maps:get(allowed_hosts, Options, any),
+    AllowedPrivate0 = maps:get(allowed_private_hosts, Options, []),
+    ResolverFun = maps:get(resolver_fun, Options, undefined),
+    CallbackMaxHeapWords = maps:get(
+                             callback_max_heap_words, Options,
+                             ?DEFAULT_CALLBACK_MAX_HEAP_WORDS),
+    MaxResolvedAddresses = maps:get(
+                             max_resolved_addresses, Options,
+                             ?DEFAULT_MAX_RESOLVED_ADDRESSES),
     case valid_timeout(InitializeTimeout) andalso
          valid_timeout(RequestTimeout) andalso
          valid_timeout(ConnectTimeout) andalso
@@ -245,7 +265,16 @@ normalize_options(Options) ->
          is_map(ClientInfo) andalso is_map(Capabilities) andalso
          valid_static_headers(Headers) andalso
          valid_auth_fun(AuthFun) andalso
-         (TlsOpts =:= default orelse is_list(TlsOpts)) of
+         valid_tls_opts(TlsOpts) andalso
+         is_boolean(AllowHttpLoopback) andalso
+         valid_host_policy(AllowedHosts0) andalso
+         valid_host_list(AllowedPrivate0) andalso
+         (ResolverFun =:= undefined orelse is_function(ResolverFun, 1)) andalso
+         bounded_range(CallbackMaxHeapWords,
+                       ?MIN_CALLBACK_MAX_HEAP_WORDS,
+                       ?MAX_CALLBACK_MAX_HEAP_WORDS) andalso
+         bounded_positive(MaxResolvedAddresses,
+                          ?MAX_RESOLVED_ADDRESSES) of
         true ->
             {ok, #{initialize_timeout => InitializeTimeout,
                    request_timeout => RequestTimeout,
@@ -256,11 +285,41 @@ normalize_options(Options) ->
                    headers => Headers,
                    auth_fun => AuthFun,
                    tls_opts => TlsOpts,
+                   allow_http_loopback => AllowHttpLoopback,
+                   allowed_hosts => normalize_host_policy(AllowedHosts0),
+                   allowed_private_hosts => normalize_hosts(AllowedPrivate0),
+                   resolver_fun => ResolverFun,
+                   callback_max_heap_words => CallbackMaxHeapWords,
+                   max_resolved_addresses => MaxResolvedAddresses,
                    protocol_versions => ?SUPPORTED_PROTOCOL_VERSIONS}};
         false -> {error, invalid_mcp_client_options}
     end.
 
-valid_timeout(Value) -> is_integer(Value) andalso Value > 0.
+valid_timeout(Value) ->
+    is_integer(Value) andalso Value > 0 andalso Value =< ?MAX_TIMEOUT.
+
+bounded_positive(Value, Ceiling) ->
+    is_integer(Value) andalso Value > 0 andalso Value =< Ceiling.
+
+bounded_range(Value, Floor, Ceiling) ->
+    is_integer(Value) andalso Value >= Floor andalso Value =< Ceiling.
+
+valid_tls_opts(default) -> true;
+valid_tls_opts(Options) when is_list(Options) ->
+    lists:all(fun(Option) -> is_tuple(Option) andalso tuple_size(Option) =:= 2
+              end, Options) andalso
+    not lists:member({verify, verify_none}, Options);
+valid_tls_opts(_) -> false.
+
+application_version() ->
+    _ = application:load(erlang_adk),
+    case application:get_key(erlang_adk, vsn) of
+        {ok, Version} when is_list(Version) ->
+            unicode:characters_to_binary(Version);
+        {ok, Version} when is_binary(Version) -> Version;
+        _ -> <<"unknown">>
+    end.
+
 valid_auth_fun(undefined) -> true;
 valid_auth_fun(Fun) -> is_function(Fun, 0).
 
@@ -268,6 +327,10 @@ valid_static_headers(Headers) when is_list(Headers) ->
     lists:all(
       fun({Name, Value}) when is_binary(Name), is_binary(Value) ->
               Header = lower(Name),
+              byte_size(Name) > 0 andalso
+              byte_size(Name) =< 256 andalso
+              byte_size(Value) =< ?MAX_HEADER_BYTES andalso
+              no_controls(Name) andalso no_controls(Value) andalso
               not sensitive_header(Header) andalso
               not reserved_transport_header(Header);
          (_) -> false
@@ -309,14 +372,23 @@ init({http, Url, Config}) ->
     process_flag(trap_exit, true),
     case parse_http_url(Url) of
         {ok, Endpoint} ->
-            case open_http(Endpoint, Config) of
-                {ok, Conn, Monitor} ->
-                    {ok, (base_state(http, Config))#{endpoint => Endpoint,
+            Deadline = deadline(maps:get(connect_timeout, Config)),
+            case resolve_endpoint(Endpoint, Config, Deadline) of
+                {ok, ResolvedEndpoint} ->
+                    case open_http(ResolvedEndpoint, Config, Deadline) of
+                        {ok, Conn, Monitor} ->
+                    {ok, (base_state(http, Config))#{endpoint => ResolvedEndpoint,
                                                      conn => Conn,
                                                      conn_monitor => Monitor}};
-                {error, Reason} -> {stop, Reason}
+                        {error, Reason} ->
+                            {ok, (base_state(http, Config))#{startup_error =>
+                                                                 Reason}}
+                    end;
+                {error, Reason} ->
+                    {ok, (base_state(http, Config))#{startup_error => Reason}}
             end;
-        {error, Reason} -> {stop, Reason}
+        {error, Reason} ->
+            {ok, (base_state(http, Config))#{startup_error => Reason}}
     end.
 
 base_state(Transport, Config) ->
@@ -333,8 +405,12 @@ handle_call(initialize, _From, State = #{dummy := true}) ->
 handle_call(initialize, From, State = #{transport := stdio}) ->
     Params = initialize_params(State),
     send_stdio_request(From, <<"initialize">>, Params, initialize, State);
+handle_call(initialize, _From,
+            State = #{transport := http, startup_error := Reason}) ->
+    {reply, {error, Reason}, State};
 handle_call(initialize, _From, State = #{transport := http}) ->
-    case initialize_http(State) of
+    Deadline = deadline(maps:get(initialize_timeout, maps:get(config, State))),
+    case initialize_http(State, Deadline) of
         {ok, NewState} -> {reply, ok, NewState};
         {error, Reason, NewState} -> {reply, {error, Reason}, NewState}
     end;
@@ -357,7 +433,9 @@ handle_call({request, Method, Params, Capability}, _From,
             State = #{transport := http}) ->
     case ready_for(State, Capability) of
         ok ->
-            case http_operation(Method, Params, State, true) of
+            Deadline = deadline(maps:get(request_timeout,
+                                         maps:get(config, State))),
+            case http_operation(Method, Params, State, true, Deadline) of
                 {ok, Result, NewState} -> {reply, {ok, Result}, NewState};
                 {error, Reason, NewState} ->
                     {reply, {error, Reason}, NewState}
@@ -417,7 +495,11 @@ format_status(Status) ->
                   undefined -> undefined;
                   _ -> configured
               end,
-              Config = Config0#{auth_fun => Auth},
+              Resolver = case maps:get(resolver_fun, Config0, undefined) of
+                  undefined -> undefined;
+                  _ -> configured
+              end,
+              Config = Config0#{auth_fun => Auth, resolver_fun => Resolver},
               maps:without([pending], State#{config => Config});
          (message, Message) -> adk_secret_redactor:redact(Message);
          (log, _Log) -> [];
@@ -568,12 +650,12 @@ send_stdio_cancel(Id, Port) ->
                 Port, [jsx:encode(Notification), <<"\n">>]),
     ok.
 
-initialize_http(State0) ->
+initialize_http(State0, Deadline) ->
     Id = maps:get(req_id, State0),
     Message = request_message(Id, <<"initialize">>,
                               initialize_params(State0)),
     State1 = maps:remove(session_id, State0),
-    case http_send(Message, initialize, State1#{req_id => Id + 1}) of
+    case http_send(Message, initialize, State1#{req_id => Id + 1}, Deadline) of
         {ok, 200, Headers, Body, State2} ->
             case decode_rpc_response(Headers, Body, Id) of
                 {ok, Outcome} ->
@@ -583,7 +665,8 @@ initialize_http(State0) ->
                                 {ok, SessionId} ->
                                     State3 = maybe_put_session(SessionId,
                                                                State2),
-                                    case send_http_initialized(State3) of
+                                    case send_http_initialized(State3,
+                                                               Deadline) of
                                         {ok, State4} ->
                                             {ok, State4#{initialized => true,
                                                          server_info => Result,
@@ -606,20 +689,20 @@ initialize_http(State0) ->
         {error, Reason, State2} -> {error, Reason, State2}
     end.
 
-send_http_initialized(State) ->
+send_http_initialized(State, Deadline) ->
     Message = notification_message(<<"notifications/initialized">>, #{}),
-    case http_send(Message, notification, State) of
+    case http_send(Message, notification, State, Deadline) of
         {ok, 202, _Headers, _Body, NewState} -> {ok, NewState};
         {ok, Status, _Headers, _Body, NewState} ->
             {error, {invalid_notification_status, Status}, NewState};
         {error, Reason, NewState} -> {error, Reason, NewState}
     end.
 
-http_operation(Method, Params, State0, RetrySession) ->
+http_operation(Method, Params, State0, RetrySession, Deadline) ->
     Id = maps:get(req_id, State0),
     Message = request_message(Id, Method, Params),
     State1 = State0#{req_id => Id + 1},
-    case http_send(Message, operation, State1) of
+    case http_send(Message, operation, State1, Deadline) of
         {ok, 200, Headers, Body, State2} ->
             case decode_rpc_response(Headers, Body, Id) of
                 {ok, {ok, Result}} -> {ok, Result, State2};
@@ -629,11 +712,13 @@ http_operation(Method, Params, State0, RetrySession) ->
         {ok, 404, _Headers, _Body, State2}
           when RetrySession, is_map_key(session_id, State0) ->
             case initialize_http(maps:remove(session_id,
-                                             State2#{initialized => false})) of
+                                             State2#{initialized => false}),
+                                 Deadline) of
                 {ok, State3} ->
                     case retryable_after_session_loss(Method) of
                         true ->
-                            http_operation(Method, Params, State3, false);
+                            http_operation(Method, Params, State3, false,
+                                           Deadline);
                         false ->
                             %% The server may have observed a mutating request
                             %% before reporting a lost session. Replaying it
@@ -659,34 +744,47 @@ retryable_after_session_loss(<<"prompts/get">>) -> true;
 retryable_after_session_loss(<<"ping">>) -> true;
 retryable_after_session_loss(_Method) -> false.
 
-http_send(Message, Kind, State) ->
-    case request_headers(Kind, State) of
+http_send(Message, Kind, State, Deadline) ->
+    case request_headers(Kind, State, Deadline) of
         {ok, Headers} ->
-            Body = jsx:encode(Message),
-            Conn = maps:get(conn, State),
-            Path = maps:get(path, maps:get(endpoint, State)),
-            Ref = gun:request(Conn, <<"POST">>, Path, Headers, Body),
-            await_http(Conn, Ref, State);
+            case remaining(Deadline) of
+                0 -> {error, timeout, State};
+                _ ->
+                    Body = jsx:encode(Message),
+                    Conn = maps:get(conn, State),
+                    Path = maps:get(path, maps:get(endpoint, State)),
+                    Ref = gun:request(Conn, <<"POST">>, Path, Headers, Body),
+                    await_http(Conn, Ref, State, Deadline)
+            end;
         {error, Reason} -> {error, Reason, State}
     end.
 
-await_http(Conn, Ref, State) ->
-    Timeout = maps:get(request_timeout, maps:get(config, State)),
-    case gun:await(Conn, Ref, Timeout) of
+await_http(Conn, Ref, State, Deadline) ->
+    case gun:await(Conn, Ref, remaining(Deadline)) of
+        {inform, _Status, _Headers} ->
+            await_http(Conn, Ref, State, Deadline);
+        {response, IsFin, Status, _Headers}
+          when Status >= 300, Status =< 399 ->
+            case IsFin of
+                nofin -> _ = catch gun:cancel(Conn, Ref);
+                fin -> ok
+            end,
+            {error, {redirect_rejected, Status}, State};
         {response, fin, Status, Headers} ->
             {ok, Status, Headers, <<>>, State};
         {response, nofin, Status, Headers} ->
             Max = maps:get(max_response_bytes, maps:get(config, State)),
-            case await_http_body(Conn, Ref, Timeout, Max, [], 0) of
+            case await_http_body(Conn, Ref, Deadline, Max, [], 0) of
                 {ok, Body} -> {ok, Status, Headers, Body, State};
                 {error, Reason} -> {error, Reason, State}
             end;
+        {error, timeout} -> {error, timeout, State};
         {error, Reason} -> {error, {http_transport, Reason}, State};
         Other -> {error, {invalid_http_response, safe_term(Other)}, State}
     end.
 
-await_http_body(Conn, Ref, Timeout, Max, Acc, Size) ->
-    case gun:await(Conn, Ref, Timeout) of
+await_http_body(Conn, Ref, Deadline, Max, Acc, Size) ->
+    case gun:await(Conn, Ref, remaining(Deadline)) of
         {data, IsFin, Data} when is_binary(Data) ->
             NewSize = Size + byte_size(Data),
             case NewSize =< Max of
@@ -696,11 +794,12 @@ await_http_body(Conn, Ref, Timeout, Max, Acc, Size) ->
                 true when IsFin =:= fin ->
                     {ok, iolist_to_binary(lists:reverse([Data | Acc]))};
                 true ->
-                    await_http_body(Conn, Ref, Timeout, Max,
+                    await_http_body(Conn, Ref, Deadline, Max,
                                     [Data | Acc], NewSize)
             end;
         {trailers, _Headers} ->
             {ok, iolist_to_binary(lists:reverse(Acc))};
+        {error, timeout} -> {error, timeout};
         {error, Reason} -> {error, {http_transport, Reason}};
         Other -> {error, {invalid_http_body, safe_term(Other)}}
     end.
@@ -753,12 +852,14 @@ validate_rpc_response(#{<<"id">> := Other}, _Id) ->
     {error, {unexpected_response_id, safe_term(Other)}};
 validate_rpc_response(_, _Id) -> {error, invalid_jsonrpc_response}.
 
-request_headers(Kind, State) ->
+request_headers(Kind, State, Deadline) ->
     Config = maps:get(config, State),
     Static = maps:get(headers, Config),
-    case dynamic_auth_headers(maps:get(auth_fun, Config)) of
+    case dynamic_auth_headers(maps:get(auth_fun, Config), Config, Deadline) of
         {ok, Auth} ->
-            Base = [{<<"accept">>,
+            Endpoint = maps:get(endpoint, State),
+            Base = [{<<"host">>, host_header(Endpoint)},
+                    {<<"accept">>,
                      <<"application/json, text/event-stream">>},
                     {<<"content-type">>, <<"application/json">>}],
             Protocol = case Kind of
@@ -775,23 +876,37 @@ request_headers(Kind, State) ->
         Error -> Error
     end.
 
-dynamic_auth_headers(undefined) -> {ok, []};
-dynamic_auth_headers(Fun) ->
+dynamic_auth_headers(undefined, _Config, _Deadline) -> {ok, []};
+dynamic_auth_headers(Fun, Config, Deadline) ->
+    MaxHeap = maps:get(callback_max_heap_words, Config),
+    case run_callback_worker(auth, fun() -> invoke_auth_fun(Fun) end,
+                             MaxHeap, Deadline) of
+        {ok, Result} -> Result;
+        timeout -> {error, timeout};
+        failed -> {error, auth_provider_failed}
+    end.
+
+invoke_auth_fun(Fun) ->
     try Fun() of
-        Headers when is_list(Headers) ->
-            case lists:all(fun valid_dynamic_header/1, Headers) of
-                true -> {ok, Headers};
-                false -> {error, invalid_auth_headers}
-            end;
+        Headers when is_list(Headers) -> normalize_auth_headers(Headers);
         _ -> {error, invalid_auth_headers}
     catch
         _:_ -> {error, auth_provider_failed}
     end.
 
+normalize_auth_headers(Headers) ->
+    case lists:all(fun valid_dynamic_header/1, Headers) andalso
+         length(Headers) =< 1 of
+        true -> {ok, [{<<"authorization">>, Value}
+                      || {_Name, Value} <- Headers]};
+        false -> {error, invalid_auth_headers}
+    end.
+
 valid_dynamic_header({Name, Value}) ->
     is_binary(Name) andalso is_binary(Value) andalso
-    (lower(Name) =:= <<"authorization">> orelse
-     lower(Name) =:= <<"proxy-authorization">>);
+    lower(Name) =:= <<"authorization">> andalso
+    byte_size(Value) > 0 andalso byte_size(Value) =< ?MAX_HEADER_BYTES andalso
+    no_controls(Name) andalso no_controls(Value);
 valid_dynamic_header(_) -> false.
 
 response_content_type(Headers) ->
@@ -830,11 +945,13 @@ header_value(Name, Headers) ->
 maybe_delete_session(State) ->
     case {maps:find(conn, State), maps:find(session_id, State)} of
         {{ok, Conn}, {ok, _SessionId}} ->
-            case request_headers(operation, State) of
+            Deadline = deadline(1000),
+            case request_headers(operation, State, Deadline) of
                 {ok, Headers} ->
                     Path = maps:get(path, maps:get(endpoint, State)),
                     try gun:request(Conn, <<"DELETE">>, Path, Headers, <<>>) of
-                        Ref -> _ = catch gun:await(Conn, Ref, 1000), ok
+                        Ref -> _ = catch gun:await(Conn, Ref,
+                                                  remaining(Deadline)), ok
                     catch _:_ -> ok
                     end;
                 {error, _} -> ok
@@ -850,8 +967,8 @@ parse_http_url(Url) ->
     end.
 
 normalize_http_endpoint(Parsed) ->
-    Scheme = to_binary(maps:get(scheme, Parsed, <<>>)),
-    Host = to_binary(maps:get(host, Parsed, <<>>)),
+    Scheme = lower(to_binary(maps:get(scheme, Parsed, <<>>))),
+    Host = canonical_host(to_binary(maps:get(host, Parsed, <<>>))),
     UserInfo = maps:get(userinfo, Parsed, undefined),
     Fragment = maps:get(fragment, Parsed, undefined),
     Query = maps:get(query, Parsed, undefined),
@@ -871,17 +988,209 @@ normalize_http_endpoint(Parsed) ->
             end
     end.
 
-open_http(Endpoint, Config) ->
-    Host = binary_to_list(maps:get(host, Endpoint)),
+resolve_endpoint(Endpoint, Config, Deadline) ->
+    Host = maps:get(host, Endpoint),
+    case exact_host_allowed(Host, maps:get(allowed_hosts, Config)) of
+        false -> {error, mcp_destination_not_allowed};
+        true ->
+            case resolve_addresses(Host, Config, Deadline) of
+                {ok, Addresses} ->
+                    validate_resolved_endpoint(Endpoint, Addresses, Config);
+                {error, _} = Error -> Error
+            end
+    end.
+
+resolve_addresses(Host, Config, Deadline) ->
+    Resolver = maps:get(resolver_fun, Config),
+    MaxAddresses = maps:get(max_resolved_addresses, Config),
+    MaxHeap = maps:get(callback_max_heap_words, Config),
+    Work = fun() -> resolved_addresses(Host, Resolver, MaxAddresses) end,
+    case run_callback_worker(resolver, Work, MaxHeap, Deadline) of
+        {ok, {ok, []}} -> {error, mcp_dns_resolution_failed};
+        {ok, {ok, Addresses}} -> {ok, Addresses};
+        {ok, error} -> {error, mcp_dns_resolution_failed};
+        timeout -> {error, mcp_connect_timeout};
+        failed -> {error, mcp_dns_resolution_failed}
+    end.
+
+resolved_addresses(Host, undefined, MaxAddresses) ->
+    HostString = binary_to_list(Host),
+    normalize_addresses(resolve_family(HostString, inet) ++
+                        resolve_family(HostString, inet6), MaxAddresses);
+resolved_addresses(Host, Resolver, MaxAddresses) ->
+    try Resolver(Host) of
+        {ok, Addresses} -> normalize_addresses(Addresses, MaxAddresses);
+        Addresses when is_list(Addresses) ->
+            normalize_addresses(Addresses, MaxAddresses);
+        _ -> error
+    catch _:_ -> error
+    end.
+
+resolve_family(Host, Family) ->
+    case inet:getaddrs(Host, Family) of
+        {ok, Addresses} -> Addresses;
+        {error, _} -> []
+    end.
+
+normalize_addresses(Addresses, MaxAddresses) when is_list(Addresses) ->
+    bounded_addresses(Addresses, MaxAddresses, []);
+normalize_addresses(_, _MaxAddresses) -> error.
+
+bounded_addresses([], _Remaining, Acc) ->
+    {ok, lists:usort(Acc)};
+bounded_addresses(_Addresses, 0, _Acc) -> error;
+bounded_addresses([Address | Rest], Remaining, Acc) ->
+    case valid_ip_address(Address) of
+        true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
+        false -> error
+    end;
+bounded_addresses(_Improper, _Remaining, _Acc) -> error.
+
+%% Authentication and custom DNS callbacks are application code.  Normalize
+%% their results in an off-heap, heap-limited process and address replies via a
+%% process alias, so a timed-out callback cannot leave a late message in the
+%% long-lived MCP client mailbox.
+run_callback_worker(Kind, Work, MaxHeap, Deadline) ->
+    case remaining(Deadline) of
+        0 -> timeout;
+        _ -> start_callback_worker(Kind, Work, MaxHeap, Deadline)
+    end.
+
+start_callback_worker(Kind, Work, MaxHeap, Deadline) ->
+    Owner = self(),
+    ReplyAlias = erlang:alias([explicit_unalias]),
+    Ref = make_ref(),
+    Worker = fun() ->
+        start_callback_owner_watchdog(Owner, self()),
+        Result = Work(),
+        CompletedAt = erlang:monotonic_time(millisecond),
+        _ = erlang:send(
+              ReplyAlias,
+              {mcp_client_callback_result, Kind, Ref, self(),
+               CompletedAt, Result},
+              [noconnect, nosuspend]),
+        ok
+    end,
+    SpawnOptions =
+        [monitor, {message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => MaxHeap, kill => true, error_logger => false,
+            include_shared_binaries => true}}],
+    try erlang:spawn_opt(Worker, SpawnOptions) of
+        {Pid, Monitor} ->
+            await_callback_worker(Kind, Pid, Monitor, ReplyAlias, Ref,
+                                  Deadline)
+    catch
+        _:_ ->
+            _ = erlang:unalias(ReplyAlias),
+            failed
+    end.
+
+await_callback_worker(Kind, Pid, Monitor, ReplyAlias, Ref, Deadline) ->
+    receive
+        {mcp_client_callback_result, Kind, Ref, Pid, CompletedAt, Result}
+          when CompletedAt =< Deadline ->
+            callback_worker_complete(ReplyAlias, Monitor),
+            {ok, Result};
+        {mcp_client_callback_result, Kind, Ref, Pid,
+         _CompletedAt, _LateResult} ->
+            _ = erlang:unalias(ReplyAlias),
+            exit(Pid, kill),
+            await_callback_worker_down(Pid, Monitor),
+            timeout;
+        {'DOWN', Monitor, process, Pid, _OpaqueReason} ->
+            _ = erlang:unalias(ReplyAlias),
+            flush_callback_worker_result(Kind, Ref, Pid),
+            failed
+    after remaining(Deadline) ->
+        _ = erlang:unalias(ReplyAlias),
+        exit(Pid, kill),
+        await_callback_worker_down(Pid, Monitor),
+        flush_callback_worker_result(Kind, Ref, Pid),
+        timeout
+    end.
+
+callback_worker_complete(ReplyAlias, Monitor) ->
+    _ = erlang:unalias(ReplyAlias),
+    _ = erlang:demonitor(Monitor, [flush]),
+    ok.
+
+flush_callback_worker_result(Kind, Ref, Pid) ->
+    receive
+        {mcp_client_callback_result, Kind, Ref, Pid,
+         _CompletedAt, _Result} -> ok
+    after 0 -> ok
+    end.
+
+await_callback_worker_down(Pid, Monitor) ->
+    receive
+        {'DOWN', Monitor, process, Pid, _OpaqueReason} -> ok
+    after 100 ->
+        _ = erlang:demonitor(Monitor, [flush]),
+        ok
+    end.
+
+start_callback_owner_watchdog(Owner, Callback) ->
+    Watchdog = fun() -> callback_owner_watchdog(Owner, Callback) end,
+    _ = spawn_opt(
+          Watchdog,
+          [{message_queue_data, off_heap},
+           {max_heap_size,
+            #{size => 8192, kill => true, error_logger => false,
+              include_shared_binaries => true}}]),
+    ok.
+
+callback_owner_watchdog(Owner, Callback) ->
+    OwnerMonitor = erlang:monitor(process, Owner),
+    CallbackMonitor = erlang:monitor(process, Callback),
+    receive
+        {'DOWN', OwnerMonitor, process, Owner, _OpaqueReason} ->
+            exit(Callback, kill),
+            _ = erlang:demonitor(CallbackMonitor, [flush]),
+            ok;
+        {'DOWN', CallbackMonitor, process, Callback, _OpaqueReason} ->
+            _ = erlang:demonitor(OwnerMonitor, [flush]),
+            ok
+    end.
+
+validate_resolved_endpoint(Endpoint, Addresses, Config) ->
+    Scheme = maps:get(scheme, Endpoint),
+    Host = maps:get(host, Endpoint),
+    AllLoopback = lists:all(fun is_loopback_address/1, Addresses),
+    AllPublic = lists:all(fun is_public_address/1, Addresses),
+    PrivateAllowed = lists:member(
+                       Host, maps:get(allowed_private_hosts, Config)),
+    Allowed = case Scheme of
+        <<"http">> -> maps:get(allow_http_loopback, Config) andalso AllLoopback;
+        <<"https">> -> AllPublic orelse PrivateAllowed
+    end,
+    case Allowed of
+        true -> {ok, Endpoint#{address => hd(Addresses),
+                              all_loopback => AllLoopback}};
+        false when Scheme =:= <<"http">> ->
+            {error, insecure_mcp_destination};
+        false -> {error, mcp_private_destination_rejected}
+    end.
+
+open_http(Endpoint, Config, Deadline) ->
+    Address = maps:get(address, Endpoint),
     Port = maps:get(port, Endpoint),
-    GunOptions = gun_options(maps:get(scheme, Endpoint), Config),
-    case gun:open(Host, Port, GunOptions) of
+    GunOptions = gun_options(Endpoint, Config, Deadline),
+    case remaining(Deadline) of
+        0 -> {error, mcp_connect_timeout};
+        _ -> open_http_connection(Address, Port, GunOptions, Deadline)
+    end.
+
+open_http_connection(Address, Port, GunOptions, Deadline) ->
+    case gun:open(Address, Port, GunOptions) of
         {ok, Conn} ->
-            Timeout = maps:get(connect_timeout, Config),
-            case gun:await_up(Conn, Timeout) of
+            case gun:await_up(Conn, remaining(Deadline)) of
                 {ok, _Protocol} ->
                     Monitor = erlang:monitor(process, Conn),
                     {ok, Conn, Monitor};
+                {error, timeout} ->
+                    _ = catch gun:close(Conn),
+                    {error, mcp_connect_timeout};
                 {error, Reason} ->
                     _ = catch gun:close(Conn),
                     {error, {mcp_http_connect_failed, Reason}}
@@ -889,19 +1198,131 @@ open_http(Endpoint, Config) ->
         {error, Reason} -> {error, {mcp_http_connect_failed, Reason}}
     end.
 
-gun_options(<<"http">>, _Config) -> #{transport => tcp};
-gun_options(<<"https">>, Config) ->
-    TlsOpts = case maps:get(tls_opts, Config) of
-        default ->
-            [{verify, verify_peer},
-             {cacerts, apply(public_key, cacerts_get, [])},
-             {customize_hostname_check,
-              [{match_fun, apply(public_key,
-                                 pkix_verify_hostname_match_fun,
-                                 [https])}]}];
-        Value -> Value
+gun_options(#{scheme := <<"http">>}, _Config, Deadline) ->
+    #{transport => tcp, protocols => [http], retry => 0,
+      connect_timeout => remaining(Deadline)};
+gun_options(#{scheme := <<"https">>, host := Host}, Config, Deadline) ->
+    #{transport => tls, protocols => [http], retry => 0,
+      connect_timeout => remaining(Deadline),
+      tls_handshake_timeout => remaining(Deadline),
+      tls_opts => secure_tls_opts(Host, maps:get(tls_opts, Config))}.
+
+secure_tls_opts(Host, Configured) ->
+    Extra0 = case Configured of default -> []; Value -> Value end,
+    Extra = lists:filter(
+              fun({Key, _Value}) ->
+                      not lists:member(Key,
+                                       [verify, verify_fun, partial_chain,
+                                        server_name_indication,
+                                        customize_hostname_check]);
+                 (_) -> false
+              end, Extra0),
+    Trust = case lists:keymember(cacerts, 1, Extra) orelse
+                 lists:keymember(cacertfile, 1, Extra) of
+        true -> [];
+        false -> [{cacerts, public_key:cacerts_get()}]
     end,
-    #{transport => tls, tls_opts => TlsOpts}.
+    [{verify, verify_peer},
+     {server_name_indication, binary_to_list(Host)},
+     {customize_hostname_check,
+      [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}]
+    ++ Trust ++ Extra.
+
+host_header(#{scheme := <<"https">>, host := Host, port := 443}) ->
+    authority_host(Host);
+host_header(#{scheme := <<"http">>, host := Host, port := 80}) ->
+    authority_host(Host);
+host_header(#{host := Host, port := Port}) ->
+    AuthorityHost = authority_host(Host),
+    <<AuthorityHost/binary, ":", (integer_to_binary(Port))/binary>>.
+
+authority_host(Host) ->
+    case inet:parse_ipv6_address(binary_to_list(Host)) of
+        {ok, _} -> <<"[", Host/binary, "]">>;
+        {error, _} -> Host
+    end.
+
+valid_host_policy(any) -> true;
+valid_host_policy(Hosts) -> valid_host_list(Hosts).
+
+valid_host_list(Hosts) when is_list(Hosts) ->
+    length(Hosts) =< 256 andalso
+    lists:all(
+      fun(Host0) ->
+          Host = canonical_host(to_binary(Host0)),
+          byte_size(Host) > 0 andalso byte_size(Host) =< 253 andalso
+          no_controls(Host)
+      end, Hosts);
+valid_host_list(_) -> false.
+
+normalize_host_policy(any) -> any;
+normalize_host_policy(Hosts) -> normalize_hosts(Hosts).
+
+normalize_hosts(Hosts) ->
+    lists:usort([canonical_host(to_binary(Host)) || Host <- Hosts]).
+
+exact_host_allowed(_Host, any) -> true;
+exact_host_allowed(Host, Hosts) -> lists:member(Host, Hosts).
+
+canonical_host(Host) -> lower(Host).
+
+deadline(Timeout) -> erlang:monotonic_time(millisecond) + Timeout.
+
+remaining(Deadline) ->
+    erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+valid_ip_address({A, B, C, D}) ->
+    lists:all(fun(V) -> is_integer(V) andalso V >= 0 andalso V =< 255 end,
+              [A, B, C, D]);
+valid_ip_address({A, B, C, D, E, F, G, H}) ->
+    lists:all(fun(V) -> is_integer(V) andalso V >= 0 andalso V =< 16#ffff end,
+              [A, B, C, D, E, F, G, H]);
+valid_ip_address(_) -> false.
+
+is_loopback_address({127, _B, _C, _D}) -> true;
+is_loopback_address({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+is_loopback_address({0, 0, 0, 0, 0, 16#ffff, C, D}) ->
+    is_loopback_address({C bsr 8, C band 16#ff,
+                         D bsr 8, D band 16#ff});
+is_loopback_address(_) -> false.
+
+%% Reject loopback, link-local, private, carrier-grade NAT, documentation,
+%% benchmarking, protocol-assignment, multicast, and reserved destinations.
+is_public_address({A, _B, _C, _D}) when A =:= 0; A =:= 10; A =:= 127 -> false;
+is_public_address({100, B, _C, _D}) when B >= 64, B =< 127 -> false;
+is_public_address({169, 254, _C, _D}) -> false;
+is_public_address({172, B, _C, _D}) when B >= 16, B =< 31 -> false;
+is_public_address({192, 0, 0, _D}) -> false;
+is_public_address({192, 0, 2, _D}) -> false;
+is_public_address({192, 31, 196, _D}) -> false;
+is_public_address({192, 52, 193, _D}) -> false;
+is_public_address({192, 88, 99, _D}) -> false;
+is_public_address({192, 168, _C, _D}) -> false;
+is_public_address({198, B, _C, _D}) when B =:= 18; B =:= 19 -> false;
+is_public_address({198, 51, 100, _D}) -> false;
+is_public_address({203, 0, 113, _D}) -> false;
+is_public_address({A, _B, _C, _D}) when A >= 224 -> false;
+is_public_address({_A, _B, _C, _D}) -> true;
+is_public_address({0, 0, 0, 0, 0, 16#ffff, C, D}) ->
+    is_public_address({C bsr 8, C band 16#ff,
+                       D bsr 8, D band 16#ff});
+is_public_address({0, _B, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#0100, 0, 0, 0, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, 0, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, 2, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, 16#0db8, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, A, _C, _D, _E, _F, _G, _H})
+  when A >= 16#0010, A =< 16#002f -> false;
+is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
+  when (A band 16#fe00) =:= 16#fc00 -> false;
+is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
+  when (A band 16#ffc0) =:= 16#fe80 -> false;
+is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
+  when (A band 16#ffc0) =:= 16#fec0 -> false;
+is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
+  when (A band 16#ff00) =:= 16#ff00 -> false;
+is_public_address({_A, _B, _C, _D, _E, _F, _G, _H}) -> true;
+is_public_address(_) -> false.
 
 request_message(Id, Method, Params) ->
     #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
@@ -922,6 +1343,10 @@ normalize_newlines(Binary) ->
 
 trim_left(<<" ", Rest/binary>>) -> Rest;
 trim_left(Value) -> Value.
+
+no_controls(Binary) ->
+    lists:all(fun(C) -> C >= 16#20 andalso C =/= 16#7f end,
+              binary_to_list(Binary)).
 
 lower(Value) when is_binary(Value) ->
     list_to_binary(string:lowercase(binary_to_list(Value))).

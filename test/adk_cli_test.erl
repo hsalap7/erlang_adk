@@ -233,6 +233,9 @@ deterministic_evaluation_case() ->
 
 option_and_url_validation_case() ->
     ?assertEqual(
+       {error, developer_server_must_bind_loopback},
+       adk_cli:command(["serve", "--ip", "0.0.0.0"])),
+    ?assertEqual(
        {error, {duplicate_option, "--url"}},
        adk_cli:command(
          ["inspect", "run", "run-1",

@@ -65,7 +65,18 @@ decode_rpc(Body, Req0, Config) ->
 
 dispatch_versioned(Id, Method, Params, Req0, Config) ->
     case cowboy_req:header(<<"a2a-version">>, Req0) of
-        <<"1.0">> -> authorize_and_dispatch(Id, Method, Params, Req0, Config);
+        <<"1.0">> ->
+            case validate_request_extensions(Req0, Config) of
+                {ok, Extensions} ->
+                    authorize_and_dispatch(
+                      Id, Method, Params, Extensions, Req0, Config);
+                {error, Missing} ->
+                    reply_json(
+                      200,
+                      adk_a2a_v1_rpc:rpc_error(
+                        Id, {extension_support_required, Missing}),
+                      Req0, Config)
+            end;
         _ ->
             Error = adk_a2a_v1_codec:error_response(
                       Id, -32009, <<"A2A protocol version not supported">>,
@@ -76,13 +87,18 @@ dispatch_versioned(Id, Method, Params, Req0, Config) ->
             reply_json(200, Error, Req0, Config)
     end.
 
-authorize_and_dispatch(Id, Method, Params, Req0, Config) ->
+authorize_and_dispatch(Id, Method, Params, Extensions, Req0, Config) ->
     Headers = cowboy_req:headers(Req0),
     Summary = #{method => Method,
                 path => cowboy_req:path(Req0),
-                peer => peer_ip(Req0)},
+                peer => peer_ip(Req0),
+                extensions => Extensions},
     Hook = maps:get(auth, Config, none),
-    case adk_a2a_v1_auth:authorize(Hook, Method, Headers, Summary) of
+    AuthOptions = #{timeout_ms => maps:get(auth_timeout_ms, Config, 5000),
+                    max_heap_words => maps:get(auth_max_heap_words, Config,
+                                               300000)},
+    case adk_a2a_v1_auth:authorize(
+           Hook, Method, Headers, Summary, AuthOptions) of
         {ok, Auth} ->
             dispatch_authorized(Id, Method, Params, Auth, Req0, Config);
         {error, unauthenticated} ->
@@ -109,12 +125,64 @@ dispatch_authorized(Id, Method, Params, Auth, Req0, Config) ->
                               Id, stream_method_requires_sse),
                     reply_json(200, Error, Req0, Config)
             end;
+        unsupported_push ->
+            reply_json(
+              200,
+              adk_a2a_v1_rpc:rpc_error(
+                Id, push_notification_not_supported), Req0, Config);
+        unsupported ->
+            reply_json(
+              200,
+              adk_a2a_v1_rpc:rpc_error(Id, unsupported_operation),
+              Req0, Config);
         unknown ->
             reply_json(200,
                        adk_a2a_v1_codec:error_response(
                          Id, -32601, <<"Method not found">>),
                        Req0, Config)
     end.
+
+validate_request_extensions(Req, Config) ->
+    {ok, Card} = adk_a2a_v1_server:card(maps:get(server, Config)),
+    Required = adk_a2a_v1_card:required_extensions(Card),
+    MaxCount = maps:get(max_extensions, Config, 32),
+    MaxBytes = maps:get(max_extension_header_bytes, Config, 8192),
+    case parse_extension_header(
+           cowboy_req:header(<<"a2a-extensions">>, Req), MaxCount, MaxBytes) of
+        {ok, Advertised} ->
+            case [Uri || Uri <- Required,
+                         not lists:member(Uri, Advertised)] of
+                [] -> {ok, Advertised};
+                Missing -> {error, Missing}
+            end;
+        {error, _} -> {error, Required}
+    end.
+
+parse_extension_header(undefined, _MaxCount, _MaxBytes) -> {ok, []};
+parse_extension_header(Header, MaxCount, MaxBytes)
+  when is_binary(Header), byte_size(Header) =< MaxBytes ->
+    Values = [trim(Value) || Value <- binary:split(Header, <<",">>, [global])],
+    case length(Values) =< MaxCount
+         andalso Values =/= []
+         andalso lists:all(fun valid_extension_header_uri/1, Values)
+         andalso length(lists:usort(Values)) =:= length(Values) of
+        true -> {ok, Values};
+        false -> {error, invalid_a2a_extensions_header}
+    end;
+parse_extension_header(_, _MaxCount, _MaxBytes) ->
+    {error, invalid_a2a_extensions_header}.
+
+valid_extension_header_uri(Uri) when is_binary(Uri), byte_size(Uri) > 0,
+                                     byte_size(Uri) =< 2048 ->
+    try uri_string:parse(Uri) of
+        #{scheme := Scheme} when Scheme =/= <<>>, Scheme =/= "" -> true;
+        _ -> false
+    catch _:_ -> false
+    end;
+valid_extension_header_uri(_) -> false.
+
+trim(Value) ->
+    list_to_binary(string:trim(binary_to_list(Value))).
 
 open_stream(Id, <<"SendStreamingMessage">>, Params, Auth, Req0, Config) ->
     Server = maps:get(server, Config),
@@ -186,7 +254,10 @@ sse_loop(Id, TaskId, Heartbeat, Req) ->
                 ok when Terminal -> Req;
                 ok -> sse_loop(Id, TaskId, Heartbeat, Req);
                 closed -> Req
-            end
+            end;
+        {adk_a2a_v1_overflow, TaskId} ->
+            _ = safe_stream_body(<<>>, fin, Req),
+            Req
     after Heartbeat ->
         case safe_stream_body(<<": heartbeat\n\n">>, nofin, Req) of
             ok -> sse_loop(Id, TaskId, Heartbeat, Req);

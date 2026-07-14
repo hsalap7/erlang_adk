@@ -41,6 +41,9 @@
 -define(DEFAULT_MAX_PARAMETERS, 64).
 -define(DEFAULT_MAX_RESPONSES, 32).
 -define(DEFAULT_MAX_SCHEMA_DEPTH, 32).
+-define(EXECUTION_MAX_HEAP_WORDS, 4000000).
+-define(EXECUTION_MAX_RESULT_BYTES, 16777216).
+-define(EXECUTION_WATCHDOG_MAX_HEAP_WORDS, 8192).
 
 -spec capabilities() -> map().
 capabilities() ->
@@ -297,10 +300,15 @@ compile_spec(Spec, Policy, Transport, Auth) ->
     end.
 
 openapi_version(#{<<"openapi">> := Version}) when is_binary(Version) ->
-    case Version of
-        <<"3.0.", _/binary>> -> {ok, openapi_3_0};
-        <<"3.1.", _/binary>> -> {ok, openapi_3_1};
-        _ -> {error, unsupported_openapi_version}
+    %% The OpenAPI field is a semantic version, not a prefix.  Accept only
+    %% released numeric 3.0.x/3.1.x versions so values such as `3.1.latest'
+    %% cannot silently select a different parser contract.
+    case re:run(Version,
+                <<"^3\\.(0|1)\\.(0|[1-9][0-9]*)$">>,
+                [{capture, [1], binary}]) of
+        {match, [<<"0">>]} -> {ok, openapi_3_0};
+        {match, [<<"1">>]} -> {ok, openapi_3_1};
+        nomatch -> {error, unsupported_openapi_version}
     end;
 openapi_version(_) -> {error, invalid_openapi_version}.
 
@@ -513,17 +521,23 @@ method_keys() ->
     [{<<"get">>, <<"GET">>}, {<<"put">>, <<"PUT">>},
      {<<"post">>, <<"POST">>}, {<<"delete">>, <<"DELETE">>},
      {<<"options">>, <<"OPTIONS">>}, {<<"head">>, <<"HEAD">>},
-     {<<"patch">>, <<"PATCH">>}, {<<"trace">>, <<"TRACE">>}].
+     {<<"patch">>, <<"PATCH">>}].
 
 validate_path_item_keys(PathItem) ->
     Allowed = [Key || {Key, _} <- method_keys()] ++
               [<<"parameters">>, <<"summary">>, <<"description">>,
-               <<"servers">>],
+               <<"servers">>, <<"trace">>],
     case validate_keys(PathItem, Allowed, invalid_openapi_path_item_key) of
         ok ->
-            valid_optional_binaries(
-              PathItem, [<<"summary">>, <<"description">>],
-              invalid_openapi_path_item);
+            %% TRACE commonly reflects request headers and therefore must not
+            %% receive an out-of-band bearer/API key from an agent tool.
+            case maps:is_key(<<"trace">>, PathItem) of
+                true -> {error, unsupported_openapi_method};
+                false ->
+                    valid_optional_binaries(
+                      PathItem, [<<"summary">>, <<"description">>],
+                      invalid_openapi_path_item)
+            end;
         {error, _} = Error -> Error
     end.
 
@@ -1256,39 +1270,99 @@ private_host(Host) ->
     end.
 
 run_bounded(Toolset, Operation, Args, Timeout) ->
-    Parent = self(),
+    Owner = self(),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    ReplyAlias = erlang:alias([explicit_unalias]),
     ReplyRef = make_ref(),
     Worker = fun() ->
+        ok = start_execution_owner_watchdog(Owner, self()),
         Outcome = try execute_operation(Toolset, Operation, Args) of
             Result -> Result
         catch
             _Class:_Reason -> {error, openapi_execution_failed}
         end,
-        Parent ! {ReplyRef, Outcome}
+        SafeOutcome = bounded_execution_outcome(Outcome),
+        CompletedAt = erlang:monotonic_time(millisecond),
+        _ = erlang:send(
+              ReplyAlias,
+              {openapi_execution_result, ReplyRef, self(),
+               CompletedAt, SafeOutcome},
+              [noconnect, nosuspend]),
+        ok
     end,
-    {Pid, MonitorRef} = spawn_opt(Worker, [monitor,
-                                           {max_heap_size,
-                                            #{size => 4000000,
-                                              kill => true,
-                                              error_logger => false}}]),
-    receive
-        {ReplyRef, Result} ->
-            erlang:demonitor(MonitorRef, [flush]),
-            Result;
-        {'DOWN', MonitorRef, process, Pid, _Reason} ->
+    SpawnOptions =
+        [monitor, {message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => ?EXECUTION_MAX_HEAP_WORDS, kill => true,
+            error_logger => false, include_shared_binaries => true}}],
+    try erlang:spawn_opt(Worker, SpawnOptions) of
+        {Pid, MonitorRef} ->
+            await_bounded_execution(
+              Pid, MonitorRef, ReplyAlias, ReplyRef, Deadline)
+    catch
+        _:_ ->
+            _ = erlang:unalias(ReplyAlias),
             {error, openapi_execution_failed}
-    after Timeout ->
+    end.
+
+await_bounded_execution(Pid, MonitorRef, ReplyAlias, ReplyRef, Deadline) ->
+    receive
+        {openapi_execution_result, ReplyRef, Pid, CompletedAt, Result} ->
+            _ = erlang:unalias(ReplyAlias),
+            _ = erlang:demonitor(MonitorRef, [flush]),
+            completed_execution_result(CompletedAt, Deadline, Result);
+        {'DOWN', MonitorRef, process, Pid, _OpaqueReason} ->
+            _ = erlang:unalias(ReplyAlias),
+            {error, openapi_execution_failed}
+    after remaining_deadline(Deadline) ->
+        _ = erlang:unalias(ReplyAlias),
         exit(Pid, kill),
-        receive
-            {'DOWN', MonitorRef, process, Pid, _} -> ok
-        after 1000 -> erlang:demonitor(MonitorRef, [flush])
-        end,
-        flush_worker_reply(ReplyRef),
+        _ = erlang:demonitor(MonitorRef, [flush]),
         {error, timeout}
     end.
 
-flush_worker_reply(ReplyRef) ->
-    receive {ReplyRef, _} -> ok after 0 -> ok end.
+completed_execution_result(CompletedAt, Deadline, _Result)
+  when CompletedAt > Deadline ->
+    {error, timeout};
+completed_execution_result(_CompletedAt, _Deadline, Result) ->
+    Result.
+
+bounded_execution_outcome(Outcome) ->
+    try erlang:external_size(Outcome) =< ?EXECUTION_MAX_RESULT_BYTES of
+        true -> Outcome;
+        false -> {error, openapi_execution_failed}
+    catch
+        _:_ -> {error, openapi_execution_failed}
+    end.
+
+start_execution_owner_watchdog(Owner, ExecutionWorker) ->
+    Watchdog = fun() -> execution_owner_watchdog(Owner, ExecutionWorker) end,
+    SpawnOptions =
+        [{message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => ?EXECUTION_WATCHDOG_MAX_HEAP_WORDS, kill => true,
+            error_logger => false, include_shared_binaries => true}}],
+    try erlang:spawn_opt(Watchdog, SpawnOptions) of
+        WatchdogPid when is_pid(WatchdogPid) -> ok
+    catch
+        _:_ -> error
+    end.
+
+execution_owner_watchdog(Owner, ExecutionWorker) ->
+    OwnerMonitor = erlang:monitor(process, Owner),
+    WorkerMonitor = erlang:monitor(process, ExecutionWorker),
+    receive
+        {'DOWN', OwnerMonitor, process, Owner, _OpaqueReason} ->
+            exit(ExecutionWorker, kill),
+            _ = erlang:demonitor(WorkerMonitor, [flush]),
+            ok;
+        {'DOWN', WorkerMonitor, process, ExecutionWorker, _OpaqueReason} ->
+            _ = erlang:demonitor(OwnerMonitor, [flush]),
+            ok
+    end.
+
+remaining_deadline(Deadline) ->
+    erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 execute_operation(#toolset{transport = Transport, auth = Auth},
                   Operation, Args) ->

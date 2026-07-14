@@ -12,6 +12,14 @@
 
 -export([request/2]).
 
+-ifdef(TEST).
+-export([test_is_public_address/1, test_resolve_target/4]).
+-endif.
+
+-define(DNS_MAX_HEAP_WORDS, 262144).
+-define(DNS_WATCHDOG_MAX_HEAP_WORDS, 8192).
+-define(MAX_DNS_ADDRESSES, 64).
+
 -spec request(adk_openapi_http_transport:handle(),
               adk_openapi_http_transport:request()) ->
     {ok, adk_openapi_http_transport:response()} | {error, term()}.
@@ -112,25 +120,166 @@ request_target(Uri) ->
 perform(Target) ->
     Deadline = erlang:monotonic_time(millisecond) + maps:get(timeout, Target),
     case resolve_target(maps:get(host, Target),
-                        maps:get(allow_private, Target)) of
+                        maps:get(allow_private, Target), Deadline) of
         {ok, Address} -> open_and_request(Address, Target, Deadline);
         {error, _} = Error -> Error
     end.
 
-resolve_target(Host, AllowPrivate) ->
-    HostString = binary_to_list(Host),
-    Addresses = resolve_family(HostString, inet) ++
-                resolve_family(HostString, inet6),
-    Unique = lists:usort(Addresses),
-    case Unique of
-        [] -> {error, dns_resolution_failed};
-        _ when AllowPrivate -> {ok, hd(Unique)};
-        _ ->
-            case lists:all(fun is_public_address/1, Unique) of
-                true -> {ok, hd(Unique)};
-                false -> {error, private_address_rejected}
-            end
+resolve_target(Host, AllowPrivate, Deadline) ->
+    resolve_target(Host, AllowPrivate, Deadline, fun system_resolver/1).
+
+resolve_target(Host, AllowPrivate, Deadline, Resolver) ->
+    case resolve_addresses(Host, Resolver, Deadline) of
+        {ok, Addresses} -> select_address(Addresses, AllowPrivate);
+        {error, _} = Error -> Error
     end.
+
+resolve_addresses(Host, Resolver, Deadline) ->
+    case remaining(Deadline) of
+        0 -> {error, timeout};
+        _ -> start_resolver(Host, Resolver, Deadline)
+    end.
+
+start_resolver(Host, Resolver, Deadline) ->
+    Owner = self(),
+    ReplyAlias = erlang:alias([explicit_unalias]),
+    Ref = make_ref(),
+    Worker = fun() ->
+        ok = start_owner_watchdog(Owner, self()),
+        Result = resolver_result(Host, Resolver),
+        CompletedAt = erlang:monotonic_time(millisecond),
+        _ = erlang:send(
+              ReplyAlias,
+              {openapi_dns_result, Ref, self(), CompletedAt, Result},
+              [noconnect, nosuspend]),
+        ok
+    end,
+    SpawnOptions =
+        [monitor, {message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => ?DNS_MAX_HEAP_WORDS, kill => true,
+            error_logger => false, include_shared_binaries => true}}],
+    try erlang:spawn_opt(Worker, SpawnOptions) of
+        {Pid, Monitor} ->
+            await_resolver(Pid, Monitor, ReplyAlias, Ref, Deadline)
+    catch
+        _:_ ->
+            _ = erlang:unalias(ReplyAlias),
+            {error, dns_resolution_failed}
+    end.
+
+start_owner_watchdog(Owner, ResolverWorker) ->
+    Watchdog = fun() -> owner_watchdog(Owner, ResolverWorker) end,
+    SpawnOptions =
+        [{message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => ?DNS_WATCHDOG_MAX_HEAP_WORDS, kill => true,
+            error_logger => false, include_shared_binaries => true}}],
+    try erlang:spawn_opt(Watchdog, SpawnOptions) of
+        WatchdogPid when is_pid(WatchdogPid) -> ok
+    catch
+        _:_ -> error
+    end.
+
+owner_watchdog(Owner, ResolverWorker) ->
+    OwnerMonitor = erlang:monitor(process, Owner),
+    WorkerMonitor = erlang:monitor(process, ResolverWorker),
+    receive
+        {'DOWN', OwnerMonitor, process, Owner, _OpaqueReason} ->
+            exit(ResolverWorker, kill),
+            _ = erlang:demonitor(WorkerMonitor, [flush]),
+            ok;
+        {'DOWN', WorkerMonitor, process, ResolverWorker, _OpaqueReason} ->
+            _ = erlang:demonitor(OwnerMonitor, [flush]),
+            ok
+    end.
+
+await_resolver(Pid, Monitor, ReplyAlias, Ref, Deadline) ->
+    receive
+        {openapi_dns_result, Ref, Pid, CompletedAt, Result} ->
+            resolver_complete(ReplyAlias, Monitor),
+            completed_resolver_result(CompletedAt, Deadline, Result);
+        {'DOWN', Monitor, process, Pid, _OpaqueReason} ->
+            _ = erlang:unalias(ReplyAlias),
+            {error, dns_resolution_failed}
+    after remaining(Deadline) ->
+        _ = erlang:unalias(ReplyAlias),
+        exit(Pid, kill),
+        _ = erlang:demonitor(Monitor, [flush]),
+        {error, timeout}
+    end.
+
+completed_resolver_result(CompletedAt, Deadline, _Result)
+  when CompletedAt > Deadline ->
+    {error, timeout};
+completed_resolver_result(_CompletedAt, _Deadline, {ok, []}) ->
+    {error, dns_resolution_failed};
+completed_resolver_result(_CompletedAt, _Deadline, {ok, Addresses}) ->
+    {ok, Addresses};
+completed_resolver_result(_CompletedAt, _Deadline, error) ->
+    {error, dns_resolution_failed}.
+
+resolver_complete(ReplyAlias, Monitor) ->
+    _ = erlang:unalias(ReplyAlias),
+    _ = erlang:demonitor(Monitor, [flush]),
+    ok.
+
+resolver_result(Host, Resolver) ->
+    %% `apply/2' keeps the isolation boundary generic: production uses the
+    %% system resolver while tests can exercise malformed or hostile results.
+    try normalize_addresses(erlang:apply(Resolver, [Host])) of
+        {ok, _Addresses} = Result -> Result;
+        error -> error
+    catch
+        _:_ -> error
+    end.
+
+-ifdef(TEST).
+normalize_addresses(Addresses) when is_list(Addresses) ->
+    bounded_addresses(Addresses, ?MAX_DNS_ADDRESSES, []);
+normalize_addresses(_Addresses) ->
+    error.
+
+bounded_addresses([], _Remaining, Acc) ->
+    {ok, lists:usort(Acc)};
+bounded_addresses(_Addresses, 0, _Acc) ->
+    error;
+bounded_addresses([Address | Rest], Remaining, Acc) ->
+    case valid_ip_address(Address) of
+        true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
+        false -> error
+    end;
+bounded_addresses(_Improper, _Remaining, _Acc) ->
+    error.
+-else.
+normalize_addresses(Addresses) ->
+    bounded_addresses(Addresses, ?MAX_DNS_ADDRESSES, []).
+
+bounded_addresses([], _Remaining, Acc) ->
+    {ok, lists:usort(Acc)};
+bounded_addresses(_Addresses, 0, _Acc) ->
+    error;
+bounded_addresses([Address | Rest], Remaining, Acc) ->
+    case valid_ip_address(Address) of
+        true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
+        false -> error
+    end.
+-endif.
+
+select_address([], _AllowPrivate) ->
+    {error, dns_resolution_failed};
+select_address(Addresses, true) ->
+    {ok, hd(Addresses)};
+select_address(Addresses, false) ->
+    case lists:all(fun is_public_address/1, Addresses) of
+        true -> {ok, hd(Addresses)};
+        false -> {error, private_address_rejected}
+    end.
+
+system_resolver(Host) ->
+    HostString = binary_to_list(Host),
+    resolve_family(HostString, inet) ++
+    resolve_family(HostString, inet6).
 
 resolve_family(Host, Family) ->
     case inet:getaddrs(Host, Family) of
@@ -186,10 +335,19 @@ send_request(Connection, Target, Deadline) ->
                          maps:get(body, Target)),
     await_response(Connection, Stream, Target, Deadline).
 
-host_header(#{scheme := <<"https">>, host := Host, port := 443}) -> Host;
-host_header(#{scheme := <<"http">>, host := Host, port := 80}) -> Host;
+host_header(#{scheme := <<"https">>, host := Host, port := 443}) ->
+    authority_host(Host);
+host_header(#{scheme := <<"http">>, host := Host, port := 80}) ->
+    authority_host(Host);
 host_header(#{host := Host, port := Port}) ->
-    <<Host/binary, ":", (integer_to_binary(Port))/binary>>.
+    AuthorityHost = authority_host(Host),
+    <<AuthorityHost/binary, ":", (integer_to_binary(Port))/binary>>.
+
+authority_host(Host) ->
+    case inet:parse_ipv6_address(binary_to_list(Host)) of
+        {ok, _Address} -> <<"[", Host/binary, "]">>;
+        {error, _} -> Host
+    end.
 
 await_response(Connection, Stream, Target, Deadline) ->
     case gun:await(Connection, Stream, remaining(Deadline)) of
@@ -246,6 +404,25 @@ has_control(Binary) ->
 lower(Binary) ->
     unicode:characters_to_binary(string:lowercase(Binary)).
 
+-ifdef(TEST).
+valid_ip_address({A, B, C, D}) ->
+    lists:all(fun valid_ipv4_part/1, [A, B, C, D]);
+valid_ip_address({A, B, C, D, E, F, G, H}) ->
+    lists:all(fun valid_ipv6_part/1, [A, B, C, D, E, F, G, H]);
+valid_ip_address(_Address) -> false.
+-else.
+valid_ip_address({A, B, C, D}) ->
+    lists:all(fun valid_ipv4_part/1, [A, B, C, D]);
+valid_ip_address({A, B, C, D, E, F, G, H}) ->
+    lists:all(fun valid_ipv6_part/1, [A, B, C, D, E, F, G, H]).
+-endif.
+
+valid_ipv4_part(Value) ->
+    is_integer(Value) andalso Value >= 0 andalso Value =< 255.
+
+valid_ipv6_part(Value) ->
+    is_integer(Value) andalso Value >= 0 andalso Value =< 16#ffff.
+
 %% Reject loopback, link-local, private, carrier-grade NAT, documentation,
 %% benchmarking, multicast, and otherwise non-global IPv4 ranges.
 is_public_address({A, _B, _C, _D}) when A =:= 0; A =:= 10; A =:= 127 -> false;
@@ -254,23 +431,53 @@ is_public_address({169, 254, _C, _D}) -> false;
 is_public_address({172, B, _C, _D}) when B >= 16, B =< 31 -> false;
 is_public_address({192, 0, 0, _D}) -> false;
 is_public_address({192, 0, 2, _D}) -> false;
+is_public_address({192, 31, 196, _D}) -> false;
+is_public_address({192, 52, 193, _D}) -> false;
+is_public_address({192, 88, 99, _D}) -> false;
 is_public_address({192, 168, _C, _D}) -> false;
 is_public_address({198, B, _C, _D}) when B =:= 18; B =:= 19 -> false;
 is_public_address({198, 51, 100, _D}) -> false;
 is_public_address({203, 0, 113, _D}) -> false;
 is_public_address({A, _B, _C, _D}) when A >= 224 -> false;
 is_public_address({_A, _B, _C, _D}) -> true;
-is_public_address({0, 0, 0, 0, 0, 0, 0, 0}) -> false;
-is_public_address({0, 0, 0, 0, 0, 0, 0, 1}) -> false;
+%% Reject IPv4-compatible and IPv4-mapped forms rather than recursively
+%% classifying their embedded address.  This prevents address-text and socket
+%% family differences from bypassing the IPv4 policy.
+is_public_address({0, _B, _C, _D, _E, _F, _G, _H}) -> false;
+%% IPv4/IPv6 translation prefixes (RFC 6052 and RFC 8215).
+is_public_address({16#0064, 16#ff9b, 0, 0, 0, 0, _G, _H}) -> false;
+is_public_address({16#0064, 16#ff9b, 1, _D, _E, _F, _G, _H}) -> false;
+%% Discard-only, protocol-assignment, benchmarking, documentation, ORCHID,
+%% deprecated 6to4/6bone, and other non-global special-purpose ranges.
+is_public_address({16#0100, 0, 0, 0, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, 0, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, 2, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, 16#0db8, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#2001, A, _C, _D, _E, _F, _G, _H})
+  when A >= 16#0010, A =< 16#002f -> false;
+is_public_address({16#2002, _B, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#3ffe, _B, _C, _D, _E, _F, _G, _H}) -> false;
+is_public_address({16#3fff, B, _C, _D, _E, _F, _G, _H})
+  when (B band 16#f000) =:= 0 -> false;
 is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
   when (A band 16#fe00) =:= 16#fc00 -> false;
 is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
   when (A band 16#ffc0) =:= 16#fe80 -> false;
 is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
   when (A band 16#ff00) =:= 16#ff00 -> false;
-is_public_address({16#2001, 16#0db8, _C, _D, _E, _F, _G, _H}) -> false;
-is_public_address({0, 0, 0, 0, 0, 16#ffff, C, D}) ->
-    is_public_address({C bsr 8, C band 16#ff,
-                       D bsr 8, D band 16#ff});
-is_public_address({_A, _B, _C, _D, _E, _F, _G, _H}) -> true;
+%% Current global unicast space is 2000::/3.  Fail closed on unallocated
+%% address space so a future special-purpose range is not silently trusted.
+is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
+  when (A band 16#e000) =:= 16#2000 -> true;
 is_public_address(_) -> false.
+
+-ifdef(TEST).
+test_is_public_address(Address) ->
+    is_public_address(Address).
+
+test_resolve_target(Host, AllowPrivate, Timeout, Resolver)
+  when is_binary(Host), is_boolean(AllowPrivate),
+       is_integer(Timeout), Timeout > 0, is_function(Resolver, 1) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    resolve_target(Host, AllowPrivate, Deadline, Resolver).
+-endif.

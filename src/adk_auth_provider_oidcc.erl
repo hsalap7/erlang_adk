@@ -9,17 +9,34 @@
 
 -export([refresh/2]).
 
+-define(MAX_TERM_BYTES, 1048576).
+-define(MAX_CLIENT_ID_BYTES, 4096).
+-define(MAX_CLIENT_SECRET_BYTES, 16384).
+-define(MAX_REFRESH_TOKEN_BYTES, 65536).
+-define(MAX_ACCESS_TOKEN_BYTES, 131072).
+-define(MAX_SUBJECT_BYTES, 4096).
+-define(MAX_TOKEN_TYPE_BYTES, 64).
+-define(MAX_EXPIRES_IN_MS, 604800000).
+-define(MAX_SCOPES, 64).
+-define(MAX_SCOPE_BYTES, 512).
+-define(MAX_RESOURCE_BYTES, 8192).
+
 -spec refresh(adk_auth_provider:credential(), adk_auth_provider:context()) ->
     {ok, adk_auth_provider:token()} | {error, term()}.
 refresh(Credential, Context) when is_map(Credential), is_map(Context) ->
-    Seeds = safe_seeds(Credential),
-    case normalize_context(Context) of
-        {ok, Provider, Adapter, Opts, Rotator} ->
-            Result = invoke_grant(Credential, Provider, Adapter, Opts,
-                                  Rotator),
-            redact_failure(Result, Seeds);
-        {error, _Reason} = Error ->
-            Error
+    case bounded_term(Credential) andalso bounded_term(Context) of
+        true ->
+            Seeds = safe_seeds(Credential),
+            case normalize_context(Context) of
+                {ok, Provider, Adapter, Opts, Rotator} ->
+                    Result = invoke_grant(Credential, Provider, Adapter, Opts,
+                                          Rotator),
+                    redact_failure(Result, Seeds);
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        false ->
+            {error, invalid_credential}
     end;
 refresh(_Credential, _Context) ->
     {error, invalid_credential}.
@@ -29,7 +46,9 @@ invoke_grant(#{kind := oauth_client_credentials,
                client_secret := ClientSecret} = Credential,
              Provider, Adapter, Opts, _Rotator)
   when is_binary(ClientId), byte_size(ClientId) > 0,
-       is_binary(ClientSecret), byte_size(ClientSecret) > 0 ->
+       byte_size(ClientId) =< ?MAX_CLIENT_ID_BYTES,
+       is_binary(ClientSecret), byte_size(ClientSecret) > 0,
+       byte_size(ClientSecret) =< ?MAX_CLIENT_SECRET_BYTES ->
     case exact_keys(Credential, [kind, client_id, client_secret]) of
         true ->
             safe_adapter_call(
@@ -46,9 +65,13 @@ invoke_grant(#{kind := oauth_refresh_token,
                expected_subject := ExpectedSubject} = Credential,
              Provider, Adapter, Opts, Rotator)
   when is_binary(ClientId), byte_size(ClientId) > 0,
+       byte_size(ClientId) =< ?MAX_CLIENT_ID_BYTES,
        is_binary(ClientSecret), byte_size(ClientSecret) > 0,
+       byte_size(ClientSecret) =< ?MAX_CLIENT_SECRET_BYTES,
        is_binary(RefreshToken), byte_size(RefreshToken) > 0,
-       is_binary(ExpectedSubject), byte_size(ExpectedSubject) > 0 ->
+       byte_size(RefreshToken) =< ?MAX_REFRESH_TOKEN_BYTES,
+       is_binary(ExpectedSubject), byte_size(ExpectedSubject) > 0,
+       byte_size(ExpectedSubject) =< ?MAX_SUBJECT_BYTES ->
     case exact_keys(Credential,
                     [kind, client_id, client_secret, refresh_token,
                      expected_subject]) of
@@ -75,7 +98,11 @@ invoke_grant(_Credential, _Provider, _Adapter, _Opts, _Rotator) ->
 safe_adapter_call(Call, RotationPolicy) ->
     try Call() of
         {ok, Token} -> normalize_token(Token, RotationPolicy);
-        {error, Reason} -> {error, Reason};
+        {error, Reason} = Failure ->
+            case bounded_term(Failure) of
+                true -> {error, Reason};
+                false -> {error, invalid_provider_response}
+            end;
         _Other -> {error, invalid_provider_response}
     catch
         _:_ -> {error, oauth_request_failed}
@@ -84,9 +111,11 @@ safe_adapter_call(Call, RotationPolicy) ->
 normalize_token(#{access_token := AccessToken,
                   expires_in_ms := ExpiresIn} = Token, RotationPolicy)
   when is_binary(AccessToken), byte_size(AccessToken) > 0,
-       is_integer(ExpiresIn), ExpiresIn > 0 ->
+       byte_size(AccessToken) =< ?MAX_ACCESS_TOKEN_BYTES,
+       is_integer(ExpiresIn), ExpiresIn > 0,
+       ExpiresIn =< ?MAX_EXPIRES_IN_MS ->
     TokenType = maps:get(token_type, Token, <<"Bearer">>),
-    case is_binary(TokenType) andalso byte_size(TokenType) > 0 of
+    case bounded_term(Token) andalso valid_token_type(TokenType) of
         true ->
             Sanitized = #{access_token => AccessToken,
                           expires_in_ms => ExpiresIn,
@@ -110,7 +139,9 @@ apply_rotation(Token, Sanitized,
         error ->
             {ok, Sanitized};
         {ok, RefreshToken} when is_binary(RefreshToken),
-                                byte_size(RefreshToken) > 0 ->
+                                byte_size(RefreshToken) > 0,
+                                byte_size(RefreshToken) =<
+                                    ?MAX_REFRESH_TOKEN_BYTES ->
             case safe_rotate(Rotator, ExpectedCredential, RefreshToken) of
                 ok -> {ok, Sanitized};
                 {error, conflict} -> {error, credential_rotation_conflict};
@@ -134,12 +165,18 @@ normalize_context(Context) ->
     Provider = maps:get(provider_worker, Context, undefined),
     Adapter = maps:get(oauth_adapter, Context, adk_oidcc_oauth_adapter),
     Scopes = maps:get(scopes, Context, []),
+    Resource = maps:get(resource, Context, undefined),
     Rotator = maps:get(credential_rotator, Context, undefined),
     case valid_server_ref(Provider) andalso is_atom(Adapter) andalso
          Adapter =/= undefined andalso valid_scopes(Scopes) andalso
-         valid_rotator(Rotator) of
-        true -> {ok, Provider, Adapter, #{scope => lists:usort(Scopes)},
-                 Rotator};
+         valid_resource(Resource) andalso valid_rotator(Rotator) of
+        true ->
+            Opts0 = #{scope => lists:usort(Scopes)},
+            Opts = case Resource of
+                undefined -> Opts0;
+                _ -> Opts0#{resource => Resource}
+            end,
+            {ok, Provider, Adapter, Opts, Rotator};
         false -> {error, invalid_context}
     end.
 
@@ -161,13 +198,47 @@ valid_server_ref(Ref) when is_pid(Ref) -> true;
 valid_server_ref(Ref) when is_atom(Ref) -> Ref =/= undefined;
 valid_server_ref(_Ref) -> false.
 
-valid_scopes([]) -> true;
-valid_scopes([Scope | Rest]) when is_binary(Scope), byte_size(Scope) > 0 ->
-    valid_scopes(Rest);
+valid_scopes(Scopes) when is_list(Scopes), length(Scopes) =< ?MAX_SCOPES ->
+    lists:all(
+      fun(Scope) ->
+          is_binary(Scope) andalso byte_size(Scope) > 0 andalso
+          byte_size(Scope) =< ?MAX_SCOPE_BYTES
+      end, Scopes) andalso
+    length(Scopes) =:= length(lists:usort(Scopes));
 valid_scopes(_Scopes) -> false.
 
 valid_rotator(undefined) -> true;
 valid_rotator(Rotator) -> is_function(Rotator, 2).
 
+valid_resource(undefined) -> true;
+valid_resource(Resource) when is_binary(Resource) ->
+    byte_size(Resource) > 0 andalso
+    byte_size(Resource) =< ?MAX_RESOURCE_BYTES;
+valid_resource(_Resource) -> false.
+
+bounded_term(Term) ->
+    try erlang:external_size(Term) =< ?MAX_TERM_BYTES
+    catch _:_ -> false
+    end.
+
 exact_keys(Map, Keys) ->
     lists:sort(maps:keys(Map)) =:= lists:sort(Keys).
+
+valid_token_type(TokenType)
+  when is_binary(TokenType), byte_size(TokenType) > 0,
+       byte_size(TokenType) =< ?MAX_TOKEN_TYPE_BYTES ->
+    token_chars(TokenType);
+valid_token_type(_TokenType) -> false.
+
+token_chars(<<>>) -> true;
+token_chars(<<Char, Rest/binary>>)
+  when (Char >= $a andalso Char =< $z) orelse
+       (Char >= $A andalso Char =< $Z) orelse
+       (Char >= $0 andalso Char =< $9) orelse
+       Char =:= $! orelse Char =:= $# orelse Char =:= $$ orelse
+       Char =:= $% orelse Char =:= $& orelse Char =:= $' orelse
+       Char =:= $* orelse Char =:= $+ orelse Char =:= $- orelse
+       Char =:= $. orelse Char =:= $^ orelse Char =:= $_ orelse
+       Char =:= $` orelse Char =:= $| orelse Char =:= $~ ->
+    token_chars(Rest);
+token_chars(_TokenType) -> false.

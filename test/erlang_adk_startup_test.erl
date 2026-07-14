@@ -9,6 +9,8 @@
          a2a_v1_server_options, a2a_v1_auth,
          a2a_v1_jwt_policy,
          a2a_v1_max_body_bytes, a2a_v1_sse_heartbeat_ms,
+         a2a_v1_max_extensions, a2a_v1_max_extension_header_bytes,
+         a2a_v1_auth_timeout_ms, a2a_v1_auth_max_heap_words,
          a2a_v1_agent_name,
          dev_enabled, dev_auth_token, dev_auth_token_env,
          dev_session_service, dev_runner_options, dev_run_options,
@@ -17,6 +19,7 @@
          dev_resource_provider, dev_max_resource_results,
          dev_diagnostic_timeout_ms, dev_diagnostic_context_policy,
          a2a_port, a2a_ip, a2a_max_body_bytes,
+         a2a_allow_non_loopback, a2a_trusted_tls_proxy, a2a_tls_options,
          a2a_num_acceptors, a2a_max_connections, a2a_request_timeout,
          a2a_idle_timeout, a2a_max_keepalive]).
 
@@ -41,6 +44,8 @@ secure_startup() ->
         default_startup_is_lean(),
         invalid_oidc_clock_skew_fails_startup(),
         configured_mnesia_startup(TempMnesiaDir),
+        developer_listener_is_always_loopback(),
+        a2a_v1_public_listener_fails_closed(),
         supervised_http_is_bounded(),
         supervised_dev_listener_is_authenticated(),
         supervised_a2a_v1_is_discoverable()
@@ -95,6 +100,116 @@ configured_mnesia_startup(TempMnesiaDir) ->
     stop_application(erlang_adk),
     stop_application(mnesia),
     application:unset_env(erlang_adk, session_backend).
+
+developer_listener_is_always_loopback() ->
+    Port = free_port(),
+    application:set_env(erlang_adk, a2a_enabled, false),
+    application:set_env(erlang_adk, a2a_v1_enabled, false),
+    application:set_env(erlang_adk, dev_enabled, true),
+    application:set_env(erlang_adk, dev_auth_token, ?DEV_TOKEN),
+    application:set_env(erlang_adk, a2a_port, Port),
+    application:set_env(erlang_adk, a2a_ip, {0, 0, 0, 0}),
+
+    %% The direct listener API is not a bypass around the CLI's loopback
+    %% parser.
+    ?assertEqual({error, developer_server_must_bind_loopback},
+                 isolated_http_start()),
+
+    %% The OTP application path fails on the same invariant before Cowboy can
+    %% open a socket.
+    ApplicationResult = application:ensure_all_started(erlang_adk),
+    ?assertMatch({error, _}, ApplicationResult),
+    ?assert(reason_in_term(developer_server_must_bind_loopback,
+                           ApplicationResult)),
+    ?assertNot(application_running(erlang_adk)),
+
+    %% The legacy A2A route cannot turn a shared /dev listener into a public
+    %% endpoint either.
+    application:set_env(erlang_adk, a2a_enabled, true),
+    ?assertEqual({error, developer_server_must_bind_loopback},
+                 isolated_http_start()),
+
+    application:set_env(erlang_adk, a2a_enabled, false),
+    application:set_env(erlang_adk, dev_enabled, false),
+    application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
+    application:unset_env(erlang_adk, dev_auth_token).
+
+a2a_v1_public_listener_fails_closed() ->
+    Port = free_port(),
+    SecuritySchemes = #{
+      <<"bearer">> => #{
+        <<"httpAuthSecurityScheme">> => #{<<"scheme">> => <<"Bearer">>}}},
+    SecurityRequirements = [
+      #{<<"schemes">> =>
+            #{<<"bearer">> => #{<<"list">> => [<<"a2a.invoke">>]}}}],
+    {ok, PublicCard} = adk_a2a_v1_card:new(
+                         #{url => <<"https://agent.example/a2a/v1">>,
+                           security_schemes => SecuritySchemes,
+                           security_requirements => SecurityRequirements}),
+    {ok, AnonymousCard} = adk_a2a_v1_card:new(
+                            #{url => <<"http://127.0.0.1/a2a/v1">>}),
+    application:set_env(erlang_adk, a2a_enabled, false),
+    application:set_env(erlang_adk, a2a_v1_enabled, true),
+    application:set_env(erlang_adk, dev_enabled, false),
+    application:set_env(erlang_adk, a2a_port, Port),
+    application:set_env(erlang_adk, a2a_ip, {0, 0, 0, 0}),
+    application:set_env(erlang_adk, a2a_v1_card, PublicCard),
+    application:set_env(erlang_adk, a2a_v1_auth, adk_a2a_v1_test_auth),
+    application:set_env(erlang_adk, a2a_allow_non_loopback, false),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, true),
+    ?assertMatch(
+       {error, non_loopback_a2a_v1_requires_explicit_opt_in},
+       isolated_http_start()),
+
+    application:set_env(erlang_adk, a2a_v1_card, AnonymousCard),
+    ?assertMatch({error, a2a_v1_auth_card_mismatch},
+                 isolated_http_start()),
+    application:set_env(erlang_adk, a2a_v1_card, PublicCard),
+
+    application:set_env(erlang_adk, a2a_allow_non_loopback, true),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, false),
+    ?assertMatch({error, non_loopback_a2a_v1_requires_tls},
+                 isolated_http_start()),
+
+    application:set_env(erlang_adk, dev_enabled, true),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, true),
+    ?assertMatch({error, public_a2a_v1_requires_dedicated_listener},
+                 isolated_http_start()),
+
+    application:set_env(erlang_adk, dev_enabled, false),
+    application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
+    application:set_env(erlang_adk, a2a_v1_card,
+                        AnonymousCard#{
+                          <<"securitySchemes">> => SecuritySchemes,
+                          <<"securityRequirements">> =>
+                              SecurityRequirements}),
+    application:set_env(erlang_adk, a2a_v1_auth, none),
+    ?assertMatch({error, a2a_v1_auth_card_mismatch},
+                 isolated_http_start()),
+
+    application:set_env(erlang_adk, a2a_v1_enabled, false),
+    application:set_env(erlang_adk, a2a_allow_non_loopback, false),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, false),
+    application:unset_env(erlang_adk, a2a_v1_card),
+    application:unset_env(erlang_adk, a2a_v1_auth).
+
+isolated_http_start() ->
+    Parent = self(),
+    Ref = make_ref(),
+    {Pid, Monitor} = spawn_monitor(
+                       fun() ->
+                           process_flag(trap_exit, true),
+                           Parent ! {Ref, erlang_adk_http:start_link()}
+                       end),
+    Result = receive
+        {Ref, Value} -> Value
+    after 5000 -> timeout
+    end,
+    receive
+        {'DOWN', Monitor, process, Pid, _} -> ok
+    after 5000 -> ok
+    end,
+    Result.
 
 supervised_http_is_bounded() ->
     Port = free_port(),
@@ -218,7 +333,8 @@ supervised_a2a_v1_is_discoverable() ->
     {ok, _} = application:ensure_all_started(erlang_adk),
     ?assert(supervised_child_present(adk_a2a_v1_server)),
     ?assert(supervised_child_present(erlang_adk_http)),
-    {ok, Discovered} = adk_a2a_v1_client:discover(Base),
+    LocalClient = #{timeout => 3000, allow_http_loopback => true},
+    {ok, Discovered} = adk_a2a_v1_client:discover(Base, LocalClient),
     ?assertEqual(Card, Discovered),
     {ok, #{<<"task">> := Task}} = adk_a2a_v1_client:send(
                                       Discovered,
@@ -226,7 +342,7 @@ supervised_a2a_v1_is_discoverable() ->
                                         <<"role">> => <<"ROLE_USER">>,
                                         <<"parts">> =>
                                             [#{<<"text">> => <<"hello">>}]},
-                                      #{timeout => 3000}),
+                                      LocalClient),
     ?assertEqual(
        <<"TASK_STATE_COMPLETED">>,
        maps:get(<<"state">>, maps:get(<<"status">>, Task))),
@@ -248,6 +364,21 @@ free_port() ->
 
 application_running(Application) ->
     lists:keymember(Application, 1, application:which_applications()).
+
+reason_in_term(Expected, Expected) ->
+    true;
+reason_in_term(Expected, Tuple) when is_tuple(Tuple) ->
+    lists:any(fun(Value) -> reason_in_term(Expected, Value) end,
+              tuple_to_list(Tuple));
+reason_in_term(Expected, List) when is_list(List) ->
+    lists:any(fun(Value) -> reason_in_term(Expected, Value) end, List);
+reason_in_term(Expected, Map) when is_map(Map) ->
+    lists:any(fun({Key, Value}) ->
+                  reason_in_term(Expected, Key) orelse
+                  reason_in_term(Expected, Value)
+              end, maps:to_list(Map));
+reason_in_term(_Expected, _Term) ->
+    false.
 
 stop_application(Application) ->
     case application:stop(Application) of

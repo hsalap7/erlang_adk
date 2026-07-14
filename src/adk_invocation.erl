@@ -60,7 +60,13 @@ init(InvocationRef) when is_reference(InvocationRef) ->
 accept_handoff(From, RunId, Request, Opts) ->
     case validate_init(RunId, Request, Opts) of
         {ok, Config} ->
-            case adk_run_registry:register(RunId, self()) of
+            OwnerScope = maps:get(owner_scope, Config, undefined),
+            RegistryMetadata = case OwnerScope of
+                undefined -> #{};
+                Scope -> #{owner_scope => Scope}
+            end,
+            case adk_run_registry:register(
+                   RunId, self(), RegistryMetadata) of
                 ok ->
                     Data = #{
                         run_id => RunId,
@@ -87,6 +93,7 @@ accept_handoff(From, RunId, Request, Opts) ->
                         cancel_timer => undefined,
                         parent_run_id => maps:get(parent_run_id, Request,
                                                   undefined),
+                        owner_scope => OwnerScope,
                         resumed_to => undefined
                     },
                     {next_state, running, Data,
@@ -254,8 +261,9 @@ handle_event({call, From},
                    Runner, UserId, SessionId, InvocationId,
                    ToolResponse) of
                 ok ->
+                    ResumeOpts = inherit_owner_scope(Opts, Data),
                     case safe_start_resumed_invocation(
-                           NewRunId, ResumeRequest, Opts) of
+                           NewRunId, ResumeRequest, ResumeOpts) of
                         ok ->
                             {keep_state, Data#{resumed_to => NewRunId},
                              [{reply, From, {ok, NewRunId}}]};
@@ -441,19 +449,24 @@ validate_init(RunId, Request, Opts)
                               ?DEFAULT_MAX_BUFFERED_EVENTS)),
             CancelGrace = maps:get(cancel_grace_ms, Opts,
                                    ?DEFAULT_CANCEL_GRACE_MS),
-            validate_options(Retention, MaxBuffered, CancelGrace)
+            OwnerScope = maps:get(owner_scope, Opts, undefined),
+            validate_options(Retention, MaxBuffered, CancelGrace,
+                             OwnerScope)
     end;
 validate_init(_RunId, _Request, _Opts) ->
     {error, invalid_invocation_arguments}.
 
-validate_options(Retention, MaxBuffered, CancelGrace)
+validate_options(Retention, MaxBuffered, CancelGrace, OwnerScope)
   when is_integer(Retention), Retention >= 0,
        is_integer(MaxBuffered), MaxBuffered >= 0,
-       is_integer(CancelGrace), CancelGrace >= 0 ->
+       is_integer(CancelGrace), CancelGrace >= 0,
+       (OwnerScope =:= undefined orelse
+        (is_binary(OwnerScope) andalso byte_size(OwnerScope) =:= 32)) ->
     {ok, #{retention_ms => Retention,
            max_buffered_events => MaxBuffered,
-           cancel_grace_ms => CancelGrace}};
-validate_options(_Retention, _MaxBuffered, _CancelGrace) ->
+           cancel_grace_ms => CancelGrace,
+           owner_scope => OwnerScope}};
+validate_options(_Retention, _MaxBuffered, _CancelGrace, _OwnerScope) ->
     {error, invalid_invocation_options}.
 
 record_event(Event, Data0) ->
@@ -772,3 +785,8 @@ cancel_timer(undefined) ->
 cancel_timer(Timer) ->
     _ = erlang:cancel_timer(Timer),
     ok.
+
+inherit_owner_scope(Opts, #{owner_scope := undefined}) ->
+    maps:remove(owner_scope, Opts);
+inherit_owner_scope(Opts, #{owner_scope := OwnerScope}) ->
+    Opts#{owner_scope => OwnerScope}.

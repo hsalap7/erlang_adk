@@ -1,7 +1,7 @@
 # ADK behavior-parity matrix
 
-This is the living feature inventory for Erlang ADK 0.5.0 development. It
-records what the `version_0.5.0` branch proves now, not the intended end-state
+This is the living feature inventory for Erlang ADK 0.6.0 development. It
+records what the `version_0.6.0` branch proves now, not the intended end-state
 of the release. It follows the externally observable capability families in
 the official [Agent Development Kit documentation](https://adk.dev/), while deliberately
 using OTP processes, supervision, monitors, and message passing instead of
@@ -12,19 +12,19 @@ Status meanings:
 - **Implemented**: public Erlang API and deterministic coverage exist.
 - **Partial**: useful, release-safe core behavior exists, but this upstream
   capability family is not claimed in full. The documented omissions are not
-  necessarily blockers for the Erlang 0.5.0 contract.
+  necessarily blockers for the Erlang 0.6.0 contract.
 - **In progress**: an implementation slice is present or being developed, but
   its required deterministic gate has not completed and no release claim is
   made yet.
-- **Planned**: the behavior contract is identified for 0.5.0, but it is not
+- **Planned**: the behavior contract is identified for 0.6.0, but it is not
   implemented yet.
 - **Planned adapter**: the core extension contract is identified, but a
   provider- or deployment-specific implementation is intentionally outside the
-  0.5.0 core.
+  0.6.0 core.
 - **Adapter**: the core defines the contract; provider-specific coverage may be
   delivered separately.
 - **Deferred experimental**: the corresponding upstream feature is
-  experimental or outside the 0.5.0 runtime contract and is not represented as
+  experimental or outside the 0.6.0 runtime contract and is not represented as
   silently supported.
 
 The upstream comparison follows the current ADK capability families. It
@@ -55,17 +55,24 @@ behavior, EUnit/Common Test coverage, and Dialyzer checks pass.
 
 The completed 0.4 clean gate passed 654 EUnit tests, four Common Test scenarios
 (including 1,000 stable correlated invocations), and warning-free Dialyzer
-analysis over 134 project files. The final 0.5 clean gate passes 765 EUnit
+analysis over 134 project files. The final 0.5 clean gate passed 765 EUnit
 tests, six Common Test scenarios, and warning-free Dialyzer over 160 project
-files. Escript packaging, `adk doctor`, and checked agent-config validation
-also pass. The full opt-in `gemini-3.1-flash-lite` run passes 14 of 16 cases;
+files. The final v0.6 clean gate passes 899 EUnit tests, six Common Test
+scenarios, and warning-free Dialyzer over 170 project files. Escript packaging,
+`adk doctor`, checked agent-config validation, focused README/stress gates, 46
+Phoenix tests, production assets, Phoenix release assembly, and a loopback
+production-release health check in both trusted-proxy and direct-TLS modes
+also pass. The
+full opt-in `gemini-3.1-flash-lite` run passes 14 of 16 cases;
 Google Search grounding and context-cache creation are explicit HTTP 429
 quota/rate-limit failures after one bounded retry, with no skips. Skips and
-provider/quota failures are not counted as passes.
+provider/quota failures are not counted as passes. The Phoenix dependency
+audit remains non-zero for the two documented Cowlib 2.18.0 advisories and is
+recorded as an explicit exception, not a passing gate.
 
 ## Build agents
 
-| Capability family | 0.5.0 development status | Erlang-native contract |
+| Capability family | 0.6.0 development status | Erlang-native contract |
 | --- | --- | --- |
 | LLM agents and static instructions | Implemented | Agent contracts compile once as immutable configuration. Fresh `invoke/3` calls use exact `{app_name, user_id, session_id}` lanes: one lane is FIFO, different lanes overlap up to a bounded default of 32, and ready lanes are admitted fairly. Unscoped fresh calls use one deterministic lane; direct compatibility calls retain their separate stateful FIFO. Model-visible tools are assessed separately below. |
 | Dynamic/global instructions and state/artifact templating | Implemented | Static and bounded dynamic instructions resolve per invocation from an exact, secret-scrubbed scope without mutating agent configuration. A root `global_instruction` is prepended locally and carried explicitly across delegated BEAM-process boundaries; a child uses its own global instruction only when independently invoked as a root. |
@@ -85,29 +92,30 @@ provider/quota failures are not counted as passes.
 
 ## Run agents
 
-| Capability family | 0.5.0 development status | Erlang-native contract |
+| Capability family | 0.6.0 development status | Erlang-native contract |
 | --- | --- | --- |
 | Sync, async, streaming runs | Implemented | One independently supervised invocation per accepted run. Provider streaming executes outside the agent mailbox; correlated partials are replayable while one immutable final snapshot supplies the outcome exactly once. |
 | Stable run ID, status, subscribe, replay, await | Implemented | Bounded replay, credit/ack delivery, explicit replay gaps, and subscriber monitoring; browser/caller lifetime is detached. |
 | Cancel and absolute deadlines | Implemented | Cancellation reaches monitored workers and every run commits exactly one terminal outcome. |
 | Resume agents | Implemented | Multiple pauses are correlated by invocation ID; a paused stable run resumes as one linked supervised run and replay is rejected. |
 | Runtime configuration and admission control | Implemented | One supervised controller enforces monitored global/per-agent permits with immediate reject or bounded oldest-eligible FIFO queueing, absolute deadlines, cancellation, and owner/caller crash cleanup. |
-| Web interface | Implemented | Opt-in dependency-free Erlang UI supports chat, traces, session inspection, cancellation, bounded credit-based replay/reconnect, approval/resume, redacted context diagnostics, content-free compaction/cache lifecycle, confirmed exact cache-scope invalidation, metadata-only artifact inspection/delete, and scoped memory search/erase. Resource services are resolved by an exact-scope provider; bytes, prompt content, policies, leases, provider resource names, and handles are not returned. Cache invalidation is anchored to an inspected session but deliberately spans that provider/app/user/model/policy scope across sessions. |
+| Local developer web interface | Implemented local tool | The opt-in dependency-free Erlang `/dev` UI supports chat, traces, session inspection, cancellation, bounded server-side credit/replay, approval/resume, and redacted resource diagnostics. Every startup path is loopback-only, browser transcripts/reconnect attempts are bounded, manual attach preserves its cursor, and unknown pause types fail closed. Its shared bearer is local administrator authentication, not per-user production authorization. |
+| Production web gateway | Implemented agent-run surface | `adk_scope_authorizer` validates issuer-bound principals and exact operation scopes. `adk_web_gateway` resolves a server-owned agent catalog, derives `user_id` from the authenticated OIDC principal, and binds stable/resumed runs to an opaque owner scope; cross-owner lookup is indistinguishable from not found. Authorization runs in caller-monitored, timeout/heap/result-bounded lightweight workers with explicit concurrent admission, so a slow custom policy cannot wedge unrelated LiveViews. The checked Phoenix companion uses this boundary for list/start/status/subscribe/ack/cancel/resume and typed decisions. Exact-scope artifact/memory/context administration plus durable audit/revocation are intentionally still separate privileged APIs/adapters. |
 | Command line and API server | Implemented | Authenticated REST/SSE replay plus `run`, `serve`, scoped `inspect` (including context lifecycle), exact cache-scope invalidation, artifact delete, memory search/erase, `cancel`, `resume`, `evaluate`, `config validate`, and `doctor` CLI commands are packaged in the `adk` escript. Destructive calls require an exact matching confirmation object. |
-| Visual workflow builder | Deferred experimental | The upstream visual builder and its Agent Config format are experimental. Erlang ADK 0.5.0 provides an inspectable developer UI and declarative workflow APIs, but does not claim drag-and-drop code generation. |
+| Visual workflow builder | Deferred experimental | The upstream visual builder and its Agent Config format are experimental. Erlang ADK 0.6.0 provides an inspectable developer UI and declarative workflow APIs, but does not claim drag-and-drop code generation. |
 | Ambient/background agents | Implemented | The local/event runtime owns stable event references, bounded concurrency/queue/retention/bytes/waiters, one absolute deadline, idempotency, monitored retry, status/await/cancel, and explicit per-event/explicit/shared session policy. A supervised fixed-delay source is included; `adk_trigger_source` keeps Pub/Sub, Eventarc, Kafka, RabbitMQ, and cloud scheduler transports as backpressured application adapters without SDK dependencies. Durable distributed dedupe/trigger registration and provider delivery acknowledgements remain adapter responsibilities. |
 
 ## Components
 
-| Capability family | 0.5.0 development status | Erlang-native contract |
+| Capability family | 0.6.0 development status | Erlang-native contract |
 | --- | --- | --- |
 | Function tools and agent tools | Partial | Erlang modules and dynamic toolsets compile normalized schemas into an immutable versioned catalog snapshot; module schemas are cached by loaded BEAM version. Duplicate/invalid schemas identify their sources, complete provider call batches and arguments are validated before callbacks or side effects, and dynamic removal fails closed as `tool_catalog_changed`. At the Gemini boundary only a small positive legacy subset uses `parameters`; schemas containing `oneOf`, `additionalProperties`, type unions, boolean subschemas, top-level boolean roots, or any unknown keyword use `parametersJsonSchema` without weakening local validation. Local modules may declare least-authority state/artifact/memory context operations and receive only a scope-bound opaque token; remote tools receive no local handles. Modules without a declaration retain an explicit 0.5 compatibility context. `refresh/1` builds a replacement snapshot, but a running agent cannot atomically swap catalogs, so additions are not advertised until recreation/replacement. AgentTool calls use invocation-scoped history and the same argument boundary. |
 | Parallel tool performance | Partial | Runner executes only explicitly parallel-safe tools with bounded fan-out and stable result order. The direct compatibility path and catalog-wide callback/error semantics are not yet aligned. |
 | Long-running tools | Partial | Runner provides invocation/action correlation, atomic single-claim terminal resume, correlated non-terminal updates, and Mnesia restart/resume coverage. An already-consumed continuation is rejected rather than returning an identical cached result, and non-Runner agent or typed-workflow tool paths do not provide universal durable continuation parity. |
 | Per-call tool confirmation | Partial | Modules support static and argument-aware confirmation callbacks, and dynamic calls may carry validated internal confirmation metadata. After schema and runtime-policy checks, a required call becomes a serial/parallel barrier before lifecycle callbacks and execution. Dynamic metadata is obtained from a policy-admitted resolver, which may acquire scoped credentials but must remain free of business side effects. A resolved local module's declaration is combined fail-closed with metadata, preventing a toolset alias from weakening confirmation or ancestry. Runner/stable-run pauses with an opaque action ID; invalid boolean replies preserve the continuation, approval freshly resolves and rechecks policy before exactly one execution, and rejection returns a correlated structural response without callbacks or execution. Restoration failures are reported explicitly. A confirmed tool may enter a second long-running pause. The developer UI sends the typed boolean payload. Non-Runner agent execution (`prompt`, fresh `invoke`, delegation, and AgentTool-backed child calls) and typed-workflow tool actions fail closed with `tool_confirmation_requires_runner`; structured modify payloads and non-Runner pause/resume are not implemented. |
-| Tool authentication | Partial | Per-principal credentials use opaque references and private storage, and OpenAPI auth is routed out of band. A catalog-wide proof that no schema/callback/error path can expose credentials and broader adapter behavior remain incomplete. |
-| OpenAPI toolsets | Partial | OpenAPI 3.0/3.1 compilation, local references, deterministic schemas, JSON operations, SSRF-resistant Gun transport, and API-key/bearer/OAuth routing are covered. Catalog-wide argument semantics, dynamic authentication behavior, and broader media/auth schemes are not claimed. |
-| MCP tools | Partial | Supervised stdio and Streamable HTTP clients plus a bounded loopback-first server implement the covered lifecycle, schema, resource, prompt, JSON-RPC, Origin, auth, body, deadline, and concurrency cases. After HTTP session loss, only allowlisted read-like operations are retried automatically. `tools/call` and unknown/mutating methods establish a replacement session but return `{mcp_session_lost, request_not_replayed}`. HTTP request serialization, bounded pending work, and live catalog replacement remain open. |
+| Tool authentication | Partial | Per-principal credentials use opaque references and private bounded storage. Trusted immutable provider profiles enforce grant/scope/resource/TTL policy, single-flight refresh and CAS rotation run in supervised bounded workers, and OpenAPI credentials remain out of model-visible schemas and arguments. The bundled ETS store is volatile; durable encrypted storage, provider revocation, and a catalog-wide proof over every application callback remain adapters/open audit work. |
+| OpenAPI toolsets | Partial | OpenAPI 3.0/3.1 compilation, local references, deterministic schemas, JSON operations, SSRF-resistant Gun transport, private immutable API-key/bearer/OAuth profiles, bounded concurrent auth workers, strict version parsing, redirect/method/IPv6 handling, and regression limits are covered. Broader media/auth schemes and complete OpenAPI semantics are not claimed. |
+| MCP tools | Partial | Supervised stdio and MCP 2025-11-25 Streamable HTTP clients plus a bounded loopback-first server implement the covered lifecycle, schema, resource, prompt, JSON-RPC, Origin, principal-bound session, version-negotiation, RFC 9728 metadata/challenge, TLS/DNS/redirect/token-isolation, body, deadline, and concurrency cases. Client authentication/DNS and server authentication/authorization/tool/resource/prompt callbacks are off-heap/heap/result bounded, use absolute completion timestamps and aliases, and die with their request owner. Clear HTTP is an explicit all-loopback opt-in; a non-loopback server requires authentication plus direct TLS or an explicit trusted-proxy assertion. After session loss, only allowlisted read-like operations are retried automatically; mutating calls are not replayed. Automatic client-side OAuth discovery/PKCE, incremental concurrent SSE delivery, and live catalog replacement remain open. |
 | Versioned artifacts | Partial | Strict app/user/session scopes, monotonic immutable versions, shared validation, quotas, metadata pagination, deadline-aware writes, ETS/filesystem adapters, atomic reader-visible filesystem publication/repair, least-authority context helpers, metadata-only event effects, bounded one-next-request model attachment, and exact-scope developer inspect/delete are implemented. Name-page envelopes carry exact scope provenance; capability and developer projections reject an envelope or record whose embedded scope/name differs from the bound request, and malformed bare names also fail closed. Durable multi-instance-safe filesystem slots cap lifetime scopes per root and names per scope at `max_scan_entries div 2`; reservations cap versions per scoped name at `max_scan_entries div 3`. Exhaustion returns a scope/name/version-specific capacity error before listing/repair scan exhaustion, and deletion does not replenish these lifetime slots. Deterministic attachment persistence coverage and the targeted live Gemini selection case pass. The direct reference adapters serialize operations per service process; the opt-in bounded `adk_artifact_sharded` wrapper instead gives each exact scope a stable supervised worker, preserves same-scope ordering, and lets unrelated scopes overlap over ETS or filesystem storage. A caller-monitor guard releases cold-route admission on death/timeout and prevents a stale queued route from creating an abandoned shard. Its quotas are per shard, not globally aggregated. Credit/ack blob streaming, portable directory-fsync guarantees, raw developer upload/download, and complete durable orphan recovery after event-persistence failure remain open. |
 | Sessions and scoped state | Partial | ETS/Mnesia scopes, HMAC snapshot cursors, filters, pagination, and immutable rewind/branch are implemented; schema migration and configurable conflict policies remain explicit adapters. |
 | Events | Implemented | Versioned JSON-safe schema with checked encoding and legacy decoding. |
@@ -116,17 +124,17 @@ provider/quota failures are not counted as passes.
 | Context compression and caching | Partial | Compression is owner/deadline/heap/input/output bounded and produces an explicit context fingerprint. Opt-in Runner compaction preserves complete recent exchanges and atomically replaces only an expected session prefix through the bundled ETS/Mnesia backends, persisting a versioned summary/checkpoint. An owner-bound provider-request-prefix cache provides TTL, single flight, isolation, invalidation, private leases, bypass/error policies, and an explicit Runner/Gemini contract without caching model answers. Before installing a provider result it synchronously rechecks every absolute waiter deadline; when all have expired, it deletes the orphan provider resource instead of retaining an unreachable entry. Deterministic exact-wire create/reuse/bypass/generate/stream coverage passes. In the full 2026-07-14 live run, cached-content creation received HTTP 429 after its one bounded retry, so the case failed as rate-limited and is not a live pass; 14 of the 16 live cases passed, with Google Search grounding the other 429 failure. |
 | App callbacks | Implemented | Existing local callbacks remain compatible. Runner-global plugins precede corresponding local callbacks, intervention skips the local callback, and local callbacks run in monitored timeout/heap-bounded workers over credential-free projected values. |
 | Plugins | Implemented | Ordered Runner-global run/agent/model/tool/event/error hooks compile once, run in monitored timeout/heap-bounded processes, support open/closed failures and observe/intervene modes, and preserve final event/schema invariants. |
-| Agent skills | Deferred experimental | Upstream Skills are experimental. A future adapter must provide incremental discovery/loading plus an explicit filesystem/remote trust policy; 0.5.0 does not reinterpret ordinary prompts or MCP resources as Skills. |
+| Agent skills | Deferred experimental | Upstream Skills are experimental. A future adapter must provide incremental discovery/loading plus an explicit filesystem/remote trust policy; 0.6.0 does not reinterpret ordinary prompts or MCP resources as Skills. |
 | Agent optimization | Adapter | Eval sets, trajectories, metrics, judges, and saved results provide the measurement contract. Automated instruction mutation/samplers and provider-specific optimizers are separate, auditable adapters. |
 
 ## Interoperability, operations, and safety
 
-| Capability family | 0.5.0 development status | Erlang-native contract |
+| Capability family | 0.6.0 development status | Erlang-native contract |
 | --- | --- | --- |
-| Incoming OIDC/OAuth/API authentication | Implemented | Local bearer auth and same-origin checks plus Oidcc-backed signature/JWKS verification and independent issuer, audience, algorithm, time, subject, claim, and scope policy are available for explicit endpoint wiring. |
-| Outbound OAuth/API-key/bearer credentials | Implemented | Private per-principal credentials and supervised single-flight OAuth client/refresh grants are keyed by provider/scopes/audience; rotated refresh tokens are compare-and-swap persisted before access-token release. Production external secret-store adapters remain application integrations. |
+| Incoming OIDC/OAuth/API authentication | Implemented release slice | Oidcc-backed signature/JWKS verification enforces issuer, access-token resource audience, algorithm, time, subject, claims, scopes, token type, and bounded input. OIDC ID-token mode separately applies authorized-party/client rules. The web gateway is default-deny for exact operations; MCP and A2A expose bounded per-operation policy hooks, and protocol resources are principal-bound. Applications must configure authoritative operation policy outside the RFC 9728 mode that requires it. IdP revocation, back-channel logout, and distributed session disconnect remain deployment integrations. |
+| Outbound OAuth/API-key/bearer credentials | Implemented release slice | Private per-principal credentials, immutable trusted provider profiles, RFC 8707 resource targeting, bounded admission/cache/storage, supervised single-flight OAuth grants, CAS refresh-token rotation, explicit cache invalidation, and secret-free status/errors are covered. Provider revocation and a durable KMS/HSM-backed encrypted store remain adapters; ETS is explicitly a development/single-node store. |
 | Google Application Default Credentials | Planned adapter | Follow ADC source precedence without mixing model, user, and service credentials. |
-| A2A protocol | Implemented | Released A2A 1.0 Agent Card discovery and JSON-RPC `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, and `SubscribeToTask` are implemented with member-discriminated Parts, task history/artifacts, bounded supervised execution, ordered SSE replay, principal scoping, OIDC hook, and outbound discovery/unary/stream client. gRPC, HTTP+JSON, push notifications, extended/signed cards, and durable distributed task storage remain explicit adapters. The project-specific `/a2a/prompt` route remains legacy and separate. |
+| A2A protocol | Hardened partial | Released A2A 1.0 Agent Card discovery and the six core JSON-RPC/SSE task methods have principal-scoped supervised execution, canonical errors, bounded extensions/card/data, absolute deadlines, isolated auth callbacks, and slow-subscriber overflow detachment. A public listener requires authentication plus direct TLS or an explicit trusted proxy. The client enforces verified HTTPS, all-loopback cleartext opt-in, bounded DNS/private-address and redirect policy, interface-origin validation, a satisfiable single declared security-scheme alternative, and discovery/RPC credential isolation. Authentication and DNS workers are heap/result bounded, suppress late replies, reject post-deadline queued results, and die with their request owner. Compound AND authentication is rejected as unsupported and server hook/card semantic alignment is operator policy. Outbound SSE is bounded but currently buffered; tasks and replay are node-local, and push notification is not enabled. The project-specific `/a2a/prompt` route remains legacy and separate. |
 | Observability | Implemented | Connected invocation/model/tool correlation, `telemetry` emission, schema-versioned structured envelopes, recursive redaction, default-off content, and bounded ordered exporters are implemented. OpenTelemetry/vendor bridges remain application adapters. |
 | Evaluation | Implemented | Legacy evaluation remains; versioned multi-turn eval sets/results, adapter state, captured event/tool trajectories, metric/judge thresholds, aggregate pass rates, redacted build metadata, deadlines, heap limits, and bounded case concurrency are implemented. Provider-specific judge/managed-service adapters remain separate. |
 | Safety and policy | Implemented | Runner policies fail closed with deny-overrides-allow agent/tool rules, finite canonical argument/content budgets, post-resolution gates before callbacks/HITL, structural tool errors, secret-free telemetry, and canonical immutable denial audit events. Gemini request-level adjustable harm categories and thresholds are strictly validated and REST-encoded; non-adjustable provider protections remain provider-owned. Human confirmation remains the suspension mechanism. |
@@ -138,9 +146,14 @@ provider/quota failures are not counted as passes.
 
 ## Developer web integration
 
-Phoenix is compatible but optional. The recommended topology is a separate
-Phoenix LiveView application that depends on `erlang_adk`, subscribes to stable
-run IDs, and reconnects using bounded replay. It must not own or link the run
-process from a LiveView process. The Erlang library itself retains a pure OTP
-dependency graph and provides the authenticated REST/SSE contract used by both
-Phoenix and the built-in developer UI.
+Phoenix is compatible and remains a companion application rather than a core
+dependency. The checked v0.6 Phoenix 1.8 project runs in the same BEAM release
+and calls `adk_web_gateway` directly. Its OIDC code/S256 PKCE boundary keeps
+login state and sessions in private bounded server stores; every mount, event,
+terminal result, reconnect, and replay-gap transition reauthorizes through the
+gateway. A LiveView subscribes to stable run IDs with credit/ack and does not
+own or link the run process. The deterministic suite, production assets, and
+release assembly pass. `/dev/v1` remains separate loopback developer
+administration, not the production browser API. Node-local session/run state,
+IdP single logout/revocation, privileged resource panels, and the documented
+Cowlib audit exception remain explicit deployment/release limitations.

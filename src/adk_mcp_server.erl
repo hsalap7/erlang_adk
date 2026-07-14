@@ -8,7 +8,8 @@
 
 -export([start/2, start_link/1, stop/1, endpoint/1,
          register_tool/2, register_resource/2, register_prompt/2,
-         handle_http/5, delete_session/3]).
+         handle_http/5, handle_http/6,
+         delete_session/3, delete_session/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3, format_status/1]).
 
@@ -22,6 +23,13 @@
 -define(DEFAULT_MAX_SESSIONS, 1024).
 -define(DEFAULT_MAX_SESSION_REQUESTS, 10000).
 -define(DEFAULT_SESSION_TTL_MS, 3600000).
+-define(DEFAULT_CALLBACK_TIMEOUT, 5000).
+-define(MAX_CALLBACK_TIMEOUT, 30000).
+-define(DEFAULT_CALLBACK_MAX_HEAP_WORDS, 262144).
+-define(MIN_CALLBACK_MAX_HEAP_WORDS, 1024).
+-define(MAX_CALLBACK_MAX_HEAP_WORDS, 4194304).
+-define(MIN_RESPONSE_BYTES, 256).
+-define(SERVER_REPLY_GRACE_MS, 1000).
 
 -spec start(binary(), map() | [module()]) ->
     {ok, pid()} | {error, term()}.
@@ -79,12 +87,27 @@ register_prompt(Server, Prompt) ->
 -spec handle_http(pid(), undefined | binary(), undefined | binary(),
                   map(), timeout()) -> term().
 handle_http(Server, Session, Version, Message, Timeout) ->
-    gen_server:call(Server, {http, Session, Version, Message}, Timeout).
+    handle_http(Server, Session, Version, Message, legacy, Timeout).
+
+%% The HTTP boundary supplies a normalized authentication context. Only its
+%% opaque scope is retained by the session state; credentials and raw headers
+%% never cross into the server process.
+-spec handle_http(pid(), undefined | binary(), undefined | binary(),
+                  map(), legacy | map(), timeout()) -> term().
+handle_http(Server, Session, Version, Message, AuthContext, Timeout) ->
+    gen_server:call(Server,
+                    {http, Session, Version, Message, AuthContext}, Timeout).
 
 -spec delete_session(pid(), undefined | binary(), undefined | binary()) ->
     ok | {error, term()}.
 delete_session(Server, Session, Version) ->
-    gen_server:call(Server, {delete_session, Session, Version}).
+    delete_session(Server, Session, Version, legacy).
+
+-spec delete_session(pid(), undefined | binary(), undefined | binary(),
+                     legacy | map()) -> ok | {error, term()}.
+delete_session(Server, Session, Version, AuthContext) ->
+    gen_server:call(Server,
+                    {delete_session, Session, Version, AuthContext}).
 
 init({normalized, Config, Registries}) ->
     process_flag(trap_exit, true),
@@ -99,18 +122,17 @@ init(Config0) ->
 init_listener(Config, Registries) ->
     Listener = {?MODULE, make_ref()},
     RouteState = route_config(Config, self()),
-    Dispatch = cowboy_router:compile(
-                 [{'_', [{maps:get(path, Config),
-                          adk_mcp_http_handler, RouteState}]}]),
+    Dispatch = cowboy_router:compile([{'_', routes(Config, RouteState)}]),
     Transport = #{socket_opts => [{ip, maps:get(ip, Config)},
-                                   {port, maps:get(port, Config)}],
+                                   {port, maps:get(port, Config)}] ++
+                                  tls_socket_options(Config),
                   num_acceptors => maps:get(num_acceptors, Config),
                   max_connections => maps:get(max_connections, Config)},
     Protocol = #{env => #{dispatch => Dispatch},
                  idle_timeout => maps:get(idle_timeout, Config),
                  request_timeout => maps:get(http_request_timeout, Config),
                  max_keepalive => maps:get(max_keepalive, Config)},
-    case cowboy:start_clear(Listener, Transport, Protocol) of
+    case start_cowboy(Listener, Config, Transport, Protocol) of
         {ok, ListenerPid} ->
             Monitor = erlang:monitor(process, ListenerPid),
             Port = apply(ranch, get_port, [Listener]),
@@ -133,9 +155,11 @@ handle_call(endpoint, _From, State) ->
     Host = endpoint_host(maps:get(ip, Config)),
     Port = maps:get(port, State),
     Path = maps:get(path, Config),
-    Url = <<"http://", Host/binary, ":",
+    Scheme = endpoint_scheme(Config),
+    Url = <<Scheme/binary, "://", Host/binary, ":",
             (integer_to_binary(Port))/binary, Path/binary>>,
-    {reply, {ok, #{url => Url, host => Host, port => Port, path => Path}},
+    {reply, {ok, #{url => Url, scheme => Scheme, host => Host,
+                   port => Port, path => Path}},
      State};
 handle_call({register, Kind, Value}, _From, State) ->
     case normalize_registry_item(Kind, Value) of
@@ -145,70 +169,79 @@ handle_call({register, Kind, Value}, _From, State) ->
             {reply, ok, State#{Field => Registry#{Key => Item}}};
         {error, Reason} -> {reply, {error, Reason}, State}
     end;
-handle_call({delete_session, undefined, _Version}, _From, State) ->
+handle_call({delete_session, undefined, _Version, _Auth}, _From, State) ->
     {reply, {error, missing_session}, State};
-handle_call({delete_session, Session, Version}, _From, State) ->
+handle_call({delete_session, Session, Version, AuthContext}, _From, State) ->
     Sessions = maps:get(sessions, State),
-    case maps:find(Session, Sessions) of
-        {ok, #{version := Version}} ->
+    case {AuthContext, auth_scope(AuthContext), maps:find(Session, Sessions)} of
+        {legacy, _Scope, {ok, #{version := Version}}} ->
             {reply, ok, State#{sessions => maps:remove(Session, Sessions)}};
-        {ok, _} -> {reply, {error, invalid_protocol_version}, State};
-        error -> {reply, {error, unknown_session}, State}
+        {legacy, _Scope, {ok, _}} ->
+            {reply, {error, invalid_protocol_version}, State};
+        {legacy, _Scope, error} ->
+            {reply, {error, unknown_session}, State};
+        {_, {ok, Scope}, {ok, #{version := Version, auth_scope := Scope}}} ->
+            {reply, ok, State#{sessions => maps:remove(Session, Sessions)}};
+        {_, {ok, Scope}, {ok, #{auth_scope := Scope}}} ->
+            {reply, {error, invalid_protocol_version}, State};
+        {_, {ok, _OtherScope}, {ok, _}} ->
+            %% Do not disclose whether another principal owns the session.
+            {reply, {error, unknown_session}, State};
+        {_, {ok, _}, error} -> {reply, {error, unknown_session}, State};
+        {_, error, _} -> {reply, {error, unknown_session}, State}
     end;
 handle_call({http, Session, Version, Message}, From, State0) ->
+    handle_call({http, Session, Version, Message, legacy}, From, State0);
+handle_call({http, Session, Version, Message, AuthContext}, From, State0) ->
     State = expire_sessions(State0),
-    case classify_message(Message) of
-        {initialize, Id, Params} ->
-            handle_initialize(Session, Id, Params, State);
-        {notification, <<"notifications/initialized">>, _Params} ->
-            handle_initialized(Session, Version, State);
-        {notification, _Method, _Params} ->
-            handle_notification(Session, Version, State);
-        {request, Id, Method, Params} ->
-            handle_operation(Session, Version, Id, Method, Params,
-                             From, State);
-        invalid ->
-            Error = error_response(null, -32600, <<"Invalid Request">>),
-            {reply, {json, 400, [], Error}, State}
+    case auth_scope(AuthContext) of
+        {ok, Scope} ->
+            case classify_message(Message) of
+                {initialize, Id, Params} ->
+                    handle_initialize(Session, Id, Params, Scope, State);
+                {notification, <<"notifications/initialized">>, _Params} ->
+                    handle_initialized(Session, Version, Scope, State);
+                {notification, _Method, _Params} ->
+                    handle_notification(Session, Version, Scope, State);
+                {request, Id, Method, Params} ->
+                    handle_operation(Session, Version, Scope, Id, Method,
+                                     Params, From, State);
+                invalid ->
+                    Error = error_response(null, -32600,
+                                           <<"Invalid Request">>),
+                    {reply, {json, 400, [], Error}, State}
+            end;
+        error ->
+            {reply, {http_error, 401, []}, State}
     end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unsupported_call}, State}.
 
 handle_cast(_Message, State) -> {noreply, State}.
 
-handle_info({mcp_worker_result, Ref, Outcome}, State) ->
+handle_info({mcp_worker_result, Ref, CompletedAt, Response0}, State) ->
     case maps:take(Ref, maps:get(pending, State)) of
         {Pending, Rest} ->
-            erlang:cancel_timer(maps:get(timer, Pending)),
-            erlang:demonitor(maps:get(monitor, Pending), [flush]),
-            Response0 = outcome_response(maps:get(id, Pending), Outcome),
-            Response = enforce_response_bound(Response0, State),
-            gen_server:reply(maps:get(from, Pending),
-                             {json, 200, [], Response}),
-            {noreply, State#{pending => Rest,
-                             active => maps:get(active, State) - 1}};
+            case CompletedAt =< maps:get(deadline, Pending) of
+                true -> complete_operation(Pending, Rest, Response0, State);
+                false -> timeout_operation(Pending, Rest, State)
+            end;
         error -> {noreply, State}
     end;
 handle_info({mcp_worker_timeout, Ref}, State) ->
     case maps:take(Ref, maps:get(pending, State)) of
-        {Pending, Rest} ->
-            exit(maps:get(pid, Pending), kill),
-            erlang:demonitor(maps:get(monitor, Pending), [flush]),
-            Response = error_response(maps:get(id, Pending), -32603,
-                                      <<"Request timed out">>),
-            gen_server:reply(maps:get(from, Pending),
-                             {json, 200, [], Response}),
-            {noreply, State#{pending => Rest,
-                             active => maps:get(active, State) - 1}};
+        {Pending, Rest} -> timeout_operation(Pending, Rest, State);
         error -> {noreply, State}
     end;
 handle_info({'DOWN', Monitor, process, _Pid, Reason}, State) ->
     case pending_by_monitor(Monitor, maps:get(pending, State)) of
         {ok, Ref, Pending} ->
             erlang:cancel_timer(maps:get(timer, Pending)),
+            _ = erlang:unalias(maps:get(reply_alias, Pending)),
             Rest = maps:remove(Ref, maps:get(pending, State)),
-            Response = error_response(maps:get(id, Pending), -32603,
-                                      safe_worker_error(Reason)),
+            Response0 = error_response(maps:get(id, Pending), -32603,
+                                       safe_worker_error(Reason)),
+            Response = enforce_response_bound(Response0, State),
             gen_server:reply(maps:get(from, Pending),
                              {json, 200, [], Response}),
             {noreply, State#{pending => Rest,
@@ -238,6 +271,14 @@ terminate(_Reason, State) ->
         {ok, Listener} -> _ = catch cowboy:stop_listener(Listener);
         error -> ok
     end,
+    maps:foreach(
+      fun(_Ref, Pending) ->
+          _ = erlang:unalias(maps:get(reply_alias, Pending)),
+          erlang:cancel_timer(maps:get(timer, Pending)),
+          exit(maps:get(pid, Pending), kill),
+          _ = erlang:demonitor(maps:get(monitor, Pending), [flush]),
+          ok
+      end, maps:get(pending, State, #{})),
     ok.
 
 code_change(_OldVersion, State, _Extra) -> {ok, State}.
@@ -251,15 +292,24 @@ format_status(Status) ->
                   {bearer_sha256, _Digest} -> bearer_digest_configured;
                   none -> none
               end,
-              Config = Config0#{auth => Auth},
-              maps:without([pending], State#{config => Config});
+              Authorization = case maps:get(authorization, Config0, none) of
+                  {hook, _} -> hook_configured;
+                  none -> none
+              end,
+              Config = Config0#{auth => Auth,
+                                authorization => Authorization},
+              Sessions = maps:get(sessions, State, #{}),
+              SafeState = State#{config => Config,
+                                 sessions =>
+                                     #{active_count => map_size(Sessions)}},
+              maps:without([pending], SafeState);
          (message, Message) -> adk_secret_redactor:redact(Message);
          (log, _Log) -> [];
          (reason, Reason) -> adk_secret_redactor:redact(Reason);
          (_Key, Value) -> adk_secret_redactor:redact(Value)
       end, Status).
 
-handle_initialize(Session, Id, Params, State) ->
+handle_initialize(Session, Id, Params, AuthScope, State) ->
     Requested = maps:get(<<"protocolVersion">>, Params, undefined),
     ClientInfo = maps:get(<<"clientInfo">>, Params, invalid),
     Capabilities = maps:get(<<"capabilities">>, Params, invalid),
@@ -284,24 +334,22 @@ handle_initialize(Session, Id, Params, State) ->
                                    <<"Session capacity reached">>),
             {reply, {json, 200, [], Error}, State};
         _ ->
-            case lists:member(Requested, ?SUPPORTED_PROTOCOL_VERSIONS) of
-                false ->
-                    Error = error_response(
-                              Id, -32602,
-                              <<"Unsupported protocol version">>,
-                              #{<<"supported">> =>
-                                    ?SUPPORTED_PROTOCOL_VERSIONS,
-                                <<"requested">> => Requested}),
-                    {reply, {json, 200, [], Error}, State};
-                true -> create_session(Id, Requested, Sessions, State)
-            end
+            %% MCP lifecycle negotiation requires the server to select a
+            %% supported version when the client's proposal is unsupported.
+            Negotiated = case lists:member(
+                                Requested, ?SUPPORTED_PROTOCOL_VERSIONS) of
+                true -> Requested;
+                false -> ?LATEST_PROTOCOL_VERSION
+            end,
+            create_session(Id, Negotiated, AuthScope, Sessions, State)
     end.
 
-create_session(Id, Requested, Sessions, State) ->
+create_session(Id, Requested, AuthScope, Sessions, State) ->
             SessionId = new_session_id(),
             Now = erlang:monotonic_time(millisecond),
             SessionState = #{phase => initializing,
                              version => Requested,
+                             auth_scope => AuthScope,
                              seen_ids => #{Id => true},
                              request_count => 1,
                              last_seen => Now},
@@ -311,8 +359,8 @@ create_session(Id, Requested, Sessions, State) ->
             {reply, {json, 200, Headers, Response},
              State#{sessions => Sessions#{SessionId => SessionState}}}.
 
-handle_initialized(Session, Version, State) ->
-    case session_check(Session, Version, initializing, State) of
+handle_initialized(Session, Version, AuthScope, State) ->
+    case session_check(Session, Version, AuthScope, initializing, State) of
         {ok, SessionState} ->
             Sessions = maps:get(sessions, State),
             Updated = touch_session(SessionState#{phase => ready}),
@@ -321,8 +369,8 @@ handle_initialized(Session, Version, State) ->
         {error, Status} -> {reply, {http_error, Status, []}, State}
     end.
 
-handle_notification(Session, Version, State) ->
-    case session_check(Session, Version, ready, State) of
+handle_notification(Session, Version, AuthScope, State) ->
+    case session_check(Session, Version, AuthScope, ready, State) of
         {ok, SessionState} ->
             Sessions = maps:get(sessions, State),
             {reply, {accepted, []},
@@ -331,8 +379,9 @@ handle_notification(Session, Version, State) ->
         {error, Status} -> {reply, {http_error, Status, []}, State}
     end.
 
-handle_operation(Session, Version, Id, Method, Params, From, State) ->
-    case session_check(Session, Version, ready, State) of
+handle_operation(Session, Version, AuthScope, Id, Method, Params, From,
+                 State) ->
+    case session_check(Session, Version, AuthScope, ready, State) of
         {error, Status} -> {reply, {http_error, Status, []}, State};
         {ok, SessionState} ->
             Config = maps:get(config, State),
@@ -362,19 +411,93 @@ handle_operation(Session, Version, Id, Method, Params, From, State) ->
 
 start_operation(Id, Method, Params, From, State) ->
     Ref = make_ref(),
-    Parent = self(),
+    Owner = self(),
+    ReplyAlias = erlang:alias([explicit_unalias]),
+    Config = maps:get(config, State),
+    MaxResponseBytes = maps:get(max_response_bytes, Config),
+    Timeout = maps:get(request_timeout, Config),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Work = fun() ->
+        start_operation_owner_watchdog(Owner, self()),
         Outcome = execute_method(Method, Params, State),
-        Parent ! {mcp_worker_result, Ref, Outcome}
+        Response = bounded_operation_response(Id, Outcome, MaxResponseBytes),
+        CompletedAt = erlang:monotonic_time(millisecond),
+        _ = erlang:send(ReplyAlias,
+                        {mcp_worker_result, Ref, CompletedAt, Response},
+                        [noconnect, nosuspend]),
+        ok
     end,
-    {Pid, Monitor} = spawn_monitor(Work),
-    Timeout = maps:get(request_timeout, maps:get(config, State)),
-    Timer = erlang:send_after(Timeout, self(), {mcp_worker_timeout, Ref}),
-    Pending0 = maps:get(pending, State),
-    Pending = #{from => From, id => Id, pid => Pid,
-                monitor => Monitor, timer => Timer},
-    {noreply, State#{pending => Pending0#{Ref => Pending},
-                     active => maps:get(active, State) + 1}}.
+    MaxHeap = maps:get(callback_max_heap_words, Config),
+    SpawnOptions =
+        [monitor, {message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => MaxHeap, kill => true, error_logger => false,
+            include_shared_binaries => true}}],
+    try erlang:spawn_opt(Work, SpawnOptions) of
+        {Pid, Monitor} ->
+            Timer = erlang:send_after(
+                      remaining_time(Deadline), self(),
+                      {mcp_worker_timeout, Ref}),
+            Pending0 = maps:get(pending, State),
+            Pending = #{from => From, id => Id, pid => Pid,
+                        monitor => Monitor, timer => Timer,
+                        reply_alias => ReplyAlias, deadline => Deadline},
+            {noreply, State#{pending => Pending0#{Ref => Pending},
+                             active => maps:get(active, State) + 1}}
+    catch
+        _:_ ->
+            _ = erlang:unalias(ReplyAlias),
+            Response = error_response(null, -32603,
+                                      <<"Callback worker unavailable">>),
+            {reply, {json, 200, [], Response}, State}
+    end.
+
+complete_operation(Pending, Rest, Response0, State) ->
+    erlang:cancel_timer(maps:get(timer, Pending)),
+    _ = erlang:unalias(maps:get(reply_alias, Pending)),
+    erlang:demonitor(maps:get(monitor, Pending), [flush]),
+    Response = enforce_response_bound(Response0, State),
+    gen_server:reply(maps:get(from, Pending), {json, 200, [], Response}),
+    {noreply, State#{pending => Rest,
+                     active => maps:get(active, State) - 1}}.
+
+timeout_operation(Pending, Rest, State) ->
+    erlang:cancel_timer(maps:get(timer, Pending)),
+    _ = erlang:unalias(maps:get(reply_alias, Pending)),
+    exit(maps:get(pid, Pending), kill),
+    erlang:demonitor(maps:get(monitor, Pending), [flush]),
+    Response0 = error_response(maps:get(id, Pending), -32603,
+                               <<"Request timed out">>),
+    Response = enforce_response_bound(Response0, State),
+    gen_server:reply(maps:get(from, Pending), {json, 200, [], Response}),
+    {noreply, State#{pending => Rest,
+                     active => maps:get(active, State) - 1}}.
+
+remaining_time(Deadline) ->
+    erlang:max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+start_operation_owner_watchdog(Owner, Worker) ->
+    Watchdog = fun() -> operation_owner_watchdog(Owner, Worker) end,
+    _ = spawn_opt(
+          Watchdog,
+          [{message_queue_data, off_heap},
+           {max_heap_size,
+            #{size => 8192, kill => true, error_logger => false,
+              include_shared_binaries => true}}]),
+    ok.
+
+operation_owner_watchdog(Owner, Worker) ->
+    OwnerMonitor = erlang:monitor(process, Owner),
+    WorkerMonitor = erlang:monitor(process, Worker),
+    receive
+        {'DOWN', OwnerMonitor, process, Owner, _OpaqueReason} ->
+            exit(Worker, kill),
+            _ = erlang:demonitor(WorkerMonitor, [flush]),
+            ok;
+        {'DOWN', WorkerMonitor, process, Worker, _OpaqueReason} ->
+            _ = erlang:demonitor(OwnerMonitor, [flush]),
+            ok
+    end.
 
 execute_method(<<"tools/list">>, _Params, State) ->
     Tools = [maps:get(public, Item)
@@ -516,16 +639,25 @@ normalize_prompt_result(_) ->
 
 outcome_response(Id, {ok, Result}) -> result_response(Id, Result);
 outcome_response(Id, {protocol_error, Code, Message}) ->
-    error_response(Id, Code, Message);
-outcome_response(Id, _) ->
-    error_response(Id, -32603, <<"Internal error">>).
+    error_response(Id, Code, Message).
+
+%% Normalize and encode inside the short-lived callback worker.  Only a
+%% protocol response whose encoded representation fits the configured limit is
+%% copied into the long-lived server process.
+bounded_operation_response(Id, Outcome, MaxBytes) ->
+    Response = outcome_response(Id, Outcome),
+    try jsx:encode(Response) of
+        Encoded when byte_size(Encoded) =< MaxBytes -> Response;
+        _ -> error_response(null, -32603, <<"Response exceeds limit">>)
+    catch
+        _:_ -> error_response(null, -32603, <<"Internal error">>)
+    end.
 
 enforce_response_bound(Response, State) ->
     Max = maps:get(max_response_bytes, maps:get(config, State)),
     case byte_size(jsx:encode(Response)) =< Max of
         true -> Response;
-        false -> error_response(maps:get(<<"id">>, Response, null),
-                                -32603, <<"Response exceeds limit">>)
+        false -> error_response(null, -32603, <<"Response exceeds limit">>)
     end.
 
 classify_message(#{<<"jsonrpc">> := <<"2.0">>, <<"id">> := Id,
@@ -551,14 +683,24 @@ classify_message(#{<<"jsonrpc">> := <<"2.0">>,
     end;
 classify_message(_) -> invalid.
 
-session_check(undefined, _Version, _Phase, _State) -> {error, 400};
-session_check(Session, Version, Phase, State) ->
+session_check(undefined, _Version, _Scope, _Phase, _State) -> {error, 400};
+session_check(Session, Version, Scope, Phase, State) ->
     case maps:find(Session, maps:get(sessions, State)) of
-        {ok, #{phase := Phase, version := Version} = SessionState} ->
+        {ok, #{phase := Phase, version := Version,
+               auth_scope := Scope} = SessionState} ->
             {ok, SessionState};
+        {ok, #{auth_scope := OtherScope}} when OtherScope =/= Scope ->
+            %% A stolen session id is intentionally indistinguishable from an
+            %% expired or otherwise unknown session id.
+            {error, 404};
         {ok, _WrongPhase} -> {error, 400};
         error -> {error, 404}
     end.
+
+auth_scope(legacy) -> {ok, legacy};
+auth_scope(#{scope := Scope}) when is_binary(Scope), byte_size(Scope) =:= 32 ->
+    {ok, Scope};
+auth_scope(_) -> error.
 
 initialize_result(State, Version) ->
     Cap0 = #{},
@@ -578,7 +720,16 @@ initialize_result(State, Version) ->
     #{<<"protocolVersion">> => Version,
       <<"capabilities">> => Cap3,
       <<"serverInfo">> => #{<<"name">> => <<"erlang_adk">>,
-                             <<"version">> => <<"0.4.0">>}}.
+                             <<"version">> => application_version()}}.
+
+application_version() ->
+    _ = application:load(erlang_adk),
+    case application:get_key(erlang_adk, vsn) of
+        {ok, Version} when is_list(Version) ->
+            unicode:characters_to_binary(Version);
+        {ok, Version} when is_binary(Version) -> Version;
+        _ -> <<"unknown">>
+    end.
 
 normalize_config(Config0) when is_map(Config0) ->
     Config1 = #{ip => maps:get(ip, Config0, {127, 0, 0, 1}),
@@ -603,11 +754,25 @@ normalize_config(Config0) when is_map(Config0) ->
                 idle_timeout => maps:get(idle_timeout, Config0, 60000),
                 http_request_timeout => maps:get(http_request_timeout, Config0,
                                                  10000),
+                callback_timeout => maps:get(callback_timeout, Config0,
+                                             ?DEFAULT_CALLBACK_TIMEOUT),
+                callback_max_heap_words =>
+                    maps:get(callback_max_heap_words, Config0,
+                             ?DEFAULT_CALLBACK_MAX_HEAP_WORDS),
                 max_keepalive => maps:get(max_keepalive, Config0, 100),
                 allow_non_loopback => maps:get(allow_non_loopback,
                                                Config0, false),
+                trusted_tls_proxy => maps:get(trusted_tls_proxy,
+                                              Config0, false),
+                tls_options => maps:get(tls_options, Config0, undefined),
                 allowed_origins => normalize_origins(
-                                     maps:get(allowed_origins, Config0, []))},
+                                     maps:get(allowed_origins, Config0, [])),
+                authorization => normalize_authorization(
+                                   maps:get(authorization_fun, Config0,
+                                            none)),
+                oauth_protected_resource =>
+                    normalize_oauth_protected_resource(
+                      maps:get(oauth_protected_resource, Config0, none))},
     case normalize_auth(Config0) of
         {ok, Auth} ->
             Config = Config1#{auth => Auth},
@@ -628,19 +793,142 @@ normalize_auth(Config) ->
         _ -> {error, invalid_mcp_server_auth}
     end.
 
+normalize_authorization(none) -> none;
+normalize_authorization(Fun) when is_function(Fun, 3) -> {hook, Fun};
+normalize_authorization(_) -> invalid.
+
 normalize_origins(Origins) when is_list(Origins) ->
     [lower(Value) || Value <- Origins, is_binary(Value)];
 normalize_origins(_) -> invalid.
 
+normalize_oauth_protected_resource(none) -> none;
+normalize_oauth_protected_resource(Metadata) when is_map(Metadata) ->
+    Resource = maps:get(resource, Metadata, undefined),
+    AuthorizationServers = maps:get(authorization_servers, Metadata, invalid),
+    Scopes = maps:get(scopes_supported, Metadata, []),
+    RequiredScopes = maps:get(required_scopes, Metadata, []),
+    MetadataPath = case maps:get(metadata_path, Metadata, undefined) of
+        undefined -> default_metadata_path(Resource);
+        ConfiguredPath -> ConfiguredPath
+    end,
+    MetadataUrl0 = maps:get(resource_metadata_url, Metadata, undefined),
+    MetadataUrl = case MetadataUrl0 of
+        undefined -> derive_metadata_url(Resource, MetadataPath);
+        _ -> MetadataUrl0
+    end,
+    case valid_absolute_http_uri(Resource) andalso
+         valid_uri_list(AuthorizationServers) andalso
+         valid_scope_list(Scopes) andalso
+         valid_scope_list(RequiredScopes) andalso
+         lists:all(fun(Scope) -> lists:member(Scope, Scopes) end,
+                   RequiredScopes) andalso
+         valid_path(MetadataPath) andalso
+         valid_absolute_http_uri(MetadataUrl) of
+        true ->
+            Document = #{<<"resource">> => Resource,
+                         <<"authorization_servers">> =>
+                             AuthorizationServers,
+                         <<"scopes_supported">> => Scopes},
+            #{resource => Resource,
+              authorization_servers => AuthorizationServers,
+              scopes_supported => Scopes,
+              required_scopes => RequiredScopes,
+              metadata_path => MetadataPath,
+              resource_metadata_url => MetadataUrl,
+              document => Document};
+        false -> invalid
+    end;
+normalize_oauth_protected_resource(_) -> invalid.
+
+default_metadata_path(Resource) when is_binary(Resource) ->
+    try uri_string:parse(Resource) of
+        Parsed when is_map(Parsed) ->
+            Base = <<"/.well-known/oauth-protected-resource">>,
+            case maps:get(path, Parsed, <<>>) of
+                <<>> -> Base;
+                <<"/">> -> Base;
+                <<"/", Rest/binary>> -> <<Base/binary, "/", Rest/binary>>;
+                _ -> invalid
+            end;
+        _ -> invalid
+    catch _:_ -> invalid
+    end;
+default_metadata_path(_) -> invalid.
+
+derive_metadata_url(Resource, MetadataPath)
+  when is_binary(Resource), is_binary(MetadataPath) ->
+    try uri_string:parse(Resource) of
+        Parsed when is_map(Parsed) ->
+            Base = maps:without([path, query, fragment, userinfo], Parsed),
+            unicode:characters_to_binary(
+              uri_string:recompose(Base#{path => MetadataPath}));
+        _ -> invalid
+    catch _:_ -> invalid
+    end;
+derive_metadata_url(_, _) -> invalid.
+
+valid_uri_list(Values) when is_list(Values), Values =/= [] ->
+    lists:all(fun valid_absolute_http_uri/1, Values);
+valid_uri_list(_) -> false.
+
+valid_absolute_http_uri(Value) when is_binary(Value), byte_size(Value) > 0 ->
+    try uri_string:parse(Value) of
+        #{scheme := Scheme, host := Host} = Parsed ->
+            (Scheme =:= <<"https">> orelse
+             (Scheme =:= <<"http">> andalso loopback_host(Host))) andalso
+            is_binary(Host) andalso byte_size(Host) > 0 andalso
+            not maps:is_key(userinfo, Parsed) andalso
+            not maps:is_key(fragment, Parsed) andalso
+            valid_header_quoted_value(Value);
+        _ -> false
+    catch _:_ -> false
+    end;
+valid_absolute_http_uri(_) -> false.
+
+loopback_host(<<"localhost">>) -> true;
+loopback_host(<<"127.0.0.1">>) -> true;
+loopback_host(<<"::1">>) -> true;
+loopback_host(_) -> false.
+
+valid_scope_list(Scopes) when is_list(Scopes) ->
+    length(Scopes) =:= length(lists:usort(Scopes)) andalso
+    lists:all(fun valid_scope/1, Scopes);
+valid_scope_list(_) -> false.
+
+valid_scope(Scope) when is_binary(Scope), byte_size(Scope) > 0,
+                        byte_size(Scope) =< 256 ->
+    lists:all(fun(C) ->
+                      C =:= 16#21 orelse
+                      (C >= 16#23 andalso C =< 16#5b) orelse
+                      (C >= 16#5d andalso C =< 16#7e)
+              end, binary_to_list(Scope));
+valid_scope(_) -> false.
+
+valid_header_quoted_value(Value) ->
+    lists:all(fun(C) -> C >= 16#20 andalso C =< 16#7e andalso
+                          C =/= $" andalso C =/= $\\
+              end, binary_to_list(Value)).
+
 valid_config(Config) ->
     valid_ip(maps:get(ip, Config)) andalso
     is_boolean(maps:get(allow_non_loopback, Config)) andalso
+    is_boolean(maps:get(trusted_tls_proxy, Config)) andalso
+    valid_tls_options(maps:get(tls_options, Config)) andalso
     secure_bind(maps:get(ip, Config), maps:get(auth, Config),
-                maps:get(allow_non_loopback, Config)) andalso
+                maps:get(allow_non_loopback, Config),
+                maps:get(tls_options, Config),
+                maps:get(trusted_tls_proxy, Config)) andalso
     is_integer(maps:get(port, Config)) andalso maps:get(port, Config) >= 0 andalso
     maps:get(port, Config) =< 65535 andalso
     valid_path(maps:get(path, Config)) andalso
+    valid_oauth_protected_resource(
+      maps:get(oauth_protected_resource, Config), maps:get(path, Config)) andalso
+    oauth_auth_compatible(maps:get(oauth_protected_resource, Config),
+                          maps:get(auth, Config),
+                          maps:get(authorization, Config)) andalso
+    maps:get(authorization, Config) =/= invalid andalso
     maps:get(allowed_origins, Config) =/= invalid andalso
+    maps:get(max_response_bytes, Config) >= ?MIN_RESPONSE_BYTES andalso
     lists:all(fun positive/1,
               [maps:get(max_body_bytes, Config),
                maps:get(max_response_bytes, Config),
@@ -653,8 +941,23 @@ valid_config(Config) ->
                maps:get(max_connections, Config),
                maps:get(idle_timeout, Config),
                maps:get(http_request_timeout, Config)]) andalso
+    bounded_positive(maps:get(callback_timeout, Config),
+                     ?MAX_CALLBACK_TIMEOUT) andalso
+    bounded_range(maps:get(callback_max_heap_words, Config),
+                  ?MIN_CALLBACK_MAX_HEAP_WORDS,
+                  ?MAX_CALLBACK_MAX_HEAP_WORDS) andalso
     is_integer(maps:get(max_keepalive, Config)) andalso
     maps:get(max_keepalive, Config) >= 0.
+
+valid_oauth_protected_resource(none, _McpPath) -> true;
+valid_oauth_protected_resource(
+  #{metadata_path := MetadataPath, document := Document}, McpPath) ->
+    MetadataPath =/= McpPath andalso is_map(Document);
+valid_oauth_protected_resource(_, _) -> false.
+
+oauth_auth_compatible(none, _Auth, _Authorization) -> true;
+oauth_auth_compatible(_Metadata, {hook, _Fun}, {hook, _Authorization}) -> true;
+oauth_auth_compatible(_Metadata, _Auth, _Authorization) -> false.
 
 normalize_registries(Config0, Config) ->
     case normalize_items(tool, maps:get(tools, Config0, []), #{}) of
@@ -772,8 +1075,24 @@ registry_field(resource) -> resources;
 registry_field(prompt) -> prompts.
 
 route_config(Config, Server) ->
-    (maps:with([path, max_body_bytes, request_timeout,
-                allowed_origins, auth], Config))#{server => Server}.
+    RouteConfig = maps:with(
+                    [path, max_body_bytes, callback_timeout,
+                     callback_max_heap_words, allowed_origins, auth,
+                     authorization, oauth_protected_resource], Config),
+    %% The operation worker is killed at the configured request_timeout.  Give
+    %% that worker's small JSON-RPC timeout reply a bounded delivery margin so
+    %% Cowboy does not race it and replace the protocol error with HTTP 504.
+    RouteConfig#{server => Server,
+                 request_timeout => maps:get(request_timeout, Config) +
+                                    ?SERVER_REPLY_GRACE_MS}.
+
+routes(Config, RouteState) ->
+    Mcp = {maps:get(path, Config), adk_mcp_http_handler, RouteState},
+    case maps:get(oauth_protected_resource, Config) of
+        none -> [Mcp];
+        #{metadata_path := Path, document := Document} ->
+            [{Path, adk_mcp_oauth_metadata_handler, Document}, Mcp]
+    end.
 
 schedule_cleanup(Config) ->
     Interval = erlang:min(maps:get(session_ttl_ms, Config), 60000),
@@ -837,6 +1156,32 @@ endpoint_host({A, B, C, D, E, F, G, H}) ->
     <<"[", Address/binary, "]">>;
 endpoint_host(_) -> <<"localhost">>.
 
+start_cowboy(Listener, #{tls_options := undefined}, Transport, Protocol) ->
+    cowboy:start_clear(Listener, Transport, Protocol);
+start_cowboy(Listener, _Config, Transport, Protocol) ->
+    cowboy:start_tls(Listener, Transport, Protocol).
+
+tls_socket_options(#{tls_options := undefined}) -> [];
+tls_socket_options(#{tls_options := Options}) -> Options.
+
+endpoint_scheme(#{tls_options := undefined}) -> <<"http">>;
+endpoint_scheme(_Config) -> <<"https">>.
+
+valid_tls_options(undefined) -> true;
+valid_tls_options(Options) when is_list(Options), Options =/= [] ->
+    lists:all(fun(Option) -> is_tuple(Option) andalso tuple_size(Option) =:= 2
+              end, Options) andalso
+    not lists:keymember(ip, 1, Options) andalso
+    not lists:keymember(port, 1, Options) andalso
+    has_tls_identity(Options);
+valid_tls_options(_) -> false.
+
+has_tls_identity(Options) ->
+    (lists:keymember(certfile, 1, Options) andalso
+     lists:keymember(keyfile, 1, Options)) orelse
+    (lists:keymember(cert, 1, Options) andalso
+     lists:keymember(key, 1, Options)).
+
 valid_path(<<"/", _/binary>>) -> true;
 valid_path(_) -> false.
 valid_resource_uri(Uri) when is_binary(Uri), byte_size(Uri) > 0 ->
@@ -851,6 +1196,13 @@ valid_resource_uri(Uri) when is_binary(Uri), byte_size(Uri) > 0 ->
     end;
 valid_resource_uri(_) -> false.
 positive(Value) -> is_integer(Value) andalso Value > 0.
+
+bounded_positive(Value, Ceiling) ->
+    positive(Value) andalso Value =< Ceiling.
+
+bounded_range(Value, Floor, Ceiling) ->
+    is_integer(Value) andalso Value >= Floor andalso Value =< Ceiling.
+
 valid_ip({A, B, C, D}) ->
     lists:all(fun(V) -> is_integer(V) andalso V >= 0 andalso V =< 255 end,
               [A, B, C, D]);
@@ -858,9 +1210,10 @@ valid_ip({A, B, C, D, E, F, G, H}) ->
     lists:all(fun(V) -> is_integer(V) andalso V >= 0 andalso V =< 16#ffff end,
               [A, B, C, D, E, F, G, H]);
 valid_ip(_) -> false.
-secure_bind({127, _B, _C, _D}, _Auth, _Allow) -> true;
-secure_bind({0, 0, 0, 0, 0, 0, 0, 1}, _Auth, _Allow) -> true;
-secure_bind(_Ip, none, _Allow) -> false;
-secure_bind(_Ip, _ConfiguredAuth, true) -> true;
-secure_bind(_Ip, _ConfiguredAuth, false) -> false.
+secure_bind({127, _B, _C, _D}, _Auth, _Allow, _Tls, _Proxy) -> true;
+secure_bind({0, 0, 0, 0, 0, 0, 0, 1}, _Auth, _Allow, _Tls, _Proxy) -> true;
+secure_bind(_Ip, none, _Allow, _Tls, _Proxy) -> false;
+secure_bind(_Ip, _Auth, false, _Tls, _Proxy) -> false;
+secure_bind(_Ip, _Auth, true, undefined, false) -> false;
+secure_bind(_Ip, _Auth, true, _Tls, _Proxy) -> true.
 lower(Value) -> list_to_binary(string:lowercase(binary_to_list(Value))).

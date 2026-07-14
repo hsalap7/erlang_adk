@@ -3,7 +3,11 @@
 
 -behaviour(adk_auth_provider).
 
--export([refresh/2]).
+-export([refresh/2, test_adapter/0]).
+
+%% Marker consumed by adk_token_manager before it permits request-provided
+%% context. Production credential providers intentionally do not export it.
+test_adapter() -> true.
 
 refresh(Credential, Context) ->
     Counter = maps:get(counter, Context),

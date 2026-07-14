@@ -11,11 +11,16 @@ jwt_authentication_policy_test_() ->
      fun wrong_issuer_is_rejected/0,
      fun wrong_audience_is_rejected/0,
      fun unknown_co_audience_is_rejected/0,
+     fun access_token_authorized_party_is_not_resource_audience/0,
+     fun id_token_authorized_party_is_bound_to_client_audience/0,
+     fun token_type_and_lifetime_are_bounded/0,
      fun wrong_signing_algorithm_is_rejected_before_adapter/0,
      fun expired_token_is_rejected/0,
      fun future_token_is_rejected/0,
      fun missing_scope_is_rejected/0,
      fun verifier_failures_are_opaque/0,
+     fun verifier_callbacks_are_bounded_and_timed_out/0,
+     fun verifier_callback_stops_when_caller_dies/0,
      fun real_oidcc_verifies_signed_offline_fixture/0,
      fun bearer_header_is_strict/0,
      fun malformed_auth_inputs_fail_closed/0,
@@ -27,6 +32,7 @@ oauth_service_credentials_test_() ->
      fun refresh_grant_requires_subject_and_is_normalized/0,
      fun api_keys_and_bearer_tokens_are_distinct/0,
      fun oauth_adapter_failure_is_redacted/0,
+     fun trusted_resource_indicator_is_forwarded/0,
      fun opaque_credentials_remain_user_isolated/0].
 
 provider_supervision_test_() ->
@@ -72,6 +78,62 @@ unknown_co_audience_is_rejected() ->
                   claims(#{<<"aud">> => [?AUDIENCE, <<"untrusted-api">>]})),
     ?assertEqual({error, invalid_audience}, authenticate(Policy, Token)).
 
+access_token_authorized_party_is_not_resource_audience() ->
+    Policy = policy(#{}),
+    ClientBound = token(
+                    <<"RS256">>,
+                    claims(#{<<"azp">> => <<"oauth-client">>})),
+    ?assertMatch({ok, _}, authenticate(Policy, ClientBound)),
+    MultiAudience = token(
+                      <<"RS256">>,
+                      claims(#{<<"aud">> =>
+                                   [?AUDIENCE, <<"shared-api">>]})),
+    ?assertMatch({ok, _}, authenticate(Policy, MultiAudience)),
+    MultiAudienceClient = token(
+                            <<"RS256">>,
+                            claims(#{<<"aud">> =>
+                                         [?AUDIENCE, <<"shared-api">>],
+                                     <<"azp">> => <<"oauth-client">>})),
+    ?assertMatch({ok, _}, authenticate(Policy, MultiAudienceClient)),
+    Malformed = token(<<"RS256">>, claims(#{<<"azp">> => 42})),
+    ?assertEqual({error, invalid_authorized_party},
+                 authenticate(Policy, Malformed)).
+
+id_token_authorized_party_is_bound_to_client_audience() ->
+    Policy = policy(#{token_use => id_token}),
+    WrongParty = token(
+                   <<"RS256">>,
+                   claims(#{<<"azp">> => <<"other-client">>})),
+    ?assertEqual({error, invalid_authorized_party},
+                 authenticate(Policy, WrongParty)),
+    Ambiguous = token(
+                  <<"RS256">>,
+                  claims(#{<<"aud">> => [?AUDIENCE, <<"shared-api">>]})),
+    ?assertEqual({error, invalid_authorized_party},
+                 authenticate(Policy, Ambiguous)),
+    Bound = token(
+              <<"RS256">>,
+              claims(#{<<"aud">> => [?AUDIENCE, <<"shared-api">>],
+                       <<"azp">> => ?AUDIENCE})),
+    ?assertMatch({ok, _}, authenticate(Policy, Bound)).
+
+token_type_and_lifetime_are_bounded() ->
+    Strict = policy(#{allowed_token_types => [<<"at+jwt">>],
+                      max_token_lifetime_seconds => 300}),
+    WrongType = token(<<"RS256">>, claims(#{})),
+    ?assertEqual({error, invalid_token_type},
+                 authenticate(Strict, WrongType)),
+    AccessToken = token_with_type(
+                    <<"RS256">>, <<"at+jwt">>, claims(#{})),
+    ?assertMatch({ok, _}, authenticate(Strict, AccessToken)),
+    LongLived = token_with_type(
+                  <<"RS256">>, <<"at+jwt">>,
+                  claims(#{<<"iat">> => ?NOW,
+                           <<"nbf">> => ?NOW,
+                           <<"exp">> => ?NOW + 301})),
+    ?assertEqual({error, token_lifetime_exceeded},
+                 authenticate(Strict, LongLived)).
+
 wrong_signing_algorithm_is_rejected_before_adapter() ->
     Policy = policy(#{}),
     Token = token(<<"HS256">>, claims(#{})),
@@ -110,6 +172,75 @@ verifier_failures_are_opaque() ->
     assert_absent(Secret, Result),
     assert_absent(Token, Result).
 
+verifier_callbacks_are_bounded_and_timed_out() ->
+    Token = token(<<"RS256">>, claims(#{})),
+    TimeoutPolicy = policy(
+                      #{verifier_timeout_ms => 20,
+                        verifier_max_heap_words => 16384,
+                        adapter_options =>
+                            #{mode => sleep, delay_ms => 250,
+                              observer => self()}}),
+    ?assertEqual({error, provider_unavailable},
+                 authenticate(TimeoutPolicy, Token)),
+    TimeoutWorker = receive
+        {jwt_verifier_started, Pid} -> Pid
+    after 500 ->
+        error(jwt_timeout_worker_not_started)
+    end,
+    ?assertNot(is_process_alive(TimeoutWorker)),
+
+    Secret = <<"jwt-callback-secret-92ac">>,
+    CrashPolicy = policy(
+                    #{verifier_timeout_ms => 100,
+                      verifier_max_heap_words => 16384,
+                      adapter_options => #{mode => crash, secret => Secret}}),
+    CrashResult = authenticate(CrashPolicy, Token),
+    ?assertEqual({error, invalid_token}, CrashResult),
+    assert_absent(Secret, CrashResult),
+
+    HeapPolicy = policy(
+                   #{verifier_timeout_ms => 250,
+                     verifier_max_heap_words => 16384,
+                     adapter_options => #{mode => heap}}),
+    ?assertEqual({error, invalid_token}, authenticate(HeapPolicy, Token)),
+
+    OversizedPolicy = policy(
+                        #{verifier_timeout_ms => 250,
+                          verifier_max_heap_words => 16384,
+                          adapter_options => #{mode => oversized}}),
+    ?assertEqual({error, invalid_token},
+                 authenticate(OversizedPolicy, Token)).
+
+verifier_callback_stops_when_caller_dies() ->
+    Parent = self(),
+    Token = token(<<"RS256">>, claims(#{})),
+    Policy = policy(
+               #{verifier_timeout_ms => 2000,
+                 verifier_max_heap_words => 16384,
+                 adapter_options =>
+                     #{mode => sleep, delay_ms => 1000,
+                       observer => Parent}}),
+    Caller = spawn(fun() ->
+        Parent ! {unexpected_jwt_result, authenticate(Policy, Token)}
+    end),
+    Callback = receive
+        {jwt_verifier_started, Pid} -> Pid
+    after 500 ->
+        error(jwt_owner_worker_not_started)
+    end,
+    CallbackMonitor = erlang:monitor(process, Callback),
+    exit(Caller, kill),
+    receive
+        {'DOWN', CallbackMonitor, process, Callback, _} -> ok
+    after 500 ->
+        error(jwt_callback_survived_caller)
+    end,
+    receive
+        {unexpected_jwt_result, _} -> error(jwt_result_after_caller_death)
+    after 25 ->
+        ok
+    end.
+
 real_oidcc_verifies_signed_offline_fixture() ->
     PrivateKey = jose_jwk:generate_key({rsa, 2048}),
     PublicKey = jose_jwk:to_public(PrivateKey),
@@ -128,13 +259,40 @@ real_oidcc_verifies_signed_offline_fixture() ->
                          (policy_config(#{}))#{
                            provider => Provider,
                            verifier => adk_oidcc_jwt_verifier,
+                           adapter_options =>
+                               #{encryption_algs => [<<"RSA-OAEP">>],
+                                 encryption_encs => [<<"A256GCM">>]},
                            clock_skew_seconds => 0,
                            now_fun => fun() -> erlang:system_time(second) end}),
         {ok, Identity} = authenticate(Policy, Signed),
         ?assertEqual(<<"signed-alice">>, maps:get(subject, Identity)),
         Tampered = tamper_subject(Signed),
         ?assertEqual({error, invalid_token},
-                     authenticate(Policy, Tampered))
+                     authenticate(Policy, Tampered)),
+        {ok, UnsafePolicy} = adk_jwt_policy:new(
+                               (policy_config(#{}))#{
+                                 provider => Provider,
+                                 verifier => adk_oidcc_jwt_verifier,
+                                 adapter_options =>
+                                     #{refresh_jwks => fun() -> ok end},
+                                 clock_skew_seconds => 0,
+                                 now_fun =>
+                                     fun() -> erlang:system_time(second) end}),
+        ?assertEqual({error, invalid_token},
+                     authenticate(UnsafePolicy, Signed)),
+        {ok, MalformedPolicy} = adk_jwt_policy:new(
+                                  (policy_config(#{}))#{
+                                    provider => Provider,
+                                    verifier => adk_oidcc_jwt_verifier,
+                                    adapter_options =>
+                                        #{encryption_algs => [<<255>>]},
+                                    clock_skew_seconds => 0,
+                                    now_fun =>
+                                        fun() ->
+                                            erlang:system_time(second)
+                                        end}),
+        ?assertEqual({error, invalid_token},
+                     authenticate(MalformedPolicy, Signed))
     after
         gen_server:stop(Provider)
     end.
@@ -198,9 +356,30 @@ unsafe_policies_are_rejected() ->
                  adk_jwt_policy:new(Base#{clock_skew_seconds => 301})),
     ?assertEqual({error, invalid_policy},
                  adk_jwt_policy:new(
+                   Base#{allowed_token_types => [<<"JWT">>, <<"JWT">>]})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(
+                   Base#{max_token_lifetime_seconds => 86401})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(
                    Base#{claim_allowlist => [<<"sub">>, <<"access_token">>]})),
     ?assertEqual({error, invalid_policy},
-                 adk_jwt_policy:new(Base#{provider => <<"dynamic-name">>})).
+                 adk_jwt_policy:new(Base#{provider => <<"dynamic-name">>})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(Base#{token_use => access})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(Base#{verifier_timeout_ms => 0})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(Base#{verifier_timeout_ms => 30001})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(Base#{verifier_max_heap_words => 16383})),
+    ?assertEqual({error, invalid_policy},
+                 adk_jwt_policy:new(Base#{verifier_max_heap_words => 4000001})),
+    ?assertEqual(
+       {error, invalid_policy},
+       adk_jwt_policy:new(
+         Base#{adapter_options =>
+                   #{padding => binary:copy(<<"x">>, 65536)}})).
 
 missing_oidcc_worker_is_reported_without_network() ->
     {ok, Policy} = adk_jwt_policy:new(
@@ -267,6 +446,64 @@ oauth_adapter_failure_is_redacted() ->
                     binary:match(term_to_binary(Reason),
                                  adk_secret_redactor:marker())).
 
+trusted_resource_indicator_is_forwarded() ->
+    Store = adk_oidc_resource_store,
+    RefreshSup = adk_oidc_resource_refresh_sup,
+    Manager = adk_oidc_resource_token_manager,
+    Resource = <<"https://resource.example/agents">>,
+    Profiles =
+        #{<<"resource-service">> =>
+              #{provider_module => adk_auth_provider_oidcc,
+                context => #{provider_worker => oidc_fixture_provider,
+                             oauth_adapter => adk_oidc_fake_oauth_adapter},
+                allowed_scopes => [<<"agent.run">>],
+                allowed_audiences => [Resource],
+                resource_indicator => true}},
+    {ok, Supervisor} = adk_auth_sup:start_link(
+                         #{name => undefined,
+                           credential_store_name => Store,
+                           refresh_sup_name => RefreshSup,
+                           token_manager_name => Manager,
+                           authorization_exchange_sup_name =>
+                               adk_oidc_resource_exchange_sup,
+                           authorization_flow_name =>
+                               adk_oidc_resource_authorization_flow,
+                           provider_profiles => Profiles}),
+    unlink(Supervisor),
+    try
+        {ok, Ref} = adk_credential_store_ets:put(
+                      Store, <<"alice">>, <<"resource-service">>,
+                      #{kind => oauth_client_credentials,
+                        client_id => <<"resource-client">>,
+                        client_secret => <<"resource-client-secret">>}),
+        Request = #{principal => <<"alice">>,
+                    provider => <<"resource-service">>,
+                    credential_ref => Ref,
+                    scopes => [<<"agent.run">>],
+                    audience => Resource,
+                    %% Both legacy fields are attacker-controlled here. The
+                    %% immutable profile, not either value, drives the grant.
+                    provider_module => adk_auth_context_echo_provider,
+                    context => #{resource => <<"https://attacker.example">>}},
+        ?assertEqual(
+           {ok, #{access_token =>
+                      <<"cc:resource-client@",
+                        "https://resource.example/agents">>,
+                  token_type => <<"Bearer">>}},
+           adk_token_manager:get_token(Manager, Request, 1000)),
+        ?assertEqual(
+           {error, audience_not_allowed},
+           adk_token_manager:get_token(
+             Manager,
+             Request#{audience => <<"https://attacker.example">>}, 1000)),
+        ?assertEqual(
+           {error, audience_not_allowed},
+           adk_token_manager:get_token(
+             Manager, maps:remove(audience, Request), 1000))
+    after
+        stop_supervisor(Supervisor)
+    end.
+
 opaque_credentials_remain_user_isolated() ->
     Store = adk_oidc_security_store,
     RefreshSup = adk_oidc_security_refresh_sup,
@@ -275,7 +512,20 @@ opaque_credentials_remain_user_isolated() ->
                          #{name => undefined,
                            credential_store_name => Store,
                            refresh_sup_name => RefreshSup,
-                           token_manager_name => Manager}),
+                           token_manager_name => Manager,
+                           authorization_exchange_sup_name =>
+                               adk_oidc_security_exchange_sup,
+                           authorization_flow_name =>
+                               adk_oidc_security_authorization_flow,
+                           provider_profiles =>
+                               #{<<"oidc-service">> =>
+                                     #{provider_module =>
+                                           adk_auth_provider_oidcc,
+                                       context =>
+                                           maps:remove(scopes,
+                                                       oauth_context()),
+                                       allowed_scopes => [<<"agent.run">>],
+                                       allowed_audiences => []}}}),
     unlink(Supervisor),
     try
         {ok, AliceRef} = adk_credential_store_ets:put(
@@ -285,10 +535,8 @@ opaque_credentials_remain_user_isolated() ->
                              client_secret => <<"alice-secret">>}),
         Request = #{principal => <<"alice">>,
                     provider => <<"oidc-service">>,
-                    provider_module => adk_auth_provider_oidcc,
                     credential_ref => AliceRef,
-                    scopes => [<<"agent.run">>],
-                    context => oauth_context()},
+                    scopes => [<<"agent.run">>]},
         {ok, #{access_token := <<"cc:alice-service">>}} =
             adk_token_manager:get_token(Manager, Request, 1000),
         BobRequest = Request#{principal => <<"bob">>},
@@ -370,7 +618,10 @@ claims(Overrides) ->
     maps:merge(Base, Overrides).
 
 token(Algorithm, Claims) ->
-    Header = jsx:encode(#{<<"alg">> => Algorithm, <<"typ">> => <<"JWT">>}),
+    token_with_type(Algorithm, <<"JWT">>, Claims).
+
+token_with_type(Algorithm, Type, Claims) ->
+    Header = jsx:encode(#{<<"alg">> => Algorithm, <<"typ">> => Type}),
     Payload = jsx:encode(Claims),
     <<(base64url(Header))/binary, ".", (base64url(Payload))/binary,
       ".fixture">>.

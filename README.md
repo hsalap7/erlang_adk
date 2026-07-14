@@ -1,18 +1,17 @@
-# Erlang ADK v0.5.0 (development)
+# Erlang ADK v0.6.0 (development)
 
 Erlang ADK is an experimental, Erlang-native toolkit for building Gemini-backed agents with OTP processes, supervision, tools, sessions, event streams, and concurrent multi-agent workflows.
 
-Version 0.5.0 is under active development on the `version_0.5.0` branch. The
-[v0.5.0 development contract](docs/VERSION_0_5_0.md) tracks its focus on
-artifacts, memory, and context and the verification gates required before
-those capability families are claimed complete. It builds on the completed
-0.4.0 agent, tool, and workflow release. The billable live Gemini suite
-remains a separate opt-in provider gate in a shell that owns `GEMINI_API_KEY`.
-The final 0.5 deterministic gate passes 765 EUnit tests, six Common Test
-scenarios, and warning-free Dialyzer over 160 project files. The full paid live
-run records 14 passes and two HTTP 429 rate-limit failures with no skips.
-The focused user guides are [artifacts](docs/ARTIFACTS.md),
-[memory](docs/MEMORY.md), and [context](docs/CONTEXT.md).
+Version 0.6.0 is under active development on the `version_0.6.0` branch. The
+[v0.6.0 development contract](docs/VERSION_0_6_0.md) tracks its focus on
+authentication, interoperable protocol boundaries, and a production-capable
+Phoenix UI. It builds on the completed 0.5.0 artifact, memory, and context
+work. The final v0.6 deterministic gate passes 899 EUnit tests, six Common
+Test scenarios, and warning-free Dialyzer over 170 project files. Escript
+packaging, `adk doctor`, checked config validation, the focused README/stress
+gates, and the Phoenix production build also pass. The billable Gemini suite
+remains a separate opt-in provider gate in a shell that owns
+`GEMINI_API_KEY`.
 
 The detailed [ADK behavior-parity matrix](docs/FEATURE_PARITY.md) maps the
 official ADK capability families to their Erlang/OTP-native implementation
@@ -29,7 +28,7 @@ BEAM concurrency without making one conversation nondeterministic.
 
 ## Current scope
 
-| Area | Status on the v0.5.0 branch |
+| Area | Status on the v0.6.0 branch |
 | --- | --- |
 | Gemini text, versioned multimodal content, function calling, Google Search grounding, thinking levels/summaries, adjustable safety settings, thought signatures, call IDs, SSE text/content streaming, structured-output settings, and provider capability discovery | Implemented on this branch; the bidirectional Gemini Live WebSocket API is not implemented |
 | Erlang tools and agents exposed as model tools | Compiled schemas, strict arguments, collision checks, isolated AgentTool calls, and Runner boolean confirmation are implemented; direct/workflow confirmation fails closed because those surfaces have no approval continuation |
@@ -50,19 +49,19 @@ BEAM concurrency without making one conversation nondeterministic.
 | Versioned artifacts | Partial 0.5 implementation: strict app/user/session scopes, immutable ETS/filesystem versions, quotas, paginated metadata, deadline-aware mutations, least-authority tool helpers, metadata-only event effects, one-request model-selected attachment, filesystem repair, exact-scope developer inspection/delete, and an opt-in bounded exact-scope sharded adapter are implemented; direct adapters serialize per service while sharded workers preserve same-scope ordering and let unrelated scopes overlap; durable lifetime scope/name/version admission fails explicitly before bounded scans can be exhausted; credit-based blob streaming and complete durable orphan recovery remain open |
 | Scoped long-term memory | Partial 0.5 implementation: the v2 app/user-scoped contract, bounded lexical ETS and durable local Mnesia adapters, provenance/idempotency, preload and model-selected retrieval, entry/session/user erasure, deadline-aware calls, fail-closed Mnesia-outbox admission, developer search/erase, and an opt-in bounded exact-user sharded adapter are implemented; durable delivery uses bounded resolution and a freshly revalidated ownership lease immediately before an idempotent at-least-once mutation; direct lexical adapters serialize per service while sharded workers overlap unrelated users; managed vector search, pending-job erasure coordination, and policy-driven retention remain adapters or application policy |
 | Context selection, compaction, and caching | Partial 0.5 implementation: mandatory model-boundary sanitization, complete-envelope budgets, O(n) exchange-aware selection, owner-bound compression, context fingerprints, opt-in Runner compaction with atomic ETS/Mnesia checkpoint persistence, a provider-prefix-cache lifecycle, and deterministic Gemini create/reuse/bypass/generate/stream wiring are implemented; cache installation synchronously rechecks every absolute waiter deadline and deletes an orphan provider resource when no live waiter remains; caching is request-prefix reuse rather than response caching, and billable live Gemini cache evidence remains a separate gate |
-| Auth and integrated developer tooling | Private scoped credentials, interactive PKCE suspension/completion, Oidcc-backed JWT/OAuth adapters, an authenticated bounded REST/SSE console, and the `adk` CLI are implemented; 0.5 adds exact-scope artifact/memory operations and content-free compaction/cache lifecycle; the clean deterministic and packaged-CLI gates pass, while the live result is 14 passes plus two HTTP 429 failures |
-| Phoenix LiveView companion | A complete stable-run integration pattern is documented below with authenticated principals, credit/ack replay, reconnect gaps, bounded UI state, and HITL resume; the public Erlang contract is tested here, while companion Elixir syntax is manually reviewed because this repository has no Mix compile gate |
+| Auth and integrated developer tooling | Immutable provider profiles, bounded single-flight OAuth tokens, supervised authorization-code + S256 PKCE, strict OIDC/JWT policy, default-deny operation scopes, issuer-bound run ownership, and loopback-only `/dev` tooling are implemented. `/dev` remains local single-operator administration, not an end-user API; durable encrypted secret storage and IdP revocation/back-channel logout remain deployment adapters. |
+| Phoenix LiveView companion | A checked-in Phoenix 1.8/LiveView application uses OIDC code+PKCE, opaque server-side login/session state, the default-deny Erlang gateway, bounded credit/ack event rendering, reconnect/cancel, and fail-closed typed HITL. It is an optional same-BEAM production companion, not a core Erlang dependency. |
 
 ## Installation
 
-While 0.5.0 is being developed, depend on this branch (or use a local path in
+While 0.6.0 is being developed, depend on this branch (or use a local path in
 the same way):
 
 ```erlang
 {deps, [
     {erlang_adk,
      {git, "https://github.com/hsalap7/erlang_adk.git",
-      {branch, "version_0.5.0"}}}
+      {branch, "version_0.6.0"}}}
 ]}.
 ```
 
@@ -1921,7 +1920,8 @@ AuthFun = fun() ->
     [{<<"authorization">>, <<"Bearer ", Token/binary>>}]
 end,
 {ok, HttpMcpClient} = adk_mcp_client:connect(
-    <<"streamable_http">>, McpUrl, #{auth_fun => AuthFun}),
+    <<"streamable_http">>, McpUrl,
+    #{auth_fun => AuthFun, allow_http_loopback => true}),
 {ok, McpToolset} = adk_toolset:new(adk_mcp_client, HttpMcpClient),
 {ok, [_]} = adk_toolset:expand_tools([McpToolset]),
 {ok, [_]} = adk_mcp_client:list_tools(HttpMcpClient),
@@ -1944,32 +1944,77 @@ descriptor used by local and OpenAPI toolsets; invocation context is not sent
 to the MCP server.
 
 The server binds to loopback and assigns bounded, expiring sessions by
-default. A non-loopback bind requires both authentication and the explicit
-`allow_non_loopback => true` acknowledgement. The included listener is clear
-HTTP; put it behind trusted TLS termination and network policy before using
-that acknowledgement.
+default. Each session is bound to the SHA-256 scope of the authenticated
+principal; a POST or DELETE using another principal receives the same 404 as
+an unknown session. A non-loopback bind requires authentication, the explicit
+`allow_non_loopback => true` acknowledgement, and either direct Cowboy TLS via
+`tls_options` or `trusted_tls_proxy => true`. Use the proxy acknowledgement only
+when the clear listener is network-reachable exclusively from that trusted TLS
+terminator; forwarding headers are not accepted as proof of TLS. Loopback may
+remain clear for development, but the client must opt in with
+`allow_http_loopback => true` as the example does.
 Configure `auth_token` (stored only as SHA-256 in listener state) or
 an `auth_fun/1` receiving request method/endpoint/origin/peer plus the transient
-Authorization header, exact `allowed_origins`, `max_body_bytes`,
+Authorization header. A successful production hook returns `{ok, PrincipalId}`.
+Use `authorization_fun/3` for exact operation/resource policy; it receives the
+credential-free authentication context, the MCP method (for example
+`<<"tools/call">>`), and a bounded resource descriptor. Also configure exact
+`allowed_origins`, `max_body_bytes`,
 `max_response_bytes`, `max_concurrency`, `request_timeout`, `max_sessions`,
-and `session_ttl_ms` before exposing it. HTTP bearer/OAuth acquisition remains
+`session_ttl_ms`, `callback_timeout`, and `callback_max_heap_words` before
+exposing it. Authentication and authorization hooks run in separate monitored,
+heap-limited workers and fail closed on timeout, crash, or oversize result.
+HTTP bearer/OAuth acquisition remains
 an application concern; the client accepts a zero-arity `auth_fun` so a token
 manager can supply fresh authorization headers without persisting a token in
 the MCP worker state. In production that callback must capture only an opaque
 token-manager reference, never the credential itself; MCP client/server status
 formatting suppresses callback internals and authentication messages.
 
+The HTTP client accepts HTTPS by default, resolves every address before
+connecting, pins one validated address while retaining the original Host/SNI,
+rejects redirects and private/reserved destinations, and applies one absolute
+deadline across authentication, connect, response headers, and body chunks.
+Use `allowed_hosts` to constrain public targets and
+`allowed_private_hosts` only for exact private HTTPS service names. Static
+credential headers, cookies, and `Proxy-Authorization` are rejected;
+`auth_fun/0` may return at most one origin `Authorization` header. These rules
+prevent a discovered or redirected endpoint from receiving credentials meant
+for another origin. Client authentication and custom `resolver_fun/1`
+callbacks run in monitored off-heap workers under the operation's absolute
+deadline; set `callback_max_heap_words` to cap each worker and
+`max_resolved_addresses` to cap the validated DNS set. Server authentication,
+authorization, tool, resource, and prompt callbacks use the corresponding
+`callback_max_heap_words` boundary, and only normalized responses within
+`max_response_bytes` cross back into the long-lived server process. Completion
+timestamps reject results that were queued after the deadline, process aliases
+suppress late replies, and owner watchdogs reap work when its client, server,
+or Cowboy request process dies.
+
+For OAuth-protected MCP, set `oauth_protected_resource` with the exact
+`resource`, one or more HTTPS `authorization_servers`, `scopes_supported`,
+`required_scopes`, and the externally authoritative HTTPS
+`resource_metadata_url`. The server publishes the unauthenticated RFC 9728
+document at `metadata_path` and includes `resource_metadata`, scope, and
+`insufficient_scope` details in Bearer challenges. This mode deliberately
+requires both `auth_fun/1` and `authorization_fun/3`; metadata without actual
+authentication and operation authorization is rejected at startup.
+
 This server returns JSON for POST and intentionally returns HTTP 405 for the
 optional unsolicited GET/SSE channel. The client accepts JSON and bounded SSE
 responses to POST. SSE resumability, resource subscriptions/templates,
-notifications, roots, sampling, elicitation, completion, MCP OAuth discovery,
-and a server-side stdio transport are explicit 0.5.0 limitations. Endpoint
+notifications, roots, sampling, elicitation, completion, client-side OAuth
+authorization-server discovery/PKCE, and a server-side stdio transport remain
+explicit limitations. Server-side RFC 9728 protected-resource discovery and
+challenges are implemented. Endpoint
 URLs containing user info, query strings, or fragments are rejected so bearer
 credentials cannot accidentally become request URLs. Deprecated
 HTTP+SSE (`<<"sse">>`) fails with
 `{error, {unsupported_transport, sse_deprecated_use_streamable_http}}`.
 The client and server also accept the finalized 2025-06-18 revision during
-version negotiation, while initiating new connections with 2025-11-25.
+version negotiation, while initiating new connections with 2025-11-25. If a
+client proposes an unsupported initialization version, the server negotiates
+the latest supported version as MCP requires.
 If Streamable HTTP reports a lost/expired session, the client reinitializes
 and automatically retries only read-only protocol operations (`tools/list`,
 `resources/list`, `resources/read`, `prompts/list`, `prompts/get`, and
@@ -1977,7 +2022,7 @@ and automatically retries only read-only protocol operations (`tools/list`,
 method whose first attempt may already have caused an effect; that call returns
 `{error, {mcp_session_lost, request_not_replayed}}`, and a later explicit
 application call uses the renewed session. Per-client HTTP request
-serialization and a separately bounded pending-request queue remain 0.5.0
+serialization and a separately bounded pending-request queue remain
 limitations; use independent supervised MCP clients for concurrency and
 failure isolation.
 
@@ -2388,7 +2433,17 @@ ok = application:set_env(
       max_tasks => 1000,
       max_active => 100,
       max_events => 256,
-      max_subscribers_per_task => 64}),
+      max_subscribers_per_task => 64,
+      max_subscriber_queue => 8,
+      max_input_bytes => 1048576,
+      max_message_bytes => 524288,
+      max_task_bytes => 4194304,
+      max_event_bytes => 2097152,
+      max_artifact_bytes => 2097152,
+      max_history_bytes => 2097152,
+      max_history_messages => 128,
+      max_artifacts => 128,
+      max_parts_per_artifact => 256}),
 ok = application:set_env(erlang_adk, a2a_v1_auth, none),
 ok = application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
 ok = application:set_env(erlang_adk, a2a_port, 8080),
@@ -2400,7 +2455,8 @@ ok = application:set_env(erlang_adk, a2a_port, 8080),
       instructions => <<"Write concise poems.">>}, []),
 
 {ok, RemoteCard} = adk_a2a_v1_client:discover(
-    <<"http://127.0.0.1:8080">>),
+    <<"http://127.0.0.1:8080">>,
+    #{allow_http_loopback => true}),
 A2AMessage = #{
     <<"messageId">> => <<"poem-request-1">>,
     <<"role">> => <<"ROLE_USER">>,
@@ -2409,7 +2465,8 @@ A2AMessage = #{
                        <<"mediaType">> => <<"text/plain">>}]
 },
 {ok, #{<<"task">> := A2ATask}} = adk_a2a_v1_client:send(
-    RemoteCard, A2AMessage, #{timeout => 65000}),
+    RemoteCard, A2AMessage,
+    #{timeout => 65000, allow_http_loopback => true}),
 <<"TASK_STATE_COMPLETED">> =
     maps:get(<<"state">>, maps:get(<<"status">>, A2ATask)),
 [#{<<"parts">> := [#{<<"text">> := A2APoem}]}] =
@@ -2424,15 +2481,45 @@ file content through base64 `raw` or an absolute `url`, with optional
 Task states use names such as `TASK_STATE_WORKING` and
 `TASK_STATE_COMPLETED`, not the lowercase 0.3 values.
 
-For a public or non-loopback deployment, use the OIDC hook and advertise its
-OpenID Connect security scheme in the Agent Card. `JwtPolicy` is an
-`adk_jwt_policy` value configured with exact HTTPS issuer, audience,
-asymmetric algorithm allow-list, time bounds, and required scopes:
+For a public or non-loopback deployment, use a dedicated A2A listener, the
+OIDC hook, matching Agent Card security declarations, explicit public-bind
+opt-in, and either direct TLS or an explicitly trusted TLS proxy. `JwtPolicy`
+is an `adk_jwt_policy` value configured with exact HTTPS issuer, audience,
+token type, maximum lifetime, asymmetric algorithm allow-list, time bounds,
+and required scopes. This direct-TLS example assumes the certificate files are
+readable only by the service account:
 
 ```erlang
+_ = application:stop(erlang_adk),
+{ok, PublicA2ACard} = adk_a2a_v1_card:new(
+    #{url => <<"https://agent.example.com:8443/a2a/v1">>,
+      security_schemes =>
+          #{<<"company-oidc">> =>
+                #{<<"openIdConnectSecurityScheme">> =>
+                      #{<<"openIdConnectUrl">> =>
+                            <<"https://identity.example.com/",
+                              ".well-known/openid-configuration">>}}},
+      security_requirements =>
+          [#{<<"schemes">> =>
+                 #{<<"company-oidc">> =>
+                       #{<<"list">> => [<<"a2a.invoke">>]}}}]}),
+ok = application:set_env(erlang_adk, dev_enabled, false),
+ok = application:set_env(erlang_adk, a2a_enabled, false),
+ok = application:set_env(erlang_adk, a2a_v1_enabled, true),
+ok = application:set_env(erlang_adk, a2a_v1_card, PublicA2ACard),
 ok = application:set_env(
     erlang_adk, a2a_v1_auth, adk_a2a_v1_oidc_auth),
-ok = application:set_env(erlang_adk, a2a_v1_jwt_policy, JwtPolicy).
+ok = application:set_env(erlang_adk, a2a_v1_jwt_policy, JwtPolicy),
+ok = application:set_env(erlang_adk, a2a_ip, {0, 0, 0, 0}),
+ok = application:set_env(erlang_adk, a2a_port, 8443),
+ok = application:set_env(erlang_adk, a2a_allow_non_loopback, true),
+ok = application:set_env(erlang_adk, a2a_v1_auth_timeout_ms, 5000),
+ok = application:set_env(erlang_adk, a2a_v1_auth_max_heap_words, 300000),
+ok = application:set_env(
+    erlang_adk, a2a_tls_options,
+    [{certfile, "/run/secrets/a2a-cert.pem"},
+     {keyfile, "/run/secrets/a2a-key.pem"}]),
+{ok, _} = application:ensure_all_started(erlang_adk).
 ```
 
 The authorization hook receives request headers transiently and returns a
@@ -2442,15 +2529,47 @@ tasks or events. Cross-principal lookup, listing, cancellation, and
 subscription all return the same not-found result as an unknown task. The
 outbound client obtains authorization headers just in time through
 `auth_fun/0`, so a token manager can rotate credentials without storing them
-in client state.
+in client state. For a secured card, pass the exact declared scheme name as
+`auth_scheme` together with `auth_fun`; an undeclared or missing scheme fails
+closed. Card discovery has a separate `discovery_auth_fun`, so an RPC bearer is
+never sent to the discovery origin by accident. Outbound requests require
+HTTPS, resolve and validate every address, pin the validated destination, and
+reject redirects and cross-origin interfaces by default. Each public client
+call has one absolute deadline, including its monitored, heap-limited
+credential callback; when a single RPC call receives a location and performs
+discovery itself, that deadline spans discovery and RPC. Calling `discover/2`
+first and then passing the returned card to `send/3` creates two separately
+bounded operations. Narrow `allowed_hosts`, `allowed_private_hosts`,
+`allowed_interface_origins`, `max_extensions`, `max_extension_header_bytes`,
+`auth_timeout`, and `auth_max_heap_words` for the deployment. Clear HTTP is
+accepted only
+when every resolved address is loopback and `allow_http_loopback => true`.
+Authentication and DNS workers use aliases, completion timestamps, bounded
+normalized results, and owner watchdogs; DNS admission stops at 64 addresses,
+and killing the request owner reaps the worker instead of leaving an orphan.
+A public listener refuses to share `/dev` or the legacy
+`/a2a/prompt` route. If TLS terminates at a proxy instead, set
+`a2a_trusted_tls_proxy` only when the listener is reachable exclusively from
+that trusted proxy; forwarded headers alone are not a trust boundary.
 
 Current limitations are explicit: this release implements the JSON-RPC 1.0
-binding, not gRPC or HTTP+JSON; push-notification configuration, extended
-Agent Cards, and Agent Card JWS signing/verification are not implemented.
+binding, not gRPC or HTTP+JSON. Push-notification configuration and extended
+Agent Cards return their canonical A2A unsupported-operation errors; they and
+Agent Card JWS signing/verification are not implemented. Agent Card security
+schemes/requirements are structurally validated, but the bundled client only
+authenticates a requirement alternative containing one exact declared scheme;
+compound AND requirements fail locally as unsupported. The operator must keep
+the server hook's actual scheme/scopes aligned with its card—the runtime cannot
+infer callback semantics. Bounded required `A2A-Extensions` negotiation is
+validated.
 Tasks and replay buffers are node-local and bounded rather than distributed
 durable storage. `Last-Event-ID` reconnect works only inside the retained event
-window. Put clear HTTP behind trusted TLS termination and network policy before
-using a non-loopback bind. See the official [A2A 1.0
+window. A slow server-side SSE subscriber is detached at its configured mailbox
+ceiling and reconnects from that cursor; the bundled outbound client returns a
+bounded decoded event list rather than an unbounded live callback. Clear HTTP
+is restricted to loopback; a non-loopback startup fails
+closed without the explicit authentication, card, and TLS conditions above.
+See the official [A2A 1.0
 specification](https://a2a-protocol.org/latest/specification/) for the binding
 and data-model contract.
 
@@ -2832,14 +2951,27 @@ ok = application:set_env(
     erlang_adk, oidc_providers,
     [#{name => company_oidc,
        issuer => <<"https://identity.example.com">>}]),
+ok = application:set_env(
+    erlang_adk, auth_provider_profiles,
+    #{<<"orders-api">> =>
+          #{provider_module => adk_auth_provider_oidcc,
+            context => #{provider_worker => company_oidc},
+            allowed_scopes => [<<"orders.read">>],
+            allowed_audiences => [<<"https://orders.example.com">>],
+            resource_indicator => true}}),
 {ok, _} = application:ensure_all_started(erlang_adk),
 {ok, JwtPolicy} = adk_jwt_policy:new(
     #{issuer => <<"https://identity.example.com">>,
       audience => <<"erlang-adk-api">>,
       trusted_audiences => [],
       signing_algs => [<<"RS256">>],
+      allowed_token_types => [<<"at+jwt">>],
+      token_use => access_token,
+      max_token_lifetime_seconds => 3600,
       clock_skew_seconds => 30,
       required_scopes => [<<"agent.run">>],
+      verifier_timeout_ms => 5000,
+      verifier_max_heap_words => 262144,
       provider => company_oidc}),
 {ok, Identity} = adk_jwt_policy:authenticate(
     JwtPolicy, RequestHeaders),
@@ -2849,9 +2981,18 @@ Principal = maps:get(principal, Identity).
 `RequestHeaders` must come from the HTTP boundary; tokens in query parameters
 or request bodies are not accepted. In addition to Oidcc signature/JWKS checks,
 the policy independently enforces HTTPS issuer equality, audience containment,
-an asymmetric algorithm allow-list, expiration/not-before/issued-at, subject,
-scope, bounded clock skew, and a safe claim allow-list. The returned principal
-is issuer-bound, so identical subjects from different issuers cannot collide.
+an asymmetric algorithm and token-type allow-list,
+maximum token lifetime, expiration/not-before/issued-at, subject, scope,
+bounded clock skew, and a safe claim allow-list. The returned principal is
+issuer-bound, so identical subjects from different issuers cannot collide.
+The verifier callback and its normalized claims execute in a monitored,
+deadline- and heap-bounded worker; late, oversized, crashed, or heap-exhausted
+verification fails closed without retaining a reply in the caller mailbox.
+`token_use => access_token` deliberately does not compare the OIDC `azp`
+(client) claim with the API resource audience. Consumers that validate an ID
+token directly must select `token_use => id_token`; the Phoenix code exchange
+also validates nonce and `azp` against its configured OIDC client before the
+identity reaches the gateway.
 
 Outbound service credentials remain scoped to that opaque principal. Load the
 secret outside the repository, store it once, and give tools only the opaque
@@ -2873,378 +3014,228 @@ ClientSecret = unicode:characters_to_binary(ClientSecretString),
     adk_token_manager,
     #{principal => Principal,
       provider => <<"orders-api">>,
-      provider_module => adk_auth_provider_oidcc,
       credential_ref => CredentialRef,
       scopes => [<<"orders.read">>],
-      audience => <<"orders-api">>,
-      context => #{provider_worker => company_oidc}},
+      audience => <<"https://orders.example.com">>},
     15000),
 <<"Bearer">> = maps:get(token_type, OAuthToken).
 ```
 
-Concurrent requests for the same principal/provider/scopes/audience join one
-monitored refresh. Refresh-token grants require an expected subject; when a
+The provider module, its base context, allowed scopes/audiences, and RFC 8707
+resource-indicator policy come only from the immutable operator profile loaded
+when `adk_auth_sup` starts. A request cannot replace them. Concurrent requests
+for the same principal/provider/scopes/audience join one monitored refresh;
+cache size, in-flight refreshes, and waiters per refresh are bounded. On
+credential deletion or revocation, call `adk_token_manager:invalidate/2` with
+the exact principal, provider, and opaque credential reference before removing
+the credential. Refresh-token grants require an expected subject; when a
 provider rotates the refresh token, the new value is atomically persisted
 before the access token is released. A stale compare-and-swap or storage
 failure fails closed. The built-in ETS store is private and node-local;
 production secret-manager adapters implement `adk_credential_store`, including
 atomic `compare_and_swap/6`, and should be durable and encrypted.
 
-Interactive user OAuth/OIDC uses the same durable Runner suspension mechanism
-as other long-running tools. The application creates an S256 PKCE flow before
-showing the provider authorization URI:
+Interactive user OAuth/OIDC uses the supervised authorization-code manager and
+the same durable Runner suspension contract as other long-running tools. Put
+provider/client/redirect/resource/scope policy behind a zero-arity loader so a
+client secret never appears in a supervisor child specification:
 
 ```erlang
-CorrelationId = <<"calendar-consent-42">>,
-{ok, Pkce} = adk_suspension:prepare_pkce(
-    adk_credential_store_ets, adk_credential_store_ets,
-    Principal, <<"calendar">>, CorrelationId),
-FlowRef = maps:get(<<"credential_flow_ref">>, Pkce),
-#{<<"pkce_challenge">> := Challenge,
-  <<"pkce_method">> := <<"S256">>} = Pkce.
+ok = application:set_env(
+    erlang_adk, auth_authorization_profile_loader,
+    {my_auth_profiles, load}).
 ```
 
-Only `Challenge` and the opaque `FlowRef` cross the browser/event boundary.
-The verifier stays in private credential storage. After the HTTPS callback has
-validated provider state and exchanged the authorization code, atomically
-replace the pending verifier with the issued credential:
+`my_auth_profiles:load/0` returns an immutable provider map. A production Oidcc
+entry has `adapter_module => adk_oidcc_authorization_code_adapter` and an
+`adapter_context` containing the configured `provider_worker`, `client_id`, and
+secret-manager-sourced `client_secret`; it also fixes the HTTPS `redirect_uri`,
+`allowed_scopes`, `default_scopes`, optional RFC 8707 `resource`, lifetime, and
+public prompt. The loader module is trusted operator code and must not use
+request or model data.
+
+Authorization-URI construction defaults to a two-second deadline and code
+exchange to a 30-second deadline. Both adapter calls run in monitored,
+owner-bound workers with a 262,144-word default heap cap and bounded results;
+standalone `adk_auth_sup` deployments may tighten these through
+`authorization_flow_opts` (`authorization_uri_timeout_ms`,
+`exchange_timeout_ms`, and `adapter_max_heap_words`). The profile loader is
+trusted boot-time operator code, not a request callback or a hostile-code
+sandbox.
+
+Begin the flow only from an authenticated application context. The returned
+map is directly usable with `adk_suspension:request_credential/2`:
 
 ```erlang
-{ok, FlowRef} = adk_suspension:complete_pkce(
-    adk_credential_store_ets, adk_credential_store_ets,
-    Principal, <<"calendar">>, FlowRef, CorrelationId,
-    #{kind => oauth_refresh_token,
-      client_id => CalendarClientId,
-      refresh_token => ProviderRefreshToken}).
+{ok, CredentialRequest} = adk_authorization_flow:begin_flow(
+    adk_authorization_flow,
+    #{principal => Principal,
+      provider => <<"calendar">>,
+      scopes => [<<"openid">>, <<"calendar.read">>]}),
+AuthorizationUri = maps:get(<<"authorization_uri">>, CredentialRequest),
+State = maps:get(<<"correlation_id">>, CredentialRequest),
+FlowRef = maps:get(<<"credential_flow_ref">>, CredentialRequest),
+#{<<"pkce_method">> := <<"S256">>} = CredentialRequest.
 ```
 
-`complete_pkce/7` is compare-and-swap protected: the same callback cannot
-complete twice, the correlation and principal/provider scope must match, and
-the pending verifier must be no more than ten minutes old, and the verifier is
-removed before resume. Runner accepts only the exact completed `FlowRef` from
-that pause; another credential for the same principal, provider, and
-correlation cannot satisfy it. The tool calls
-`adk_suspension:request_credential/2` with the public authorization request;
-Runner resume accepts only the same `CorrelationId` and `FlowRef`, never a raw
-authorization code or token. Phoenix or another HTTPS boundary remains
-responsible for provider `state`, callback CSRF validation, and the code
-exchange.
+The HTTPS callback gives the manager only the one-time state and bounded
+authorization code. It performs the exact provider/client/redirect/nonce/PKCE
+exchange internally and atomically replaces the pending credential:
+
+```erlang
+{ok, ResumeResponse} = adk_authorization_flow:complete(
+    adk_authorization_flow, State, AuthorizationCode),
+FlowRef = maps:get(<<"credential_ref">>, ResumeResponse),
+State = maps:get(<<"correlation_id">>, ResumeResponse).
+```
+
+Provider profiles, nonce, verifier, client credentials, and token results
+remain in private/bounded processes and owner-private ETS. The high-entropy
+state is intentionally returned in the authorization URI and the bounded code
+arrives at the callback; both are transient correlation inputs and are never
+placed in model/session data or telemetry. State is atomically claimed before
+exchange, so replay, provider mix-up, callback races, expiry, timeout, and
+cancellation fail closed. The validated provider `sub` becomes
+the refresh credential's `expected_subject`; the separate issuer-bound local
+`Principal` remains the credential-store owner. Runner resume accepts only the
+matching opaque `FlowRef` and `State`, never a raw authorization code or token.
+Call `adk_authorization_flow:cancel/2` when the browser abandons a flow.
 
 The `/dev` bearer token is deliberately only local developer authentication.
 It must not be reused as end-user identity, a model API key, or a tool
 credential.
 
-## Phoenix LiveView integration
+## Phoenix LiveView companion
 
-Phoenix is compatible with this Erlang application and remains an optional
-companion, not a core dependency. Put the Phoenix app beside this repository
-and let Mix build the Rebar dependency:
+Phoenix is compatible with Erlang ADK and remains an optional companion rather
+than a core dependency. Version 0.6 checks in a complete Phoenix 1.8/LiveView
+application at `examples/phoenix_adk_ui`. It runs in the same BEAM release and
+calls `adk_web_gateway` directly; it does not proxy the local `/dev/v1`
+administrator API.
 
-```bash
-cd ..
-mix phx.new phoenix_app --live
-cd phoenix_app
-```
+The gateway authorizes requests in independent lightweight workers. Defaults
+admit 64 concurrent checks with a one-second callback deadline and a
+100,000-word heap cap; deployments can tighten `max_authorizations`,
+`authorizer_timeout_ms`, and `authorizer_max_heap_words` in their trusted
+`gateway_options/0`. Callback crash, timeout, oversized input/result, caller
+death, or heap exhaustion fails closed without terminating the gateway.
 
-```elixir
-# phoenix_app/mix.exs
-defp deps do
-  [
-    {:phoenix, "~> 1.8.9"},
-    {:phoenix_live_view, "~> 1.2.6"},
-    {:oidcc_plug, "~> 0.4.0"},
-    {:erlang_adk, path: "../erlang_adk", manager: :rebar3}
-  ]
-end
-```
-
-Then fetch and compile both dependency trees before adding the LiveView below:
+The companion uses `gemini-3.1-flash-lite` and a server-owned agent catalog.
+For local development, configure an OIDC client whose callback exactly matches
+the value below:
 
 ```bash
-mix deps.get
+cd examples/phoenix_adk_ui
+export GEMINI_API_KEY="your_api_key_here"
+export OIDC_ISSUER="https://identity.example.com"
+export OIDC_CLIENT_ID="erlang-adk-ui"
+export OIDC_CLIENT_SECRET="load-this-from-your-secret-manager"
+export OIDC_REDIRECT_URI="http://127.0.0.1:4000/auth/callback"
+export OIDC_SCOPES="openid adk.agents.read adk.run.start adk.run.read adk.run.control"
+mix setup
+mix phx.server
+```
+
+Open `http://127.0.0.1:4000/auth/login`. A public OIDC client may set
+`OIDC_PUBLIC_CLIENT=true` instead of exporting a client secret; S256 PKCE
+remains mandatory. `OIDC_SIGNING_ALGS` defaults to `RS256`. The identity
+provider must actually grant the configured ADK scopes—changing a browser form
+or cookie cannot add them.
+
+The browser cookie contains only Phoenix's encrypted session and opaque random
+handles. The nonce, verifier, provider exchange data, and sanitized identity
+remain in bounded, expiring server-side stores. The high-entropy OAuth state is
+also sent through the browser/IdP redirect and is atomically consumed before
+code exchange; it is not treated as a secret. Browser sessions rotate at login,
+logout revokes the
+server entry, and callback replay fails closed. The default production boundary
+uses external OIDC; the Erlang core deliberately does not store passwords. A
+deployment that needs local accounts may replace the auth provider with
+Phoenix-generated authentication and a maintained password hasher, while
+keeping the same issuer-bound identity and gateway policy contract.
+
+Every connected mount and browser event re-fetches the server session and calls
+the default-deny Erlang gateway. Final output and replay-gap handling also
+re-check session validity and run ownership before rendering. The gateway:
+
+- derives the ADK user and opaque owner scope from the validated issuer and
+  subject;
+- resolves agents from an immutable server-owned catalog;
+- requires exact scopes for list, start, observe, control, and resume;
+- makes cross-owner and unknown runs indistinguishable;
+- preserves owner scope when a paused run is resumed.
+
+A LiveView owns only a credit/ack subscription. The stable run is independently
+supervised, survives browser disconnects, and reconnects from the last
+acknowledged sequence stored in the server-side session. Rendered events,
+encoded bytes, prompts, outputs, login flows, sessions, and reconnect state are
+bounded. Confirmation and human-approval responses are typed; an unknown pause
+type remains paused and displays no action buttons.
+
+Run the companion's deterministic and release gates from its directory:
+
+```bash
+mix format --check-formatted
 mix compile --warnings-as-errors
-iex -S mix phx.server
+mix test
+MIX_ENV=prod mix assets.deploy
+MIX_ENV=prod mix release
+mix hex.audit
 ```
 
-In that IEx shell, register the agent used by the example (the dependency
-application may already be started):
+The first five commands must pass. At the current lock, `mix hex.audit`
+intentionally exits non-zero for the two Cowlib 2.18.0 advisories documented in
+the companion README. That output is a visible release exception to resolve on
+an official fixed dependency, not a passing gate and not a reason to disable
+TLS verification or the audit. As of 2026-07-14, Cowlib 2.18.0 is still the
+latest official release and neither EEF advisory has a fixed-version event, so
+there is no safe official dependency bump yet.
 
-```elixir
-{:ok, _started} = :application.ensure_all_started(:erlang_adk)
-{:ok, _agent_pid} =
-  :erlang_adk.spawn_agent(
-    <<"PhoenixAgent">>,
-    %{
-      provider: :adk_llm_gemini,
-      model: <<"gemini-3.1-flash-lite">>,
-      instructions: <<"Answer concisely.">>
-    },
-    []
-  )
+The final companion gate passes all 46 tests, production asset compilation,
+and release assembly. The packaged release also boots with test-only
+trusted-proxy and direct-TLS configurations, returns HTTP 200 from `/health`
+on loopback in both modes, and stops cleanly.
+
+The lock file pins the official Phoenix LiveView fix commit for
+CVE-2026-58228 until a fixed Hex release at or above 1.2.7 is available. Do not
+replace that pin with an affected range merely to silence an audit. Keep
+`mix.lock` in version control.
+
+For a direct-TLS release, export the OIDC values above with an HTTPS callback,
+then set `SECRET_KEY_BASE`, `PHX_HOST`, `TLS_CERT_PATH`, and
+`TLS_KEY_PATH` before starting the release:
+
+```bash
+export PHX_SERVER=true
+export PHX_HOST="agents.example.com"
+export PORT=8443
+export PHX_URL_PORT=8443
+export SECRET_KEY_BASE="$(mix phx.gen.secret)"
+export OIDC_REDIRECT_URI="https://agents.example.com:8443/auth/callback"
+export TLS_CERT_PATH="/run/secrets/tls-cert.pem"
+export TLS_KEY_PATH="/run/secrets/tls-key.pem"
+_build/prod/rel/erlang_adk_ui/bin/erlang_adk_ui start
 ```
 
-Run the Erlang ADK deterministic gates independently in the `erlang_adk`
-directory. This repository does not contain the companion Mix project, so its
-CI cannot claim that manually copied Elixir code compiled in the user's app.
+Alternatively set `PHX_BEHIND_HTTPS_PROXY=true` and omit the certificate
+paths only when the HTTP listener is network-reachable exclusively through a
+trusted TLS terminator. Phoenix's forwarded-protocol rewrite is an explicit
+proxy trust decision: the proxy must overwrite `X-Forwarded-Host`,
+`X-Forwarded-Port`, and `X-Forwarded-Proto`, and forwarded headers from
+arbitrary clients are not a TLS boundary. Production configuration enforces
+secure/HttpOnly/SameSite cookies, connection-exact LiveView scheme/host/port,
+CSRF, CSP, HSTS, body limits, and a bounded channel implementation.
 
-`oidcc_plug` is needed only when Phoenix owns the browser OIDC boundary. Pin a
-patched Phoenix line and keep the companion application's lock file current;
-Phoenix 1.8.9 includes the
-[per-transport channel bound](https://osv.dev/vulnerability/EEF-CVE-2026-56811)
-required to prevent a single socket from spawning an unbounded number of
-channel processes.
+The production companion currently covers authenticated agent execution and
+typed decisions. Artifact, memory, context, approver, operator, or admin panels
+must be added as separately authorized server-side gateway operations; never
+give the browser a service PID, credential reference, filesystem root, cache
+lease, provider resource name, or caller-selected app/user scope. The Erlang
+`/dev` console remains loopback-only single-operator tooling and must not be
+mounted behind this public endpoint.
 
-The important lifecycle rule is that a LiveView subscribes to a stable run; it
-does not own the run process. This minimal LiveView starts a run from an
-authenticated server-side user ID and consumes correlated messages:
-
-```elixir
-defmodule MyAppWeb.AgentLive do
-  use MyAppWeb, :live_view
-
-  @app_name <<"phoenix_app">>
-  @max_rendered_events 200
-
-  def render(assigns) do
-    ~H"""
-    <main id="agent-live">
-      <h1>PhoenixAgent</h1>
-      <form phx-submit="send">
-        <input name="message" type="text" required autocomplete="off" />
-        <button type="submit">Send</button>
-      </form>
-
-      <p :if={@run_id}>Run: <code><%= @run_id %></code></p>
-      <ol id="agent-events">
-        <li :for={item <- @events}>
-          <pre><%= inspect(item) %></pre>
-        </li>
-      </ol>
-
-      <div :if={@paused} id="agent-approval">
-        <button phx-click="approve" phx-value-decision="approve">Approve</button>
-        <button phx-click="approve" phx-value-decision="reject">Reject</button>
-      </div>
-      <pre :if={@outcome} id="agent-outcome"><%= inspect(@outcome) %></pre>
-    </main>
-    """
-  end
-
-  def mount(_params, %{"user_id" => user_id}, socket) do
-    session_id = "session-#{System.unique_integer([:positive, :monotonic])}"
-
-    {:ok,
-     assign(socket,
-       user_id: user_id,
-       session_id: session_id,
-       run_id: nil,
-       last_sequence: 0,
-       events: [],
-       paused: false,
-       outcome: nil
-     )}
-  end
-
-  def handle_event("send", %{"message" => message}, socket) do
-    {:ok, agent_pid} = :adk_agent_registry.lookup(<<"PhoenixAgent">>)
-    runner =
-      :adk_runner.new(
-        agent_pid,
-        @app_name,
-        :erlang_adk_session,
-        %{
-          admission_control: %{overflow: :queue, queue_timeout: 5_000},
-          runtime_policy: %{
-            id: <<"phoenix-agent-policy">>,
-            agents: %{allow: [<<"PhoenixAgent">>]},
-            tools: %{allow: :all, deny: [<<"shell">>]},
-            max_argument_bytes: 32_768,
-            max_content_bytes: 262_144
-          }
-        }
-      )
-
-    {:ok, run_id} =
-      :adk_run.start(
-        runner,
-        socket.assigns.user_id,
-        socket.assigns.session_id,
-        message
-      )
-
-    {:ok, _subscription} = :adk_run.subscribe_credit(run_id, self(), 0)
-
-    {:noreply,
-     assign(socket,
-       run_id: run_id,
-       last_sequence: 0,
-       events: [],
-       paused: false,
-       outcome: nil
-     )}
-  end
-
-  def handle_info({:adk_run_event, run_id, sequence, event},
-                  %{assigns: %{run_id: run_id}} = socket) do
-    item = %{sequence: sequence, event: :adk_event.to_map(event)}
-    events = Enum.take(socket.assigns.events ++ [item], -@max_rendered_events)
-    socket =
-      assign(socket,
-        events: events,
-        last_sequence: sequence,
-        paused: socket.assigns.paused or pause_event?(item.event)
-      )
-
-    # Return credit only after this event has been converted and retained in
-    # the bounded UI history. Exactly one next run message may then arrive.
-    case :adk_run.ack(run_id, self(), sequence) do
-      :ok ->
-        {:noreply, socket}
-
-      {:error, {:replay_gap, gap}} ->
-        {:noreply, stop_subscription(socket, {:replay_gap, gap})}
-
-      {:error, reason} ->
-        {:noreply, stop_subscription(socket, {:ack_failed, reason})}
-    end
-  end
-
-  def handle_info({:adk_run_terminal, run_id, sequence, outcome},
-                  %{assigns: %{run_id: run_id}} = socket) do
-    _ = :adk_run.unsubscribe(run_id, self())
-    {:noreply,
-     assign(socket, outcome: outcome, last_sequence: sequence, paused: false)}
-  end
-
-  def handle_info({:adk_run_replay_gap, run_id, gap},
-                  %{assigns: %{run_id: run_id}} = socket) do
-    {:noreply, stop_subscription(socket, {:replay_gap, gap})}
-  end
-
-  # A terminal/event from an earlier run may already be in this LiveView's
-  # mailbox when a resumed run becomes current. Correlation prevents it from
-  # changing the new run's UI state.
-  def handle_info({:adk_run_event, stale_run_id, _sequence, _event}, socket) do
-    :adk_run.unsubscribe(stale_run_id, self())
-    {:noreply, socket}
-  end
-
-  def handle_info({:adk_run_terminal, stale_run_id, _sequence, _outcome}, socket) do
-    :adk_run.unsubscribe(stale_run_id, self())
-    {:noreply, socket}
-  end
-
-  def handle_info({:adk_run_replay_gap, stale_run_id, _gap}, socket) do
-    :adk_run.unsubscribe(stale_run_id, self())
-    {:noreply, socket}
-  end
-
-  def handle_event("approve", %{"decision" => decision},
-                   %{assigns: %{run_id: paused_run_id}} = socket) do
-    confirmed = decision == "approve"
-    tool_response = resume_payload(
-      socket.assigns.events, confirmed, socket.assigns.user_id)
-
-    {:ok, resumed_run_id} = :adk_run.resume(paused_run_id, tool_response)
-    {:ok, _subscription} =
-      :adk_run.subscribe_credit(resumed_run_id, self(), 0)
-
-    {:noreply,
-     assign(socket,
-       run_id: resumed_run_id,
-       last_sequence: 0,
-       events: [],
-       paused: false,
-       outcome: nil
-     )}
-  end
-
-  defp resume_payload(events, confirmed, user_id) do
-    pause_type =
-      Enum.find_value(Enum.reverse(events), fn
-        %{event: %{"actions" => %{"pause" =>
-          %{"details" => %{"type" => type}}}}} -> type
-        _ -> nil
-      end)
-
-    case pause_type do
-      "tool_confirmation" -> %{"confirmed" => confirmed}
-      nil -> %{"approved" => confirmed, "approver" => user_id}
-      unsupported -> raise ArgumentError,
-        "unsupported pause type: #{inspect(unsupported)}"
-    end
-  end
-
-  defp pause_event?(%{"actions" => %{"pause" => _pause}}), do: true
-  defp pause_event?(_event), do: false
-
-  defp stop_subscription(socket, reason) do
-    # Unsubscribe is idempotent from the UI's perspective: a terminal run or
-    # monitor cleanup may already have removed this subscriber.
-    _ = :adk_run.unsubscribe(socket.assigns.run_id, self())
-    assign(socket, outcome: {:stream_error, reason}, paused: false)
-  end
-
-  def terminate(_reason, %{assigns: %{run_id: run_id}}) when is_binary(run_id) do
-    # Unsubscribe is optional because the run monitors subscribers. Never
-    # cancel here: a browser disconnect must not terminate useful work.
-    :adk_run.unsubscribe(run_id, self())
-    :ok
-  end
-
-  def terminate(_reason, _socket), do: :ok
-end
-```
-
-Add `live "/agent", AgentLive, :index` inside an authenticated browser scope
-in `router.ex`. Its authenticated `live_session` hook must place the trusted
-server-side UTF-8 binary identifier in the LiveView session as
-`%{"user_id" => user_id}`; convert an integer database ID with
-`Integer.to_string/1`. Do not take it from a route parameter or form field.
-The generated `mix phx.gen.auth` flow can provide that hook from
-`current_user`.
-
-Persist the binary `run_id` and last fully handled sequence in the URL or an
-authenticated server session. After a LiveView reconnect, call
-`:adk_run.subscribe_credit(run_id, self(), last_sequence)`. Handle an initial
-`{:error, {:replay_gap, details}}` the same way as the asynchronous gap above;
-the client must reload a session/status snapshot rather than pretend a partial
-replay is complete. Render event maps, not Erlang records, at the web boundary,
-and keep both rendered assigns and any browser DOM history bounded. Derive
-`user_id` and authorization from the authenticated Phoenix session rather than
-request parameters. The example distinguishes the built-in
-`tool_confirmation` response from the legacy application-defined approval
-shape; add an explicit branch for every other pause type your UI supports and
-fail closed for unknown types in production.
-
-For artifact, memory, and context panels, keep scope resolution on the server.
-A Phoenix controller or LiveView may call the Erlang services directly using
-the authenticated session's `app_name`/`user_id`, or proxy a separately
-authenticated application endpoint. Never give the browser a service PID,
-Mnesia table, filesystem root, context capability, cache lease, or provider
-resource name. The built-in `/dev/v1` API is useful for local integration
-testing, but its loopback bearer token is developer authentication and must not
-be promoted into a production end-user API. If a companion exposes cache
-invalidation, show and confirm its real provider/app/user/model/policy breadth:
-the inspected session is only the authorization anchor, and every matching
-prefix/TTL entry across that user's sessions is removed.
-
-To exercise the companion locally, export `GEMINI_API_KEY`, run the IEx startup
-above, and open `/agent` in two authenticated browser tabs. Verify that both
-tabs receive only their correlated `run_id`. Kill or reload one tab while a
-run is active: the stable run must continue, and a new LiveView must reconnect
-using its last acknowledged sequence. Also test a confirmation pause, an
-expired replay window, cancellation, and a deliberately wrong user/session
-scope; the last case must fail without exposing resource existence.
-
-For local username/password accounts, Phoenix's generated auth flow is the
-maintained starting point. For enterprise identity, the selected design is
-OpenID Connect: use [`oidcc_plug`](https://hex.pm/packages/oidcc_plug) in the
-Phoenix boundary and [`oidcc`](https://hex.pm/packages/oidcc) in pure Erlang
-services, with issuer, audience, algorithm, expiry, and scope policy configured
-explicitly. Model API keys, incoming user identity, and outbound per-user tool
-tokens are separate credential classes and must never be copied into LiveView
-assigns, prompts, session state, events, or telemetry.
+See `examples/phoenix_adk_ui/README.md` for configuration, topology, test, and
+release details.
 
 ## Verification
 
@@ -3258,10 +3249,16 @@ _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
 ```
 
-The packaged-CLI gate passes on 2026-07-14. `adk doctor` reports version
-`0.5.0`, OTP 27, `gemini-3.1-flash-lite`, all required dependencies, and a
-configured Gemini key with no warnings; checked validation accepts
+After a successful v0.6 packaging gate, `adk doctor` must report version
+`0.6.0`, OTP 27, `gemini-3.1-flash-lite`, all required dependencies, and a
+configured Gemini key without exposing it; checked validation must accept
 `examples/agent.json` with the same model.
+
+The final 2026-07-14 clean run passed 899 EUnit tests and six deterministic
+Common Test cases, and Dialyzer completed without warnings over 170 project
+files. The separate packaging commands passed; `adk doctor` reported v0.6.0,
+OTP 27, the expected default model and dependency availability while exposing
+only that the Gemini key was configured.
 
 Run the focused deterministic README smoke suite with:
 
@@ -3280,6 +3277,9 @@ test-process mailbox.
 The 0.5 stress suite separately executes 1,000 bounded artifact/memory writes
 across isolated scopes and 128 concurrent context-cache acquisitions across
 four exact scopes; the latter collapse to four provider creates/deletes.
+The focused v0.6 run passed all 29 README examples, all four workflow examples,
+the 1,000-run concurrency scenario, and both v0.5 resource/context stress
+scenarios.
 
 Run the opt-in live Gemini suite after exporting `GEMINI_API_KEY` with:
 

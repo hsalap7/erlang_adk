@@ -3,13 +3,19 @@
 
 -export([dispatch/5, method_type/1, rpc_error/2, task_state/1]).
 
--spec method_type(binary()) -> unary | stream | unknown.
+-spec method_type(binary()) ->
+    unary | stream | unsupported_push | unsupported | unknown.
 method_type(<<"SendMessage">>) -> unary;
 method_type(<<"SendStreamingMessage">>) -> stream;
 method_type(<<"GetTask">>) -> unary;
 method_type(<<"ListTasks">>) -> unary;
 method_type(<<"CancelTask">>) -> unary;
 method_type(<<"SubscribeToTask">>) -> stream;
+method_type(<<"CreateTaskPushNotificationConfig">>) -> unsupported_push;
+method_type(<<"GetTaskPushNotificationConfig">>) -> unsupported_push;
+method_type(<<"ListTaskPushNotificationConfigs">>) -> unsupported_push;
+method_type(<<"DeleteTaskPushNotificationConfig">>) -> unsupported_push;
+method_type(<<"GetExtendedAgentCard">>) -> unsupported;
 method_type(_) -> unknown.
 
 -spec dispatch(gen_server:server_ref(), map(), term(), binary(), map()) ->
@@ -48,6 +54,9 @@ dispatch(Server, Auth, Id, <<"CancelTask">>, Params) ->
 dispatch(_Server, _Auth, Id, Method, _Params) ->
     case method_type(Method) of
         stream -> {error, rpc_error(Id, stream_method_requires_sse)};
+        unsupported_push ->
+            {error, rpc_error(Id, push_notification_not_supported)};
+        unsupported -> {error, rpc_error(Id, unsupported_operation)};
         unknown ->
             {error, adk_a2a_v1_codec:error_response(
                       Id, -32601, <<"Method not found">>)};
@@ -97,6 +106,19 @@ rpc_error(Id, task_not_found) ->
 rpc_error(Id, task_not_cancelable) ->
     a2a_error(Id, -32002, <<"Task not cancelable">>,
               <<"TASK_NOT_CANCELABLE">>);
+rpc_error(Id, push_notification_not_supported) ->
+    a2a_error(Id, -32003, <<"Push notification is not supported">>,
+              <<"PUSH_NOTIFICATION_NOT_SUPPORTED">>);
+rpc_error(Id, unsupported_operation) ->
+    a2a_error(Id, -32004, <<"Unsupported operation">>,
+              <<"UNSUPPORTED_OPERATION">>);
+rpc_error(Id, {extension_support_required, Missing}) ->
+    adk_a2a_v1_codec:error_response(
+      Id, -32008, <<"Required A2A extension is not supported">>,
+      [#{<<"@type">> => <<"type.googleapis.com/google.rpc.ErrorInfo">>,
+         <<"reason">> => <<"EXTENSION_SUPPORT_REQUIRED">>,
+         <<"domain">> => <<"a2a-protocol.org">>,
+         <<"metadata">> => #{<<"missingExtensions">> => Missing}}]);
 rpc_error(Id, unsupported_terminal_subscription) ->
     a2a_error(Id, -32004, <<"Unsupported operation">>,
               <<"UNSUPPORTED_OPERATION">>);
@@ -116,6 +138,8 @@ rpc_error(Id, stream_method_requires_sse) ->
     a2a_error(Id, -32004, <<"Streaming operation required">>,
               <<"UNSUPPORTED_OPERATION">>);
 rpc_error(Id, wait_timeout) ->
+    adk_a2a_v1_codec:error_response(Id, -32603, <<"Internal error">>);
+rpc_error(Id, server_unavailable) ->
     adk_a2a_v1_codec:error_response(Id, -32603, <<"Internal error">>);
 rpc_error(Id, _InvalidParams) ->
     adk_a2a_v1_codec:error_response(Id, -32602, <<"Invalid parameters">>).

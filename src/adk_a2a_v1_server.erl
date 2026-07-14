@@ -23,6 +23,18 @@
 -define(DEFAULT_MAX_ACTIVE, 100).
 -define(DEFAULT_MAX_EVENTS, 256).
 -define(DEFAULT_MAX_SUBSCRIBERS, 64).
+-define(DEFAULT_MAX_SUBSCRIBER_QUEUE, 8).
+-define(MAX_SUBSCRIBER_QUEUE, 64).
+-define(DEFAULT_MAX_INPUT_BYTES, 1048576).
+-define(DEFAULT_MAX_MESSAGE_BYTES, 524288).
+-define(DEFAULT_MAX_TASK_BYTES, 4194304).
+-define(DEFAULT_MAX_EVENT_BYTES, 2097152).
+-define(DEFAULT_MAX_ARTIFACT_BYTES, 2097152).
+-define(DEFAULT_MAX_HISTORY_BYTES, 2097152).
+-define(DEFAULT_MAX_HISTORY_MESSAGES, 128).
+-define(DEFAULT_MAX_ARTIFACTS, 128).
+-define(DEFAULT_MAX_PARTS_PER_ARTIFACT, 256).
+-define(CALL_TIMEOUT_MS, 5000).
 
 -spec start_link() -> gen_server:start_ret().
 start_link() ->
@@ -53,7 +65,7 @@ send_message(Server, AuthContext, Params) ->
 -spec send_message(gen_server:server_ref(), map(), map(), undefined | pid()) ->
     {ok, map()} | {error, term()}.
 send_message(Server, AuthContext, Params, Subscriber) ->
-    gen_server:call(Server, {send, AuthContext, Params, Subscriber}, infinity).
+    safe_call(Server, {send, AuthContext, Params, Subscriber}).
 
 -spec get_task(gen_server:server_ref(), binary(), map()) ->
     {ok, map()} | {error, term()}.
@@ -68,7 +80,7 @@ list_tasks(Server, Scope, Params) ->
 -spec cancel_task(gen_server:server_ref(), binary(), map()) ->
     {ok, map()} | {error, term()}.
 cancel_task(Server, Scope, Params) ->
-    gen_server:call(Server, {cancel, Scope, Params}, infinity).
+    safe_call(Server, {cancel, Scope, Params}).
 
 -spec subscribe(gen_server:server_ref(), binary(), map(), pid()) ->
     {ok, binary(), [{non_neg_integer(), map()}]} | {error, term()}.
@@ -82,7 +94,7 @@ unsubscribe(Server, TaskId, Subscriber) ->
 -spec progress(gen_server:server_ref(), binary(), binary(), term()) ->
     ok | {error, term()}.
 progress(Server, TaskId, Scope, Event) ->
-    gen_server:call(Server, {progress, TaskId, Scope, Event}, infinity).
+    safe_call(Server, {progress, TaskId, Scope, Event}).
 
 -spec card(gen_server:server_ref()) -> {ok, map()}.
 card(Server) -> gen_server:call(Server, card).
@@ -290,6 +302,17 @@ terminate(_Reason, State) ->
 
 code_change(_OldVersion, State, _Extra) -> {ok, State}.
 
+safe_call(Server, Request) ->
+    try gen_server:call(Server, Request, ?CALL_TIMEOUT_MS) of
+        Reply -> Reply
+    catch
+        exit:{timeout, _} -> {error, server_unavailable};
+        exit:{noproc, _} -> {error, server_unavailable};
+        exit:{normal, _} -> {error, server_unavailable};
+        exit:{shutdown, _} -> {error, server_unavailable};
+        exit:_ -> {error, server_unavailable}
+    end.
+
 %% option validation
 
 normalize_options(Options) ->
@@ -314,7 +337,30 @@ normalize_options(Options) ->
                 max_subscribers_per_task => maps:get(
                                               max_subscribers_per_task,
                                               Options,
-                                              ?DEFAULT_MAX_SUBSCRIBERS)},
+                                              ?DEFAULT_MAX_SUBSCRIBERS),
+                max_subscriber_queue => maps:get(
+                                          max_subscriber_queue, Options,
+                                          ?DEFAULT_MAX_SUBSCRIBER_QUEUE),
+                max_input_bytes => maps:get(max_input_bytes, Options,
+                                             ?DEFAULT_MAX_INPUT_BYTES),
+                max_message_bytes => maps:get(max_message_bytes, Options,
+                                               ?DEFAULT_MAX_MESSAGE_BYTES),
+                max_task_bytes => maps:get(max_task_bytes, Options,
+                                            ?DEFAULT_MAX_TASK_BYTES),
+                max_event_bytes => maps:get(max_event_bytes, Options,
+                                             ?DEFAULT_MAX_EVENT_BYTES),
+                max_artifact_bytes => maps:get(max_artifact_bytes, Options,
+                                                ?DEFAULT_MAX_ARTIFACT_BYTES),
+                max_history_bytes => maps:get(max_history_bytes, Options,
+                                               ?DEFAULT_MAX_HISTORY_BYTES),
+                max_history_messages => maps:get(
+                                          max_history_messages, Options,
+                                          ?DEFAULT_MAX_HISTORY_MESSAGES),
+                max_artifacts => maps:get(max_artifacts, Options,
+                                           ?DEFAULT_MAX_ARTIFACTS),
+                max_parts_per_artifact => maps:get(
+                                            max_parts_per_artifact, Options,
+                                            ?DEFAULT_MAX_PARTS_PER_ARTIFACT)},
     case {adk_a2a_v1_card:validate(Card0), valid_executor(Executor),
           valid_config_numbers(Config0)} of
         {{ok, Card}, true, true} ->
@@ -338,9 +384,90 @@ valid_config_numbers(Config) ->
                maps:get(max_tasks, Config),
                maps:get(max_active, Config),
                maps:get(max_events, Config),
-               maps:get(max_subscribers_per_task, Config)]).
+               maps:get(max_subscribers_per_task, Config),
+               maps:get(max_subscriber_queue, Config),
+               maps:get(max_input_bytes, Config),
+               maps:get(max_message_bytes, Config),
+               maps:get(max_task_bytes, Config),
+               maps:get(max_event_bytes, Config),
+               maps:get(max_artifact_bytes, Config),
+               maps:get(max_history_bytes, Config),
+               maps:get(max_history_messages, Config),
+               maps:get(max_artifacts, Config),
+               maps:get(max_parts_per_artifact, Config)])
+    andalso valid_payload_limit_maxima(Config).
+
+valid_payload_limit_maxima(Config) ->
+    maps:get(max_input_bytes, Config) >= 1024
+    andalso maps:get(max_message_bytes, Config) >= 256
+    andalso maps:get(max_task_bytes, Config) >= 4096
+    andalso maps:get(max_event_bytes, Config) >= 1024
+    andalso maps:get(max_artifact_bytes, Config) >= 512
+    andalso maps:get(max_history_bytes, Config) >= 512
+    andalso maps:get(max_input_bytes, Config) =< ?DEFAULT_MAX_INPUT_BYTES
+    andalso maps:get(max_message_bytes, Config) =< ?DEFAULT_MAX_MESSAGE_BYTES
+    andalso maps:get(max_task_bytes, Config) =< ?DEFAULT_MAX_TASK_BYTES
+    andalso maps:get(max_event_bytes, Config) =< ?DEFAULT_MAX_EVENT_BYTES
+    andalso maps:get(max_artifact_bytes, Config) =<
+                ?DEFAULT_MAX_ARTIFACT_BYTES
+    andalso maps:get(max_history_bytes, Config) =<
+                ?DEFAULT_MAX_HISTORY_BYTES
+    andalso maps:get(max_history_messages, Config) =<
+                ?DEFAULT_MAX_HISTORY_MESSAGES
+    andalso maps:get(max_subscriber_queue, Config) =<
+                ?MAX_SUBSCRIBER_QUEUE
+    andalso maps:get(max_artifacts, Config) =< ?DEFAULT_MAX_ARTIFACTS
+    andalso maps:get(max_parts_per_artifact, Config) =<
+                ?DEFAULT_MAX_PARTS_PER_ARTIFACT.
 
 positive_integer(Value) -> is_integer(Value) andalso Value > 0.
+
+input_payload_allowed(Message, Params, State) ->
+    Config = maps:get(config, State),
+    SafeParams = Params#{<<"message">> => Message},
+    within_json_bytes(SafeParams, maps:get(max_input_bytes, Config))
+    andalso within_json_bytes(Message, maps:get(max_message_bytes, Config)).
+
+retained_task_allowed(Task, Config) ->
+    History = maps:get(<<"history">>, Task, []),
+    Artifacts = maps:get(<<"artifacts">>, Task, []),
+    is_list(History) andalso is_list(Artifacts)
+    andalso length(History) =< maps:get(max_history_messages, Config)
+    andalso length(Artifacts) =< maps:get(max_artifacts, Config)
+    andalso within_json_bytes(History, maps:get(max_history_bytes, Config))
+    andalso lists:all(
+              fun(Message) ->
+                  within_json_bytes(
+                    Message, maps:get(max_message_bytes, Config))
+              end, History)
+    andalso lists:all(fun(Artifact) -> artifact_allowed(Artifact, Config) end,
+                      Artifacts)
+    andalso within_json_bytes(Task, maps:get(max_task_bytes, Config)).
+
+artifact_allowed(Artifact, Config) ->
+    Parts = maps:get(<<"parts">>, Artifact, invalid),
+    is_list(Parts)
+    andalso length(Parts) =< maps:get(max_parts_per_artifact, Config)
+    andalso within_json_bytes(Artifact,
+                              maps:get(max_artifact_bytes, Config)).
+
+event_payload_allowed(Payload, Config) ->
+    within_json_bytes(Payload, maps:get(max_event_bytes, Config)).
+
+status_change_allowed(Task, State) ->
+    Config = maps:get(config, State),
+    Payload = #{<<"statusUpdate">> =>
+                    #{<<"taskId">> => maps:get(<<"id">>, Task),
+                      <<"contextId">> => maps:get(<<"contextId">>, Task),
+                      <<"status">> => maps:get(<<"status">>, Task)}},
+    retained_task_allowed(Task, Config)
+    andalso event_payload_allowed(Payload, Config).
+
+within_json_bytes(Value, Max) ->
+    try jsx:encode(Value) of
+        Encoded when is_binary(Encoded) -> byte_size(Encoded) =< Max
+    catch _:_ -> false
+    end.
 
 %% send and execution
 
@@ -356,18 +483,26 @@ validate_send(Auth, Params, Subscriber, State)
                 {ok, Message} ->
                     case maps:get(<<"role">>, Message) of
                         <<"ROLE_USER">> ->
-                            case validate_send_config(Params) of
-                                ok ->
-                                    case tenant_matches(Params, State) of
-                                        true ->
-                                            {ok, #{scope => Scope,
-                                                   principal => Principal,
-                                                   seeds => Seeds,
-                                                   message => Message,
-                                                   params => Params}};
-                                        false -> {error, invalid_tenant}
-                                    end;
-                                Error -> Error
+                            case input_payload_allowed(Message, Params,
+                                                       State) of
+                                false -> {error, a2a_input_payload_too_large};
+                                true ->
+                                    case validate_send_config(Params) of
+                                        ok ->
+                                            case tenant_matches(Params,
+                                                                State) of
+                                                true ->
+                                                    {ok, #{scope => Scope,
+                                                           principal =>
+                                                               Principal,
+                                                           seeds => Seeds,
+                                                           message => Message,
+                                                           params => Params}};
+                                                false ->
+                                                    {error, invalid_tenant}
+                                            end;
+                                        Error -> Error
+                                    end
                             end;
                         _ -> {error, invalid_user_message_role}
                     end;
@@ -427,18 +562,28 @@ create_task(Input, State) ->
                              <<"status">> => Status,
                              <<"artifacts">> => [],
                              <<"history">> => [Message]},
-                    Now = erlang:system_time(millisecond),
-                    Entry0 = #{id => TaskId,
-                               scope => maps:get(scope, Input),
-                               task => Task,
-                               task_ref => undefined,
-                               events => [], next_seq => 1,
-                               subscribers => #{},
-                               updated_ms => Now, terminal_at => undefined},
-                    {Entry1, State2} = append_event(
-                                         #{<<"task">> => Task}, false,
-                                         Entry0, State1),
-                    {ok, TaskId, Entry1, put_entry(Entry1, State2)}
+                    Config = maps:get(config, State1),
+                    case retained_task_allowed(Task, Config)
+                         andalso event_payload_allowed(
+                                   #{<<"task">> => Task}, Config) of
+                        false ->
+                            {error, a2a_task_payload_limit_exceeded, State1};
+                        true ->
+                            Now = erlang:system_time(millisecond),
+                            Entry0 = #{id => TaskId,
+                                       scope => maps:get(scope, Input),
+                                       task => Task,
+                                       task_ref => undefined,
+                                       events => [], next_seq => 1,
+                                       subscribers => #{},
+                                       updated_ms => Now,
+                                       terminal_at => undefined},
+                            {Entry1, State2} = append_event(
+                                                 #{<<"task">> => Task}, false,
+                                                 Entry0, State1),
+                            {ok, TaskId, Entry1,
+                             put_entry(Entry1, State2)}
+                    end
             end
     end.
 
@@ -464,10 +609,18 @@ continue_task(TaskId, Input, State) ->
                                            <<"status">> => status(
                                              <<"TASK_STATE_SUBMITTED">>,
                                              undefined)},
-                            {Entry1, State1} = status_event(
-                                                 Task1, Entry0, State),
-                            {ok, TaskId, Entry1,
-                             put_entry(Entry1, State1)};
+                            case retained_task_allowed(
+                                   Task1, maps:get(config, State)) of
+                                false ->
+                                    {error, a2a_task_payload_limit_exceeded,
+                                     State};
+                                true ->
+                                    {Entry1, State1} = status_event(
+                                                         Task1, Entry0,
+                                                         State),
+                                    {ok, TaskId, Entry1,
+                                     put_entry(Entry1, State1)}
+                            end;
                         _ -> {error, context_id_mismatch, State}
                     end
             end
@@ -535,14 +688,19 @@ apply_progress({status, StateName, Message0}, Entry0, State0)
         true ->
             Message = normalize_agent_message(Message0, Entry0),
             Task1 = set_status(maps:get(task, Entry0), StateName, Message),
-            case adk_a2a_v1_codec:terminal_state(StateName) of
+            case status_change_allowed(Task1, State0) of
+                false -> {error, a2a_task_payload_limit_exceeded};
                 true ->
-                    {Entry1, State1} = terminal_status_event(
-                                         Task1, Entry0, State0),
-                    {ok, Entry1, State1};
-                false ->
-                    {Entry1, State1} = status_event(Task1, Entry0, State0),
-                    {ok, Entry1, State1}
+                    case adk_a2a_v1_codec:terminal_state(StateName) of
+                        true ->
+                            {Entry1, State1} = terminal_status_event(
+                                                 Task1, Entry0, State0),
+                            {ok, Entry1, State1};
+                        false ->
+                            {Entry1, State1} = status_event(
+                                                 Task1, Entry0, State0),
+                            {ok, Entry1, State1}
+                    end
             end;
         false -> {error, invalid_progress_state}
     end;
@@ -557,11 +715,18 @@ apply_progress({artifact, Artifact0, Append, LastChunk}, Entry0, State0)
                        <<"artifact">> => Artifact,
                        <<"append">> => Append,
                        <<"lastChunk">> => LastChunk},
-            Entry1 = Entry0#{task => Task1},
-            {Entry2, State1} = append_event(
-                                 #{<<"artifactUpdate">> => Update}, false,
-                                 Entry1, State0),
-            {ok, Entry2, State1};
+            Config = maps:get(config, State0),
+            Payload = #{<<"artifactUpdate">> => Update},
+            case artifact_allowed(Artifact, Config)
+                 andalso retained_task_allowed(Task1, Config)
+                 andalso event_payload_allowed(Payload, Config) of
+                false -> {error, a2a_task_payload_limit_exceeded};
+                true ->
+                    Entry1 = Entry0#{task => Task1},
+                    {Entry2, State1} = append_event(
+                                         Payload, false, Entry1, State0),
+                    {ok, Entry2, State1}
+            end;
         {error, Reason} -> {error, Reason}
     end;
 apply_progress(_, _Entry, _State) -> {error, invalid_progress_event}.
@@ -611,11 +776,17 @@ finalize_outcome({failed, _}, Entry, State) ->
 finalize_success(Value, Entry0, State0) ->
     case output_artifact(Value) of
         {ok, Artifact} ->
-            {ok, Entry1, State1} = apply_progress(
-                                     {artifact, Artifact, false, true},
-                                     Entry0, State0),
-            finalize_status(<<"TASK_STATE_COMPLETED">>, undefined,
-                            true, Entry1, State1);
+            case apply_progress({artifact, Artifact, false, true},
+                                Entry0, State0) of
+                {ok, Entry1, State1} ->
+                    finalize_status(<<"TASK_STATE_COMPLETED">>, undefined,
+                                    true, Entry1, State1);
+                {error, _} ->
+                    finalize_status(
+                      <<"TASK_STATE_FAILED">>,
+                      <<"Agent response exceeded configured limits">>,
+                      true, Entry0, State0)
+            end;
         {error, _} ->
             finalize_status(<<"TASK_STATE_FAILED">>,
                             <<"Agent returned an invalid response">>,
@@ -625,9 +796,24 @@ finalize_success(Value, Entry0, State0) ->
 finalize_status(StateName, Message0, Terminal, Entry0, State0) ->
     Message = normalize_agent_message(Message0, Entry0),
     Task1 = set_status(maps:get(task, Entry0), StateName, Message),
+    Task = bounded_status_task(Task1, StateName, Entry0, State0),
     case Terminal of
-        true -> terminal_status_event(Task1, Entry0, State0);
-        false -> status_event(Task1, Entry0, State0)
+        true -> terminal_status_event(Task, Entry0, State0);
+        false -> status_event(Task, Entry0, State0)
+    end.
+
+bounded_status_task(Candidate, StateName, Entry, State) ->
+    case status_change_allowed(Candidate, State) of
+        true -> Candidate;
+        false ->
+            Fallback = set_status(maps:get(task, Entry), StateName, undefined),
+            case status_change_allowed(Fallback, State) of
+                true -> Fallback;
+                false ->
+                    maps:without(
+                      [<<"history">>, <<"artifacts">>],
+                      Fallback)
+            end
     end.
 
 output_artifact(#{<<"artifactId">> := _} = Artifact) ->
@@ -704,18 +890,61 @@ terminal_status_event(Task, Entry0, State0) ->
 
 append_event(Payload, Terminal, Entry0, State0) ->
     {ok, SafePayload} = adk_a2a_v1_codec:validate_stream_response(Payload),
-    Seq = maps:get(next_seq, Entry0),
-    Events0 = maps:get(events, Entry0),
-    Max = maps:get(max_events, maps:get(config, State0)),
-    Events1 = trim_events(Events0 ++ [{Seq, SafePayload}], Max),
-    maps:foreach(
-      fun(_Ref, Pid) ->
-          Pid ! {adk_a2a_v1_event, maps:get(id, Entry0), Seq,
-                 SafePayload, Terminal}
-      end, maps:get(subscribers, Entry0)),
-    {Entry0#{events => Events1,
-             next_seq => Seq + 1,
-             updated_ms => erlang:system_time(millisecond)}, State0}.
+    Config = maps:get(config, State0),
+    case event_payload_allowed(SafePayload, Config) of
+        false -> {Entry0, State0};
+        true ->
+            Seq = maps:get(next_seq, Entry0),
+            Events0 = maps:get(events, Entry0),
+            Max = maps:get(max_events, Config),
+            Events1 = trim_events(Events0 ++ [{Seq, SafePayload}], Max),
+            {Entry1, State1} = deliver_event(
+                                 Entry0, State0, Seq, SafePayload, Terminal),
+            {Entry1#{events => Events1,
+                     next_seq => Seq + 1,
+                     updated_ms => erlang:system_time(millisecond)}, State1}
+    end.
+
+%% A slow Cowboy/request process must not turn the task store into an
+%% unbounded mailbox producer. Once the configured queue ceiling is reached,
+%% detach that subscriber and enqueue one terminal control message behind the
+%% already accepted events. The HTTP handler closes the connection; the client
+%% can reconnect with Last-Event-ID while the retained replay window exists.
+deliver_event(Entry0, State0, Seq, Payload, Terminal) ->
+    Config = maps:get(config, State0),
+    Maximum = maps:get(max_subscriber_queue, Config),
+    TaskId = maps:get(id, Entry0),
+    Refs0 = maps:get(subscriber_refs, State0),
+    {Subscribers, Refs} = maps:fold(
+      fun(Ref, Pid, {SubscribersAcc, RefsAcc}) ->
+          Message = {adk_a2a_v1_event, TaskId, Seq, Payload, Terminal},
+          case subscriber_ready(Pid, Maximum) andalso
+               safe_subscriber_send(Pid, Message) of
+              true ->
+                  {SubscribersAcc#{Ref => Pid}, RefsAcc};
+              false ->
+                  _ = erlang:demonitor(Ref, [flush]),
+                  _ = safe_subscriber_send(
+                        Pid, {adk_a2a_v1_overflow, TaskId}),
+                  {SubscribersAcc, maps:remove(Ref, RefsAcc)}
+          end
+      end, {#{}, Refs0}, maps:get(subscribers, Entry0)),
+    {Entry0#{subscribers => Subscribers},
+     State0#{subscriber_refs => Refs}}.
+
+subscriber_ready(Pid, Maximum) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, Length} when Length < Maximum -> true;
+        _ -> false
+    end.
+
+safe_subscriber_send(Pid, Message) ->
+    try erlang:send(Pid, Message, [nosuspend, noconnect]) of
+        ok -> true;
+        _ -> false
+    catch
+        error:badarg -> false
+    end.
 
 trim_events(Events, Max) ->
     Extra = length(Events) - Max,

@@ -184,10 +184,9 @@ injected_rotator_is_redacted_from_provider_errors() ->
           {ok, Ref} = adk_credential_store_ets:put(
                         Store, <<"alice">>, <<"oidc-service">>, Credential),
           with_token_runtime(
-            adk_credential_store_ets, Store,
+            adk_credential_store_ets, Store, echo_provider_profiles(),
             fun(Manager, _RefreshSup) ->
-                Request = (refresh_request(Ref, [<<"agent.run">>]))#{
-                            provider_module => adk_auth_context_echo_provider},
+                Request = refresh_request(Ref, [<<"agent.run">>]),
                 {error, {provider_error, Reason}} = Result =
                     adk_token_manager:get_token(Manager, Request, 1000),
                 ?assertEqual(adk_secret_redactor:marker(),
@@ -207,11 +206,8 @@ refresh_credential(RefreshToken) ->
 refresh_request(Ref, Scopes) ->
     #{principal => <<"alice">>,
       provider => <<"oidc-service">>,
-      provider_module => adk_auth_provider_oidcc,
       credential_ref => Ref,
-      scopes => Scopes,
-      context => #{provider_worker => oidc_fixture_provider,
-                   oauth_adapter => adk_oidc_fake_oauth_adapter}}.
+      scopes => Scopes}.
 
 with_private_store(Fun) ->
     {ok, Store} = adk_credential_store_ets:start_link(#{name => undefined}),
@@ -221,6 +217,10 @@ with_private_store(Fun) ->
     end.
 
 with_token_runtime(StoreModule, StoreHandle, Fun) ->
+    with_token_runtime(StoreModule, StoreHandle, oidcc_provider_profiles(),
+                       Fun).
+
+with_token_runtime(StoreModule, StoreHandle, ProviderProfiles, Fun) ->
     {ok, RefreshSup} = adk_token_refresh_sup:start_link(#{name => undefined}),
     unlink(RefreshSup),
     {ok, Manager} = adk_token_manager:start_link(
@@ -228,6 +228,7 @@ with_token_runtime(StoreModule, StoreHandle, Fun) ->
                         store_module => StoreModule,
                         store_handle => StoreHandle,
                         refresh_sup => RefreshSup,
+                        provider_profiles => ProviderProfiles,
                         expiry_skew_ms => 0,
                         refresh_timeout_ms => 1000}),
     unlink(Manager),
@@ -236,6 +237,21 @@ with_token_runtime(StoreModule, StoreHandle, Fun) ->
         stop_process(Manager),
         stop_process(RefreshSup)
     end.
+
+oidcc_provider_profiles() ->
+    #{<<"oidc-service">> =>
+          #{provider_module => adk_auth_provider_oidcc,
+            context => #{provider_worker => oidc_fixture_provider,
+                         oauth_adapter => adk_oidc_fake_oauth_adapter},
+            allowed_scopes => [<<"agent.run">>, <<"rotation-race-a">>,
+                               <<"rotation-race-b">>],
+            allowed_audiences => []}}.
+
+echo_provider_profiles() ->
+    #{<<"oidc-service">> =>
+          #{provider_module => adk_auth_context_echo_provider,
+            allowed_scopes => [<<"agent.run">>],
+            allowed_audiences => []}}.
 
 collect_cas_results(0, Acc) -> Acc;
 collect_cas_results(Remaining, Acc) ->

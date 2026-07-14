@@ -15,6 +15,12 @@ adk_dev_http_test_() ->
      fun cleanup/1,
      fun(State) ->
          [{"static UI is self-contained", ?_test(static_ui_case(State))},
+          {"UI collections and reconnect attempts are bounded",
+           ?_test(ui_bounds_case(State))},
+          {"manual attach preserves the same-run cursor",
+           ?_test(ui_manual_attach_cursor_case(State))},
+          {"UI uses fail-closed typed pause decisions",
+           ?_test(ui_uses_typed_confirmation_payload_case(State))},
           {"SSE limits are validated", ?_test(sse_config_validation_case())},
           {"bearer and origin policy", ?_test(auth_case(State))},
           {"agent discovery is authenticated and pid-free",
@@ -81,7 +87,11 @@ static_ui_case(State) ->
     ?assertNotEqual(nomatch, binary:match(Body, <<"Create/switch session">>)),
     ?assertNotEqual(nomatch, binary:match(Body, <<"Delete session">>)),
     ?assertNotEqual(nomatch, binary:match(Body, <<"Apply state delta">>)),
-    ?assertNotEqual(nomatch, binary:match(Body, <<"Human approval">>)),
+    ?assertNotEqual(nomatch,
+                    binary:match(Body, <<"single-operator local /dev/v1">>)),
+    ?assertNotEqual(nomatch,
+                    binary:match(Body, <<"not a production or multi-user UI">>)),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"Typed pause decision">>)),
     ?assertNotEqual(nomatch,
                     binary:match(Body, <<"tool_confirmation">>)),
     ?assertNotEqual(nomatch,
@@ -97,6 +107,72 @@ static_ui_case(State) ->
     ?assertNotEqual(nomatch, binary:match(Csp, <<"connect-src 'self'">>)),
     ?assertNotEqual(nomatch, binary:match(Csp, <<"script-src 'nonce-">>)),
     {405, _, _} = request(State, post, <<"/dev">>, [], <<>>).
+
+ui_bounds_case(State) ->
+    {200, _, Body} = request(State, get, <<"/dev">>, [], <<>>),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body,
+         <<"transcriptEntries:200,traceEntries:500,reconnectAttempts:8">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body,
+         <<"childElementCount>LIMITS.transcriptEntries">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body,
+         <<"state.trace.splice(0,state.trace.length-LIMITS.traceEntries)">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body,
+         <<"state.retryAttempts>=LIMITS.reconnectAttempts">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(Body, <<"reconnect limit reached">>)).
+
+ui_manual_attach_cursor_case(State) ->
+    {200, _, Body} = request(State, get, <<"/dev">>, [], <<>>),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(Body,
+                    <<"const preserveCursor=requested===state.runId">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(Body,
+                    <<"if(!preserveCursor)resetRunView()">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body,
+         <<"preserveCursor?'Reconnecting after sequence '+state.lastId">>)),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"run_event_replay_gap">>)),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"last-event-id">>)).
+
+ui_uses_typed_confirmation_payload_case(State) ->
+    {200, _, Body} = request(State, get, <<"/dev">>, [], <<>>),
+    ?assertNotEqual(nomatch,
+                    binary:match(Body, <<"return {confirmed}">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body, <<"state.pauseType!=='tool_confirmation'">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(Body, <<"Object.keys(decision).length!==1">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(
+         Body, <<"unsupported or untyped decision contract">>)),
+    ?assertNotEqual(
+       nomatch,
+       binary:match(Body,
+                    <<"$('approve').disabled=!supported">>)),
+    ?assertEqual(nomatch, binary:match(Body, <<"approved:true">>)),
+    ?assertEqual(nomatch, binary:match(Body, <<"approved:false">>)).
 
 sse_config_validation_case() ->
     Base = #{auth_token => ?TOKEN},

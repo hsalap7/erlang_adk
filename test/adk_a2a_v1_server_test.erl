@@ -11,7 +11,11 @@ a2a_v1_server_test_() ->
       fun credentials_are_redacted_case/0,
       fun replay_is_ordered_and_bounded_case/0,
       fun list_tasks_cursor_case/0,
-      fun active_admission_is_bounded_case/0]}.
+      fun active_admission_is_bounded_case/0,
+      fun direct_input_bytes_are_bounded_before_task_creation_case/0,
+      fun retained_history_count_is_bounded_case/0,
+      fun oversized_executor_output_is_not_retained_case/0,
+      fun slow_subscriber_mailbox_is_bounded_and_detached_case/0]}.
 
 setup() ->
     {ok, _} = application:ensure_all_started(erlang_adk),
@@ -200,6 +204,126 @@ active_admission_is_bounded_case() ->
         gen_server:stop(Server)
     end.
 
+direct_input_bytes_are_bounded_before_task_creation_case() ->
+    Parent = self(),
+    Executor = fun(_Request, _Emit) -> Parent ! unexpected_execution, ok end,
+    Server = start_server(
+               Executor, #{max_input_bytes => 1024,
+                           max_message_bytes => 512}),
+    try
+        Large = binary:copy(<<"x">>, 700),
+        ?assertEqual(
+           {error, a2a_input_payload_too_large},
+           adk_a2a_v1_server:send_message(
+             Server, auth(<<"alice">>), send_params(Large))),
+        receive unexpected_execution -> ?assert(false) after 50 -> ok end,
+        {ok, #{<<"tasks">> := []}} = adk_a2a_v1_server:list_tasks(
+                                          Server, scope(<<"alice">>), #{})
+    after
+        gen_server:stop(Server)
+    end.
+
+retained_history_count_is_bounded_case() ->
+    Executor = fun(_Request, _Emit) -> {input_required, <<"continue">>} end,
+    Server = start_server(Executor, #{max_history_messages => 2}),
+    try
+        {ok, #{task_id := TaskId}} = adk_a2a_v1_server:send_message(
+                                      Server, auth(<<"alice">>),
+                                      send_params(<<"first">>)),
+        Task1 = wait_for_state(Server, TaskId,
+                               <<"TASK_STATE_INPUT_REQUIRED">>),
+        ContextId = maps:get(<<"contextId">>, Task1),
+        {ok, _} = adk_a2a_v1_server:send_message(
+                    Server, auth(<<"alice">>),
+                    continue_params(TaskId, ContextId, <<"second">>)),
+        _ = wait_for_history_length(Server, TaskId, 2),
+        ?assertEqual(
+           {error, a2a_task_payload_limit_exceeded},
+           adk_a2a_v1_server:send_message(
+             Server, auth(<<"alice">>),
+             continue_params(TaskId, ContextId, <<"third">>))),
+        {ok, Retained} = adk_a2a_v1_server:inspect_task(Server, TaskId),
+        ?assertEqual(2, length(maps:get(<<"history">>, Retained)))
+    after
+        gen_server:stop(Server)
+    end.
+
+oversized_executor_output_is_not_retained_case() ->
+    LargeOutput = binary:copy(<<"a">>, 900),
+    Executor = fun(_Request, _Emit) -> {ok, LargeOutput} end,
+    Server = start_server(Executor, #{max_artifact_bytes => 512}),
+    try
+        {ok, #{task_id := TaskId}} = adk_a2a_v1_server:send_message(
+                                      Server, auth(<<"alice">>),
+                                      send_params(<<"bounded">>), self()),
+        wait_terminal(TaskId),
+        {ok, Task} = adk_a2a_v1_server:inspect_task(Server, TaskId),
+        ?assertEqual(<<"TASK_STATE_FAILED">>, task_state(Task)),
+        ?assertEqual([], maps:get(<<"artifacts">>, Task)),
+        ?assertEqual(nomatch,
+                     binary:match(jsx:encode(Task), LargeOutput))
+    after
+        gen_server:stop(Server)
+    end.
+
+slow_subscriber_mailbox_is_bounded_and_detached_case() ->
+    Parent = self(),
+    Executor = fun(_Request, _Emit) ->
+        Parent ! {slow_subscriber_worker, self()},
+        receive stop -> ok end
+    end,
+    Server = start_server(Executor, #{max_subscriber_queue => 1}),
+    Sink = spawn(fun slow_subscriber_sink/0),
+    try
+        {ok, #{task_id := TaskId}} = adk_a2a_v1_server:send_message(
+                                      Server, auth(<<"alice">>),
+                                      send_params(<<"slow stream">>)),
+        Worker = receive {slow_subscriber_worker, Pid} -> Pid
+                 after 1000 -> error(timeout) end,
+        {ok, TaskId, _Frames} = adk_a2a_v1_server:subscribe(
+                                  Server, scope(<<"alice">>),
+                                  #{<<"id">> => TaskId,
+                                    last_event_id => 0}, Sink),
+        ok = adk_a2a_v1_server:progress(
+               Server, TaskId, scope(<<"alice">>),
+               {status, <<"TASK_STATE_WORKING">>, <<"one">>}),
+        ok = adk_a2a_v1_server:progress(
+               Server, TaskId, scope(<<"alice">>),
+               {status, <<"TASK_STATE_WORKING">>, <<"two">>}),
+        ok = adk_a2a_v1_server:progress(
+               Server, TaskId, scope(<<"alice">>),
+               {status, <<"TASK_STATE_WORKING">>, <<"three">>}),
+        {message_queue_len, QueueLength} =
+            process_info(Sink, message_queue_len),
+        ?assert(QueueLength =< 2),
+        Sink ! {drain, self()},
+        receive
+            {slow_subscriber_messages, Messages} ->
+                ?assertEqual(
+                   1,
+                   length([ok || {adk_a2a_v1_event, Id, _, _, _}
+                                    <- Messages, Id =:= TaskId])),
+                ?assert(lists:member(
+                          {adk_a2a_v1_overflow, TaskId}, Messages))
+        after 1000 -> error(slow_subscriber_drain_timeout)
+        end,
+        Worker ! stop
+    after
+        exit(Sink, kill),
+        gen_server:stop(Server)
+    end.
+
+slow_subscriber_sink() ->
+    receive
+        {drain, ReplyTo} ->
+            ReplyTo ! {slow_subscriber_messages, drain_messages([])}
+    end.
+
+drain_messages(Acc) ->
+    receive Message -> drain_messages([Message | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+
 start_server(Executor) -> start_server(Executor, #{}).
 start_server(Executor, Extra) ->
     Options = maps:merge(
@@ -228,6 +352,12 @@ send_params(Text) ->
             <<"parts">> => [#{<<"text">> => Text}]},
       <<"configuration">> => #{<<"returnImmediately">> => true}}.
 
+continue_params(TaskId, ContextId, Text) ->
+    Params = send_params(Text),
+    Message = maps:get(<<"message">>, Params),
+    Params#{<<"message">> => Message#{<<"taskId">> => TaskId,
+                                      <<"contextId">> => ContextId}}.
+
 artifact(Text) ->
     #{<<"artifactId">> => unique(<<"artifact-">>),
       <<"parts">> => [#{<<"text">> => Text}]}.
@@ -252,5 +382,24 @@ wait_until_terminal(Server, TaskId) ->
             case adk_a2a_v1_codec:terminal_state(task_state(Task)) of
                 true -> ok;
                 false -> timer:sleep(5), wait_until_terminal(Server, TaskId)
+            end
+    end.
+
+wait_for_state(Server, TaskId, Expected) ->
+    case adk_a2a_v1_server:inspect_task(Server, TaskId) of
+        {ok, Task} ->
+            case task_state(Task) of
+                Expected -> Task;
+                _ -> timer:sleep(5), wait_for_state(Server, TaskId, Expected)
+            end
+    end.
+
+wait_for_history_length(Server, TaskId, Expected) ->
+    case adk_a2a_v1_server:inspect_task(Server, TaskId) of
+        {ok, Task} ->
+            case length(maps:get(<<"history">>, Task)) of
+                Expected -> Task;
+                _ -> timer:sleep(5),
+                     wait_for_history_length(Server, TaskId, Expected)
             end
     end.
