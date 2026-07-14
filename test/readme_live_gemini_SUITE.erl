@@ -6,6 +6,9 @@
 -export([generate/3, stream/4]).
 -export([
     direct_text/1,
+    google_search_grounding/1,
+    thinking_configuration/1,
+    multimodal_content/1,
     weather_tool_round_trip/1,
     streaming/1,
     async_delegation/1,
@@ -30,6 +33,9 @@ suite() ->
 
 all() ->
     [direct_text,
+     google_search_grounding,
+     thinking_configuration,
+     multimodal_content,
      weather_tool_round_trip,
      streaming,
      async_delegation,
@@ -47,6 +53,7 @@ init_per_suite(Config) ->
         {"1", Key} when is_list(Key), Key =/= [] ->
             application:set_env(erlang_adk, a2a_enabled, false),
             application:set_env(erlang_adk, agent_call_timeout, ?TIMEOUT),
+            application:set_env(erlang_adk, agent_turn_timeout, ?TIMEOUT),
             {ok, _} = application:ensure_all_started(erlang_adk),
             ok = compile_example(readme_weather_tool),
             ok = compile_example(readme_audit_callback),
@@ -70,6 +77,7 @@ end_per_suite(_Config) ->
     _ = application:unset_env(erlang_adk, a2a_enabled),
     _ = application:unset_env(erlang_adk, a2a_port),
     _ = application:unset_env(erlang_adk, agent_call_timeout),
+    _ = application:unset_env(erlang_adk, agent_turn_timeout),
     ok.
 
 %% The live suite deliberately uses itself as a thin provider wrapper. This
@@ -96,6 +104,96 @@ direct_text(_Config) ->
                  content => <<"Reply with one short sentence about Erlang OTP.">>}],
     Text = expect_text(adk_llm:generate(Config, History, []), direct_text),
     assert(nonempty_text(Text), {empty_direct_text, Text}),
+    ok.
+
+google_search_grounding(_Config) ->
+    Config = (provider_config())#{builtin_tools => [google_search],
+                                  max_tokens => 384},
+    History = [#{role => user,
+                 content =>
+                     <<"Use Google Search before answering: what is the "
+                       "latest stable Erlang/OTP release? Reply briefly.">>}],
+    Result = adk_llm:generate(Config, History, []),
+    case adk_provider_result:decode(Result) of
+        {ok, {ok, Answer}, ProviderMetadata} ->
+            assert(nonempty_text(Answer),
+                   {empty_grounded_answer, Answer}),
+            assert(maps:get(<<"provider">>, ProviderMetadata, undefined)
+                       =:= <<"gemini">>,
+                   {invalid_grounding_provider, ProviderMetadata}),
+            assert(maps:get(<<"type">>, ProviderMetadata, undefined)
+                       =:= <<"google_search_grounding">>,
+                   {invalid_grounding_type, ProviderMetadata}),
+            Grounding = maps:get(<<"metadata">>, ProviderMetadata, #{}),
+            Chunks = maps:get(<<"groundingChunks">>, Grounding, []),
+            Queries = maps:get(<<"webSearchQueries">>, Grounding, []),
+            assert(Chunks =/= [] orelse Queries =/= [],
+                   {missing_grounding_evidence, Grounding}),
+            ok;
+        {error, Reason} ->
+            ct:fail({google_search_grounding, Reason});
+        not_provider_result ->
+            ct:fail({google_search_not_used, Result})
+    end.
+
+thinking_configuration(_Config) ->
+    Config = (gemini_config(provider_config()))#{
+        thinking_config => #{thinking_level => high,
+                             include_thoughts => true}
+    },
+    Result = live_request(
+               fun() ->
+                   adk_llm_gemini:generate(
+                     Config,
+                     [#{role => user,
+                        content =>
+                            <<"Answer in one short sentence: why use OTP?">>}],
+                     [])
+               end,
+               ?TRANSPORT_TIMEOUT_RETRIES),
+    assert_thinking_response(Result),
+    ok.
+
+multimodal_content(_Config) ->
+    TinyPng = base64:decode(
+        <<"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=">>),
+    {ok, PromptPart} = adk_content:text(
+                         <<"Describe this one-pixel image in one sentence.">>),
+    {ok, ImagePart} = adk_content:inline_data(<<"image/png">>, TinyPng),
+    {ok, Prompt} = adk_content:new([PromptPart, ImagePart]),
+    History = [#{role => user, content => Prompt}],
+    GeminiConfig = gemini_config(provider_config()),
+    Text = expect_text(
+             live_request(
+               fun() -> adk_llm_gemini:generate(
+                          GeminiConfig, History, []) end,
+               ?TRANSPORT_TIMEOUT_RETRIES),
+             multimodal_generate),
+    assert(nonempty_text(Text), {empty_multimodal_response, Text}),
+    Self = self(),
+    StreamResult = live_request(
+                     fun() ->
+                         adk_llm_gemini:stream_content(
+                           GeminiConfig, History, [],
+                           fun(Delta) ->
+                               Self ! {live_content_delta, Delta}
+                           end)
+                     end, 0),
+    assert(StreamResult =:= ok,
+           {unexpected_multimodal_stream_result, StreamResult}),
+    Deltas = collect_content_deltas([]),
+    assert(Deltas =/= [], no_multimodal_stream_deltas),
+    lists:foreach(
+      fun(Delta) ->
+          assert(adk_content:validate(Delta) =:= {ok, Delta},
+                 {invalid_multimodal_stream_delta, Delta})
+      end, Deltas),
+    StreamText = iolist_to_binary(
+                   lists:append(
+                     [adk_llm_gemini_content:text_parts(Delta)
+                      || Delta <- Deltas])),
+    assert(nonempty_text(StreamText),
+           {empty_multimodal_stream_text, Deltas}),
     ok.
 
 weather_tool_round_trip(_Config) ->
@@ -259,7 +357,8 @@ runner_sync_async(_Config) ->
                          instructions => <<"Answer in one short sentence.">>}, []),
     Runner = adk_runner:new(
                AgentPid, App, erlang_adk_session,
-               #{run_timeout => ?TIMEOUT}),
+               #{run_timeout => ?TIMEOUT,
+                 streaming_mode => text}),
     try
         SyncText = expect_text(
                      adk_runner:run(
@@ -270,10 +369,18 @@ runner_sync_async(_Config) ->
                             Runner, User, AsyncSession,
                             <<"What is a supervisor?">>),
         {done, AsyncEvents} = drain_runner(StreamPid, []),
-        assert(lists:any(
-                 fun(Event) -> Event#adk_event.is_final =:= true end,
-                 AsyncEvents),
-               {runner_missing_final_event, AsyncEvents}),
+        ModelDeltas =
+            [Event || #adk_event{author = Author,
+                                 partial = true,
+                                 is_final = false} = Event <- AsyncEvents,
+                      Author =:= Name],
+        FinalEvents =
+            [Event || #adk_event{is_final = true} = Event <- AsyncEvents],
+        assert(ModelDeltas =/= [],
+               {runner_missing_streamed_model_delta, AsyncEvents}),
+        assert(length(FinalEvents) =:= 1,
+               {runner_invalid_final_event_count,
+                length(FinalEvents), AsyncEvents}),
         {ok, Stored} = erlang_adk_session:get_session(
                          App, User, AsyncSession),
         StoredEvents = maps:get(events, Stored),
@@ -310,8 +417,15 @@ human_approval(_Config) ->
                 assert(maps:get(<<"tool_name">>, Pause) =:=
                            <<"request_human_approval">>,
                        {wrong_pause_tool, Pause}),
+                ContinuationId = maps:get(<<"continuation_id">>, Pause),
+                assert(ContinuationId =:=
+                           PauseEvent#adk_event.invocation_id,
+                       {pause_continuation_mismatch,
+                        ContinuationId,
+                        PauseEvent#adk_event.invocation_id}),
                 {ok, ResumePid} = adk_runner:resume(
                                     Runner, User, Session,
+                                    ContinuationId,
                                     #{approved => true,
                                       approver => <<"live-test">>}),
                 {done, ResumeEvents} = drain_runner(ResumePid, []),
@@ -364,10 +478,10 @@ callbacks_telemetry_and_eval(_Config) ->
     end,
     ok = telemetry:attach(
            HandlerId, [erlang_adk, agent, prompt, stop], Handler, #{}),
+    ok = readme_audit_callback:set_observer(Self),
     AgentConfig = (provider_config())#{
         instructions => <<"Answer each request briefly.">>,
-        callbacks => [readme_audit_callback],
-        callback_pid => Self
+        callbacks => [readme_audit_callback]
     },
     {ok, AgentPid} = erlang_adk:spawn_agent(Name, AgentConfig, []),
     try
@@ -402,6 +516,7 @@ callbacks_telemetry_and_eval(_Config) ->
         assert(maps:get(average_score, Report) =:= 1.0,
                {live_evaluation_failed, Report})
     after
+        ok = readme_audit_callback:clear_observer(),
         _ = telemetry:detach(HandlerId),
         safe_stop_agent(AgentPid)
     end.
@@ -434,7 +549,6 @@ provider_config() ->
     #{provider => ?MODULE,
       model => ?MODEL,
       request_timeout => ?LIVE_REQUEST_TIMEOUT_MS,
-      temperature => 0,
       max_tokens => 512}.
 
 gemini_config(Config) ->
@@ -535,9 +649,33 @@ nonempty_text(Text) when is_list(Text) ->
 nonempty_text(_) ->
     false.
 
+assert_thinking_response({ok, Text}) when is_binary(Text); is_list(Text) ->
+    assert(nonempty_text(Text), {empty_thinking_response, Text});
+assert_thinking_response({ok, Content}) when is_map(Content) ->
+    assert(adk_content:validate(Content) =:= {ok, Content},
+           {invalid_thinking_content, Content}),
+    Visible = [Text || #{<<"type">> := <<"text">>,
+                         <<"text">> := Text} = Part
+                          <- adk_content:parts(Content),
+                      maps:get(<<"thought">>, Part, false) =/= true],
+    assert(Visible =/= [] andalso nonempty_text(iolist_to_binary(Visible)),
+           {missing_visible_thinking_answer, Content});
+assert_thinking_response({error, Reason}) ->
+    ct:fail({thinking_configuration, Reason});
+assert_thinking_response(Other) ->
+    ct:fail({thinking_configuration, unexpected_result, Other}).
+
 collect_chunks(Acc) ->
     receive
         {live_stream_chunk, Chunk} -> collect_chunks([Chunk | Acc])
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+collect_content_deltas(Acc) ->
+    receive
+        {live_content_delta, Delta} ->
+            collect_content_deltas([Delta | Acc])
     after 0 ->
         lists:reverse(Acc)
     end.

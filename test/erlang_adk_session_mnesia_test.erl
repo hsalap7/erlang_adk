@@ -35,6 +35,8 @@ session_mnesia_test_() ->
                 {"Concurrent Updates", ?_test(test_concurrent_updates())},
                 {"Concurrent Create Is Idempotent", ?_test(test_concurrent_create())},
                 {"Atomic State Take", ?_test(test_atomic_take_state())},
+                {"Atomic Compare And Append",
+                 ?_test(test_compare_and_append_event())},
                 {"Runner Integration", ?_test(test_runner_integration())}
             ]
         end
@@ -236,6 +238,33 @@ test_atomic_take_state() ->
     {ok, Session} = erlang_adk_session_mnesia:get_session(
                       App, User, SessionId),
     ?assertEqual(error, maps:find(Key, maps:get(state, Session))).
+
+test_compare_and_append_event() ->
+    App = <<"CompareAppendMnesiaApp">>,
+    User = <<"CompareAppendMnesiaUser">>,
+    SessionId = <<"compare-append-mnesia-session">>,
+    Key = <<"continuation">>,
+    Expected = #{<<"revision">> => 1},
+    {ok, _} = erlang_adk_session_mnesia:create_session(
+                App, User,
+                #{session_id => SessionId,
+                  state => #{Key => Expected}}),
+    Event = adk_event:new(
+              <<"tool">>, <<"progress">>,
+              #{actions =>
+                    #{<<"state_delta">> => #{<<"progress">> => 50}}}),
+    ok = erlang_adk_session_mnesia:add_event_if_state(
+           App, User, SessionId, Key, Expected, Event),
+    ?assertEqual(
+       {error, conflict},
+       erlang_adk_session_mnesia:add_event_if_state(
+         App, User, SessionId, Key,
+         #{<<"revision">> => 2}, Event)),
+    {ok, Session} = erlang_adk_session_mnesia:get_session(
+                      App, User, SessionId),
+    ?assertEqual(Expected, maps:get(Key, maps:get(state, Session))),
+    ?assertEqual(50, maps:get(<<"progress">>, maps:get(state, Session))),
+    ?assertEqual([Event], maps:get(events, Session)).
 
 test_runner_integration() ->
     App = <<"MnesiaRunnerApp">>,

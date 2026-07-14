@@ -13,6 +13,8 @@ hitl_pause_test_() ->
      fun cleanup/1,
      [
       fun test_pause_and_resume_same_invocation/0,
+      fun test_pause_event_is_json_roundtrippable/0,
+      fun test_two_paused_invocations_are_independently_resumable/0,
       fun test_concurrent_resume_is_single_use/0,
       fun test_sync_run_returns_paused/0,
       fun test_resume_rejects_missing_pause/0
@@ -32,7 +34,8 @@ cleanup_sessions() ->
           erlang_adk_session:delete_session(?APP, ?USER, SessionId)
       end,
       [<<"hitl_resume_sess">>, <<"hitl_concurrent_sess">>,
-       <<"hitl_sync_sess">>, <<"hitl_missing_sess">>]),
+       <<"hitl_two_pauses_sess">>, <<"hitl_sync_sess">>,
+       <<"hitl_missing_sess">>, <<"hitl_json_pause_sess">>]),
     ok.
 
 %% The first model turn requests approval. The resumed turn reports the exact
@@ -67,6 +70,65 @@ hitl_agent_loop(TestPid, Stage) ->
             ok;
         _ ->
             hitl_agent_loop(TestPid, Stage)
+    end.
+
+%% This agent leaves a second, correlated Gemini-style call in the durable
+%% continuation.  Its first call deliberately has no signature or call ID.
+json_pause_agent_loop(initial) ->
+    receive
+        {'$gen_call', From, {run_with_events, _History, InvId}} ->
+            Calls = [
+                {<<"request_human_approval">>,
+                 #{<<"action_summary">> => <<"Publish Release">>},
+                 undefined},
+                {<<"missing_after_approval">>,
+                 #{<<"release">> => <<"0.3.0">>},
+                 undefined, <<"remaining-call-id">>}
+            ],
+            AgentEvent = adk_event:new(
+                           <<"agent">>, {tool_calls, Calls},
+                           #{invocation_id => InvId}),
+            gen_server:reply(From, {tool_calls, AgentEvent, Calls}),
+            json_pause_agent_loop(waiting_for_resume);
+        {'$gen_call', From, get_tools} ->
+            gen_server:reply(From, {ok, [adk_long_running_tool], #{}}),
+            json_pause_agent_loop(initial);
+        {'$gen_call', From, get_runtime} ->
+            gen_server:reply(
+              From, {ok, <<"json-agent">>, #{},
+                     [adk_long_running_tool], #{}}),
+            json_pause_agent_loop(initial);
+        stop -> ok
+    end;
+json_pause_agent_loop(waiting_for_resume) ->
+    receive
+        {'$gen_call', From, {run_with_events, _History, InvId}} ->
+            FinalEvent = adk_event:new(
+                           <<"json-agent">>, <<"Release handled">>,
+                           #{invocation_id => InvId, is_final => true}),
+            gen_server:reply(From, {ok, FinalEvent}),
+            json_pause_agent_loop(done);
+        {'$gen_call', From, get_tools} ->
+            gen_server:reply(From, {ok, [adk_long_running_tool], #{}}),
+            json_pause_agent_loop(waiting_for_resume);
+        {'$gen_call', From, get_runtime} ->
+            gen_server:reply(
+              From, {ok, <<"json-agent">>, #{},
+                     [adk_long_running_tool], #{}}),
+            json_pause_agent_loop(waiting_for_resume);
+        stop -> ok
+    end;
+json_pause_agent_loop(done) ->
+    receive
+        {'$gen_call', From, get_tools} ->
+            gen_server:reply(From, {ok, [adk_long_running_tool], #{}}),
+            json_pause_agent_loop(done);
+        {'$gen_call', From, get_runtime} ->
+            gen_server:reply(
+              From, {ok, <<"json-agent">>, #{},
+                     [adk_long_running_tool], #{}}),
+            json_pause_agent_loop(done);
+        stop -> ok
     end.
 
 test_pause_and_resume_same_invocation() ->
@@ -112,6 +174,10 @@ test_pause_and_resume_same_invocation() ->
             %% A continuation is single-use and terminal completion clears temp state.
             ?assertEqual({error, no_paused_invocation},
                          adk_runner:resume(Runner, ?USER, SessionId, <<"Again">>)),
+            ?assertEqual(
+               {error, no_paused_invocation},
+               adk_runner:resume(
+                 Runner, ?USER, SessionId, OriginalInvId, <<"Again">>)),
             {ok, FinalSession} = erlang_adk_session:get_session(?APP, ?USER, SessionId),
             FinalState = maps:get(state, FinalSession),
             ?assertEqual(error, maps:find(<<"temp:approval_context">>, FinalState))
@@ -119,6 +185,112 @@ test_pause_and_resume_same_invocation() ->
         ?assert(false)
     end,
     AgentPid1 ! stop.
+
+test_pause_event_is_json_roundtrippable() ->
+    SessionId = <<"hitl_json_pause_sess">>,
+    AgentPid = spawn(fun() -> json_pause_agent_loop(initial) end),
+    Runner = adk_runner:new(AgentPid, ?APP, erlang_adk_session,
+                            #{run_timeout => 2000}),
+    try
+        {ok, StreamPid} = adk_runner:run_async(
+                            Runner, ?USER, SessionId,
+                            <<"Publish the release">>),
+        {PauseEvent, _Events} = await_pause(StreamPid, []),
+
+        {ok, Encoded} = adk_event:encode(PauseEvent),
+        ?assertEqual(Encoded, adk_event:to_map(PauseEvent)),
+        JsonMap = jsx:decode(jsx:encode(Encoded), [return_maps]),
+        ?assertEqual({ok, PauseEvent}, adk_event:decode(JsonMap)),
+
+        Pause = maps:get(<<"pause">>, PauseEvent#adk_event.actions),
+        ?assertEqual(null, maps:get(<<"thought_signature">>, Pause)),
+        ?assertEqual(null, maps:get(<<"call_id">>, Pause)),
+        StateDelta = maps:get(
+                       <<"state_delta">>, PauseEvent#adk_event.actions),
+        [_ContinuationKey] = maps:keys(StateDelta),
+        [PauseState] = maps:values(StateDelta),
+        ?assertEqual(<<"human_in_the_loop">>,
+                     maps:get(<<"reason">>, PauseState)),
+        [RemainingCall] = maps:get(<<"remaining_calls">>, PauseState),
+        ?assert(is_map(RemainingCall)),
+        ?assertEqual(<<"remaining-call-id">>,
+                     maps:get(<<"call_id">>, RemainingCall)),
+
+        InvocationId = PauseEvent#adk_event.invocation_id,
+        {ok, ResumePid} = adk_runner:resume(
+                            Runner, ?USER, SessionId, InvocationId,
+                            <<"Approved">>),
+        ResumeEvents = await_done(ResumePid, []),
+        ?assert(lists:any(
+                  fun(Event) -> Event#adk_event.is_final =:= true end,
+                  ResumeEvents))
+    after
+        AgentPid ! stop
+    end.
+
+test_two_paused_invocations_are_independently_resumable() ->
+    SessionId = <<"hitl_two_pauses_sess">>,
+    TestPid = self(),
+    AgentPid1 = spawn(fun() -> hitl_agent_loop(TestPid, initial) end),
+    AgentPid2 = spawn(fun() -> hitl_agent_loop(TestPid, initial) end),
+    Runner1 = adk_runner:new(AgentPid1, ?APP, erlang_adk_session,
+                             #{run_timeout => 2000}),
+    Runner2 = adk_runner:new(AgentPid2, ?APP, erlang_adk_session,
+                             #{run_timeout => 2000}),
+    try
+        {ok, StreamPid1} = adk_runner:run_async(
+                             Runner1, ?USER, SessionId, <<"Approval one">>),
+        {PauseEvent1, _} = await_pause(StreamPid1, []),
+        InvId1 = PauseEvent1#adk_event.invocation_id,
+        receive {initial_invocation, InvId1} -> ok
+        after 1000 -> ?assert(false)
+        end,
+
+        {ok, StreamPid2} = adk_runner:run_async(
+                             Runner2, ?USER, SessionId, <<"Approval two">>),
+        {PauseEvent2, _} = await_pause(StreamPid2, []),
+        InvId2 = PauseEvent2#adk_event.invocation_id,
+        receive {initial_invocation, InvId2} -> ok
+        after 1000 -> ?assert(false)
+        end,
+        ?assertNotEqual(InvId1, InvId2),
+
+        %% The compatibility API refuses to guess. The pause event's
+        %% invocation_id is the explicit continuation reference for resume/5.
+        {error, {ambiguous_paused_invocation, AmbiguousIds}} =
+            adk_runner:resume(Runner1, ?USER, SessionId, <<"Approved">>),
+        ?assertEqual(lists:sort([InvId1, InvId2]), AmbiguousIds),
+
+        {ok, ResumePid1} = adk_runner:resume(
+                             Runner1, ?USER, SessionId, InvId1,
+                             <<"Approved one">>),
+        _ = await_done(ResumePid1, []),
+        receive {resumed_invocation, InvId1, _History1} -> ok
+        after 1000 -> ?assert(false)
+        end,
+        ?assertEqual(
+           {error, no_paused_invocation},
+           adk_runner:resume(
+             Runner1, ?USER, SessionId, InvId1, <<"Replay">>)),
+
+        %% Completing the first invocation must not clear the second
+        %% invocation's continuation. With only one left resume/4 is safe.
+        {ok, ResumePid2} = adk_runner:resume(
+                             Runner2, ?USER, SessionId,
+                             <<"Approved two">>),
+        _ = await_done(ResumePid2, []),
+        receive {resumed_invocation, InvId2, _History2} -> ok
+        after 1000 -> ?assert(false)
+        end,
+        ?assertEqual(
+           {error, no_paused_invocation},
+           adk_runner:resume(
+             Runner2, ?USER, SessionId, InvId2, <<"Replay">>))
+    after
+        AgentPid1 ! stop,
+        AgentPid2 ! stop,
+        _ = erlang_adk_session:delete_session(?APP, ?USER, SessionId)
+    end.
 
 test_concurrent_resume_is_single_use() ->
     SessionId = <<"hitl_concurrent_sess">>,
@@ -233,6 +405,8 @@ assert_pause_event(PauseEvent) ->
     ?assertEqual(<<"request_human_approval">>, maps:get(<<"tool_name">>, Pause)),
     ?assertEqual(?SIG, maps:get(<<"thought_signature">>, Pause)),
     ?assertEqual(?CALL_ID, maps:get(<<"call_id">>, Pause)),
+    ?assertEqual(PauseEvent#adk_event.invocation_id,
+                 maps:get(<<"continuation_id">>, Pause)),
     ?assertEqual(<<"human_in_the_loop">>, maps:get(<<"reason">>, Pause)).
 
 assert_correlated_tool_response(Events, InvId) ->

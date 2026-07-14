@@ -30,9 +30,12 @@ agent_node(Name, Config, Tools) ->
                 NewHistory = HistoryEvents ++ [AgentEvent],
                 #{<<"events">> => NewHistory, <<"pending_tools">> => Calls, <<"last_agent">> => Name};
             {error, Reason} ->
-                ErrorEvent = adk_event:new(Name, list_to_binary(io_lib:format("Error: ~p", [Reason])), #{}),
+                Failure = adk_failure:sanitize(
+                            graph_node, model_generate, Reason),
+                ErrorEvent = adk_event:new(
+                               Name, <<"Model execution failed">>, #{}),
                 NewHistory = HistoryEvents ++ [ErrorEvent],
-                #{<<"events">> => NewHistory, <<"error">> => Reason}
+                #{<<"events">> => NewHistory, <<"error">> => Failure}
         end
     end.
 
@@ -81,13 +84,22 @@ execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList, Acc) ->
         {value, Mod} ->
             try Mod:execute(ArgsMap, #{}) of
                 {ok, Res} -> #{<<"success">> => true, <<"result">> => format_result(Res)};
-                {error, Reason} -> #{<<"success">> => false, <<"error">> => format_result(Reason)};
+                {error, Reason} ->
+                    #{<<"success">> => false,
+                      <<"error">> => adk_failure:model_response(
+                                        graph_tool, execute, Reason)};
                 Other -> #{<<"success">> => false,
-                           <<"error">> => format_result({invalid_tool_result, Other})}
+                           <<"error">> => adk_failure:model_response(
+                                             graph_tool, invalid_result,
+                                             Other)}
             catch
                 Class:Failure ->
                     #{<<"success">> => false,
-                      <<"error">> => format_result({Class, Failure})}
+                      <<"error">> =>
+                          adk_failure:model_response(
+                            graph_tool, execute,
+                            adk_failure:exception(
+                              graph_tool, execute, Class, Failure))}
             end;
         false ->
             #{<<"success">> => false, <<"error">> => <<"Tool not found">>}
@@ -122,9 +134,14 @@ generate_with_callbacks(Config, Memory, History, Tools) ->
         {replace, Replacement} -> Replacement;
         _ ->
             try adk_llm:generate(Config, History, Tools) of
+                {error, Reason} ->
+                    {error, adk_failure:sanitize(
+                              graph_node, model_generate, Reason)};
                 Result -> Result
             catch
-                Class:Reason -> {error, {Class, Reason}}
+                Class:Reason ->
+                    {error, adk_failure:exception(
+                              graph_node, model_generate, Class, Reason)}
             end
     end,
     case adk_callbacks:run(Handlers, after_model, [Config, RawResult]) of

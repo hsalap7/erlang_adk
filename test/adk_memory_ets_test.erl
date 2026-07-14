@@ -10,6 +10,7 @@ memory_ets_test_() ->
          [
           ?_test(test_add_search(Pid)),
           ?_test(test_add_session(Pid)),
+          ?_test(test_add_session_skips_non_serializable_event(Pid)),
           ?_test(test_correlated_replies(Pid))
          ]
      end}.
@@ -52,6 +53,18 @@ test_add_session(Pid) ->
     Content = maps:get(content, R),
     ?assert(string:str(binary_to_list(Content), "Query 1") > 0),
     ?assert(string:str(binary_to_list(Content), "Response 1") > 0).
+
+test_add_session_skips_non_serializable_event(Pid) ->
+    InternalEvent = adk_event:new(
+                      <<"runner">>, <<"internal continuation">>,
+                      #{actions => #{<<"private">> => {not_json, self()}}}),
+    SearchableEvent = adk_event:new(<<"user">>, <<"still searchable">>),
+    ok = adk_memory_ets:add_session_to_memory(
+           Pid, <<"sess_with_internal_event">>,
+           [InternalEvent, SearchableEvent]),
+    {ok, [_ | _]} = adk_memory_ets:search(
+                      Pid, <<"still searchable">>, #{}, 10),
+    ?assert(is_process_alive(Pid)).
 
 test_correlated_replies(Pid) ->
     OldRef = make_ref(),

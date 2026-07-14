@@ -17,7 +17,8 @@ state_scoping_test_() ->
       fun test_missing_session_update_does_not_leak_scoped_state/0,
       fun test_concurrent_updates_are_not_lost/0,
       fun test_concurrent_create_is_idempotent/0,
-      fun test_take_state_is_atomic/0
+      fun test_take_state_is_atomic/0,
+      fun test_independent_sessions_do_not_share_a_lock/0
      ]}.
 
 test_user_prefix_propagation() ->
@@ -247,3 +248,41 @@ collect_take_results(Remaining, Acc) ->
     after 5000 ->
         erlang:error(take_timeout)
     end.
+
+test_independent_sessions_do_not_share_a_lock() ->
+    App = <<"lock_granularity_app">>,
+    User = <<"lock_granularity_user">>,
+    BlockedSession = <<"blocked">>,
+    FreeSession = <<"free">>,
+    {ok, _} = erlang_adk_session:create_session(
+                App, User, #{session_id => BlockedSession}),
+    {ok, _} = erlang_adk_session:create_session(
+                App, User, #{session_id => FreeSession}),
+    Parent = self(),
+    Blocker = spawn(fun() ->
+        Resource = {erlang_adk_session, session, App, User, BlockedSession},
+        global:trans(
+          {Resource, self()},
+          fun() ->
+              Parent ! session_lock_held,
+              receive release_session_lock -> ok end
+          end,
+          [node()], infinity)
+    end),
+    receive session_lock_held -> ok after 1000 -> ?assert(false) end,
+
+    %% A former app-wide lock made this read wait behind BlockedSession.
+    Reader = spawn(fun() ->
+        Parent ! {free_session_read,
+                  erlang_adk_session:get_session(App, User, FreeSession)}
+    end),
+    receive
+        {free_session_read, {ok, Session}} ->
+            ?assertEqual(FreeSession, maps:get(id, Session))
+    after 1000 ->
+        exit(Reader, kill),
+        ?assert(false)
+    end,
+    Blocker ! release_session_lock,
+    ok = erlang_adk_session:delete_session(App, User, BlockedSession),
+    ok = erlang_adk_session:delete_session(App, User, FreeSession).

@@ -4,7 +4,8 @@
 -behaviour(adk_session_service).
 
 -export([init/0, create_session/3, get_session/3, list_sessions/2, delete_session/3,
-         update_state/4, add_event/4, clear_temp_state/3, take_state/4]).
+         update_state/4, add_event/4, clear_temp_state/3, take_state/4,
+         add_event_if_state/6]).
 -export([save/2, load/1, delete/1]). %% Legacy API
 
 -record(adk_sessions_mnesia, {id, memory}).
@@ -13,24 +14,58 @@
 
 %% @doc Initialize the Mnesia tables. Call this if you intend to use Mnesia sessions.
 init() ->
-    application:ensure_all_started(mnesia),
-    %% Try to change the local schema to disk-backed storage when possible.
-    mnesia:change_table_copy_type(schema, node(), disc_copies),
+    case application:ensure_all_started(mnesia) of
+        {ok, _StartedApps} -> init_schema_and_tables();
+        {error, Reason} -> {error, {mnesia_start_failed, Reason}}
+    end.
 
-    mnesia:create_table(adk_sessions_mnesia, [
-        {attributes, record_info(fields, adk_sessions_mnesia)},
-        {disc_copies, [node()]}
-    ]),
-    mnesia:create_table(adk_session_v2, [
-        {attributes, record_info(fields, adk_session_v2)},
-        {disc_copies, [node()]}
-    ]),
-    mnesia:create_table(adk_session_scope, [
-        {attributes, record_info(fields, adk_session_scope)},
-        {disc_copies, [node()]}
-    ]),
-    mnesia:wait_for_tables(
-      [adk_sessions_mnesia, adk_session_v2, adk_session_scope], 5000).
+init_schema_and_tables() ->
+    case ensure_disk_schema() of
+        ok ->
+            Tables = [
+                {adk_sessions_mnesia,
+                 [{attributes, record_info(fields, adk_sessions_mnesia)},
+                  {disc_copies, [node()]}]},
+                {adk_session_v2,
+                 [{attributes, record_info(fields, adk_session_v2)},
+                  {disc_copies, [node()]}]},
+                {adk_session_scope,
+                 [{attributes, record_info(fields, adk_session_scope)},
+                  {disc_copies, [node()]}]}
+            ],
+            case ensure_tables(Tables) of
+                ok -> wait_for_tables();
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error -> Error
+    end.
+
+ensure_disk_schema() ->
+    case mnesia:change_table_copy_type(schema, node(), disc_copies) of
+        {atomic, ok} -> ok;
+        {aborted, {already_exists, schema, Node, disc_copies}}
+          when Node =:= node() -> ok;
+        {aborted, Reason} -> {error, {schema_configuration_failed, Reason}}
+    end.
+
+ensure_tables([]) ->
+    ok;
+ensure_tables([{Table, Options} | Rest]) ->
+    case mnesia:create_table(Table, Options) of
+        {atomic, ok} -> ensure_tables(Rest);
+        {aborted, {already_exists, Table}} -> ensure_tables(Rest);
+        {aborted, Reason} -> {error, {table_creation_failed, Table, Reason}}
+    end.
+
+wait_for_tables() ->
+    Tables = [adk_sessions_mnesia, adk_session_v2, adk_session_scope],
+    case mnesia:wait_for_tables(Tables, 5000) of
+        ok -> ok;
+        {timeout, Unavailable} ->
+            {error, {table_wait_timeout, Unavailable}};
+        {error, Reason} ->
+            {error, {table_wait_failed, Reason}}
+    end.
 
 %% --- Legacy API for backward compatibility ---
 save(SessionId, Memory) ->
@@ -209,6 +244,54 @@ take_state(AppName, UserId, SessionId, Key) ->
                 {error, not_found}
         end
     end).
+
+%% @doc Mnesia compare-and-append counterpart to the ETS session service.
+add_event_if_state(AppName, UserId, SessionId, Key, Expected, Event)
+  when is_record(Event, adk_event) ->
+    transaction(fun() ->
+        SessionKey = {AppName, UserId, SessionId},
+        case mnesia:read(adk_session_v2, SessionKey, write) of
+            [Record = #adk_session_v2{state = StoredState,
+                                      events = Events}] ->
+                {LocalState0, LegacyUserState, LegacyAppState} =
+                    split_state(StoredState),
+                AppState0 = maps:merge(
+                              LegacyAppState,
+                              read_scope_tx(app_scope_key(AppName), write)),
+                UserState0 = maps:merge(
+                               LegacyUserState,
+                               read_scope_tx(user_scope_key(AppName, UserId),
+                                             write)),
+                Current = compose_state(LocalState0, UserState0, AppState0),
+                case maps:find(Key, Current) of
+                    {ok, Expected} ->
+                        StateDelta = maps:get(
+                                       <<"state_delta">>,
+                                       Event#adk_event.actions, #{}),
+                        {LocalDelta, UserDelta, AppDelta} =
+                            split_state(StateDelta),
+                        LocalState = maps:merge(LocalState0, LocalDelta),
+                        update_scope_tx(app_scope_key(AppName),
+                                        AppState0, AppDelta),
+                        update_scope_tx(user_scope_key(AppName, UserId),
+                                        UserState0, UserDelta),
+                        mnesia:write(
+                          Record#adk_session_v2{
+                            state = LocalState,
+                            events = [Event | Events],
+                            last_update = erlang:system_time(millisecond)}),
+                        ok;
+                    {ok, _Other} ->
+                        {error, conflict};
+                    error ->
+                        {error, not_found}
+                end;
+            [] ->
+                {error, not_found}
+        end
+    end);
+add_event_if_state(_AppName, _UserId, _SessionId, _Key, _Expected, _Event) ->
+    {error, invalid_event}.
 
 %% --- Internal functions ---
 

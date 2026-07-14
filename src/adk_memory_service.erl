@@ -5,6 +5,7 @@
 %% querying and updating long-term knowledge.
 -module(adk_memory_service).
 
+-type handle() :: term().
 -type query() :: binary().
 -type filter() :: map().
 -type result() :: #{
@@ -14,12 +15,18 @@
     score => float()
 }.
 
--export_type([query/0, filter/0, result/0]).
+-export_type([handle/0, query/0, filter/0, result/0]).
 
--callback init(Config :: map()) -> {ok, pid()} | {error, term()}.
--callback add(Pid :: pid(), Content :: binary(), Metadata :: map()) -> {ok, binary()} | {error, term()}.
--callback search(Pid :: pid(), Query :: query(), Filter :: filter(), Limit :: pos_integer()) -> {ok, [result()]} | {error, term()}.
--callback delete(Pid :: pid(), Id :: binary()) -> ok | {error, term()}.
+-callback init(Config :: map()) -> {ok, handle()} | {error, term()}.
+-callback add(Handle :: handle(), Content :: binary(), Metadata :: map()) ->
+    {ok, binary()} | {error, term()}.
+-callback search(Handle :: handle(), Query :: query(), Filter :: filter(),
+                 Limit :: pos_integer()) ->
+    {ok, [result()]} | {error, term()}.
+-callback delete(Handle :: handle(), Id :: binary()) ->
+    ok | {error, term()}.
 
 %% Helper to index an entire session's events into long term memory.
--callback add_session_to_memory(Pid :: pid(), SessionId :: binary(), Events :: [adk_event:event()]) -> ok | {error, term()}.
+-callback add_session_to_memory(Handle :: handle(), SessionId :: binary(),
+                                Events :: [adk_event:event()]) ->
+    ok | {error, term()}.

@@ -11,7 +11,17 @@ start_link() ->
 
 %% @doc Spawns a new ADK agent process dynamically under this supervisor.
 start_agent(Name, LLMConfig, Tools) ->
-    supervisor:start_child(?SERVER, [Name, LLMConfig, Tools]).
+    case adk_agent_config_store:put(Name, LLMConfig, Tools) of
+        {ok, ConfigRef} ->
+            case supervisor:start_child(?SERVER, [ConfigRef]) of
+                {ok, _Pid} = Started -> Started;
+                {ok, _Pid, _Info} = Started -> Started;
+                {error, _Reason} = Error ->
+                    ok = adk_agent_config_store:delete(ConfigRef),
+                    Error
+            end;
+        {error, _Reason} = Error -> Error
+    end.
 
 init([]) ->
     SupFlags = #{strategy => simple_one_for_one,

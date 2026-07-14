@@ -44,13 +44,72 @@ init([]) ->
                  shutdown => 5000,
                  type => worker,
                  modules => [adk_agent_registry]},
+    AgentConfigStore = adk_agent_config_store:child_spec(#{}),
     AgentSup = #{id => adk_agent_sup,
                  start => {adk_agent_sup, start_link, []},
                  restart => permanent,
                  shutdown => infinity,
                  type => supervisor,
                  modules => [adk_agent_sup]},
-    ChildSpecs = [SessionOwner, Registry, AgentSup],
+    AgentTurnSup = adk_agent_turn_sup:child_spec(#{}),
+    %% Blocking model/tool work is independently supervised. Keep every
+    %% registry immediately ahead of its dynamic supervisor. Tasks sit before
+    %% runs because invocations may own tasks; rest_for_one can therefore never
+    %% leave a run attached to a stale task registry.
+    TaskRegistry = adk_task_registry:child_spec(#{}),
+    TaskSup = adk_task_sup:child_spec(#{}),
+    RunRegistry = adk_run_registry:child_spec(#{}),
+    InvocationSup = adk_invocation_sup:child_spec(#{}),
+    AdmissionControl = adk_admission_control:child_spec(
+                         application:get_env(
+                           erlang_adk, admission_control, #{})),
+    AmbientSup = adk_ambient_sup:child_spec(#{}),
+    AuthSup = adk_auth_sup:child_spec(#{}),
+    OidcProviderSup = adk_oidc_provider_sup:child_spec(
+                        #{providers => application:get_env(
+                                         erlang_adk, oidc_providers, [])}),
+    McpClientSup = adk_mcp_client_sup:child_spec(#{}),
+    WorkflowSup = adk_workflow_sup:child_spec(#{}),
+    ChildSpecs = [SessionOwner, Registry, AgentConfigStore, AgentSup,
+                  AgentTurnSup,
+                  TaskRegistry, TaskSup,
+                  RunRegistry, InvocationSup,
+                  AdmissionControl, AmbientSup,
+                  AuthSup, OidcProviderSup, McpClientSup,
+                  WorkflowSup] ++ a2a_v1_child_specs() ++ http_child_specs(),
     {ok, {SupFlags, ChildSpecs}}.
 
 %% internal functions
+
+a2a_v1_child_specs() ->
+    case application:get_env(erlang_adk, a2a_v1_enabled, false) of
+        true ->
+            Options = application:get_env(
+                        erlang_adk, a2a_v1_server_options, #{}),
+            [adk_a2a_v1_server:child_spec(Options)];
+        false -> [];
+        Invalid ->
+            erlang:error({invalid_application_env, a2a_v1_enabled, Invalid})
+    end.
+
+http_child_specs() ->
+    A2AEnabled = application:get_env(erlang_adk, a2a_enabled, false),
+    A2AV1Enabled = application:get_env(erlang_adk, a2a_v1_enabled, false),
+    DevEnabled = application:get_env(erlang_adk, dev_enabled, false),
+    case {A2AEnabled, A2AV1Enabled, DevEnabled} of
+        {false, false, false} -> [];
+        {A2A, A2AV1, Dev}
+          when is_boolean(A2A), is_boolean(A2AV1), is_boolean(Dev) ->
+            [#{id => erlang_adk_http,
+               start => {erlang_adk_http, start_link, []},
+               restart => permanent,
+               shutdown => 5000,
+               type => worker,
+               modules => [erlang_adk_http]}];
+        {Invalid, _, _} when not is_boolean(Invalid) ->
+            erlang:error({invalid_application_env, a2a_enabled, Invalid});
+        {_, Invalid, _} when not is_boolean(Invalid) ->
+            erlang:error({invalid_application_env, a2a_v1_enabled, Invalid});
+        {_, _, Invalid} ->
+            erlang:error({invalid_application_env, dev_enabled, Invalid})
+    end.

@@ -4,7 +4,8 @@
 -behaviour(adk_session_service).
 
 -export([init/0, create_session/3, get_session/3, list_sessions/2, delete_session/3,
-         update_state/4, add_event/4, clear_temp_state/3, take_state/4]).
+         update_state/4, add_event/4, clear_temp_state/3, take_state/4,
+         add_event_if_state/6]).
 -export([save/2, load/1, delete/1]). %% Legacy API
 
 -define(TABLE, adk_sessions).
@@ -38,7 +39,11 @@ delete(SessionId) ->
 create_session(AppName, UserId, Opts) ->
     SessionId = maps:get(session_id, Opts, generate_id()),
     InitialState = maps:get(state, Opts, #{}),
-    with_app_lock(AppName, fun() ->
+    {_, UserDelta0, AppDelta0} = split_state(InitialState),
+    with_scope_locks(AppName, UserId, SessionId,
+                     map_size(AppDelta0) > 0,
+                     map_size(UserDelta0) > 0,
+                     fun() ->
         case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
             [{{AppName, UserId, SessionId}, StoredState, Events, Timestamp}] ->
                 %% Idempotent creation prevents concurrent first invocations from
@@ -58,7 +63,7 @@ create_session(AppName, UserId, Opts) ->
     end).
 
 get_session(AppName, UserId, SessionId) ->
-    with_app_lock(AppName, fun() ->
+    with_session_lock(AppName, UserId, SessionId, fun() ->
         case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
             [{{AppName, UserId, SessionId}, StoredState, Events, Timestamp}] ->
                 State = effective_state(AppName, UserId, StoredState),
@@ -70,20 +75,21 @@ get_session(AppName, UserId, SessionId) ->
     end).
 
 list_sessions(AppName, UserId) ->
-    with_app_lock(AppName, fun() ->
-        MatchSpec = [{{{AppName, UserId, '$1'}, '_', '_', '$2'},
-                      [], [#{id => '$1', timestamp => '$2'}]}],
-        {ok, ets:select(?TABLE, MatchSpec)}
-    end).
+    %% ETS selection is concurrency-safe and intentionally returns a weakly
+    %% consistent snapshot when sessions are created/deleted concurrently.
+    %% It must not serialize unrelated sessions belonging to the same app.
+    MatchSpec = [{{{AppName, UserId, '$1'}, '_', '_', '$2'},
+                  [], [#{id => '$1', timestamp => '$2'}]}],
+    {ok, ets:select(?TABLE, MatchSpec)}.
 
 delete_session(AppName, UserId, SessionId) ->
-    with_app_lock(AppName, fun() ->
+    with_session_lock(AppName, UserId, SessionId, fun() ->
         ets:delete(?TABLE, {AppName, UserId, SessionId}),
         ok
     end).
 
 update_state(AppName, UserId, SessionId, StateDelta) ->
-    with_app_lock(AppName, fun() ->
+    with_mutation_locks(AppName, UserId, SessionId, StateDelta, fun() ->
         case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
             [{{AppName, UserId, SessionId}, StoredState, Events, _Timestamp}] ->
                 {LocalState0, LegacyUserState, LegacyAppState} = split_state(StoredState),
@@ -101,7 +107,7 @@ update_state(AppName, UserId, SessionId, StateDelta) ->
 
 add_event(AppName, UserId, SessionId, Event) ->
     StateDelta = maps:get(<<"state_delta">>, Event#adk_event.actions, #{}),
-    with_app_lock(AppName, fun() ->
+    with_mutation_locks(AppName, UserId, SessionId, StateDelta, fun() ->
         case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
             [{{AppName, UserId, SessionId}, StoredState, Events, _Timestamp}] ->
                 {LocalState0, LegacyUserState, LegacyAppState} = split_state(StoredState),
@@ -119,7 +125,7 @@ add_event(AppName, UserId, SessionId, Event) ->
 
 %% @doc Remove invocation-scoped temp: state after an invocation has completed.
 clear_temp_state(AppName, UserId, SessionId) ->
-    with_app_lock(AppName, fun() ->
+    with_mutation_locks(AppName, UserId, SessionId, #{}, fun() ->
         case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
             [{{AppName, UserId, SessionId}, StoredState, Events, _Timestamp}] ->
                 {LocalState0, LegacyUserState, LegacyAppState} = split_state(StoredState),
@@ -139,7 +145,8 @@ clear_temp_state(AppName, UserId, SessionId) ->
 %% @doc Atomically read and remove one state value.
 %% Missing sessions and missing keys both return {error, not_found}.
 take_state(AppName, UserId, SessionId, Key) ->
-    with_app_lock(AppName, fun() ->
+    with_mutation_locks(AppName, UserId, SessionId,
+                        #{Key => '$adk_lock_marker'}, fun() ->
         case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
             [{{AppName, UserId, SessionId}, StoredState, Events, _Timestamp}] ->
                 {LocalState, LegacyUserState, LegacyAppState} = split_state(StoredState),
@@ -167,6 +174,47 @@ take_state(AppName, UserId, SessionId, Key) ->
                 {error, not_found}
         end
     end).
+
+%% @doc Atomically append Event only while Key still has Expected. This is the
+%% compare-and-append primitive used for non-terminal long-running tool
+%% progress, so a racing terminal resume either happens wholly before or after
+%% the progress event.
+add_event_if_state(AppName, UserId, SessionId, Key, Expected, Event)
+  when is_record(Event, adk_event) ->
+    StateDelta = maps:get(<<"state_delta">>, Event#adk_event.actions, #{}),
+    LockDelta = StateDelta#{Key => '$adk_lock_marker'},
+    with_mutation_locks(AppName, UserId, SessionId, LockDelta, fun() ->
+        case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
+            [{{AppName, UserId, SessionId}, StoredState, Events, _Timestamp}] ->
+                {LocalState0, LegacyUserState, LegacyAppState} =
+                    split_state(StoredState),
+                Current = effective_state(AppName, UserId, StoredState),
+                case maps:find(Key, Current) of
+                    {ok, Expected} ->
+                        {LocalDelta, UserDelta, AppDelta} =
+                            split_state(StateDelta),
+                        LocalState = maps:merge(LocalState0, LocalDelta),
+                        update_scope(app_scope_key(AppName),
+                                     LegacyAppState, AppDelta),
+                        update_scope(user_scope_key(AppName, UserId),
+                                     LegacyUserState, UserDelta),
+                        ets:insert(
+                          ?TABLE,
+                          {{AppName, UserId, SessionId}, LocalState,
+                           [Event | Events],
+                           erlang:system_time(millisecond)}),
+                        ok;
+                    {ok, _Other} ->
+                        {error, conflict};
+                    error ->
+                        {error, not_found}
+                end;
+            [] ->
+                {error, not_found}
+        end
+    end);
+add_event_if_state(_AppName, _UserId, _SessionId, _Key, _Expected, _Event) ->
+    {error, invalid_event}.
 
 %% --- Internal functions ---
 
@@ -245,9 +293,51 @@ take_scope_value(ScopeKey, Key) ->
             {error, not_found}
     end.
 
-with_app_lock(AppName, Fun) ->
-    LockId = {{?MODULE, AppName}, self()},
-    global:trans(LockId, Fun, [node()], infinity).
+%% Local session mutations should not contend merely because they share an
+%% application name. App- and user-scoped map merges still need their matching
+%% locks to avoid lost updates. Locks are acquired in app -> user -> session
+%% order so an operation spanning scopes cannot deadlock another operation.
+with_mutation_locks(AppName, UserId, SessionId, Delta, Fun) ->
+    {_, DeltaUser, DeltaApp} = split_state(Delta),
+    {LegacyUser, LegacyApp} = legacy_scopes(AppName, UserId, SessionId),
+    with_scope_locks(AppName, UserId, SessionId,
+                     map_size(DeltaApp) > 0 orelse map_size(LegacyApp) > 0,
+                     map_size(DeltaUser) > 0 orelse map_size(LegacyUser) > 0,
+                     Fun).
+
+legacy_scopes(AppName, UserId, SessionId) ->
+    case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
+        [{{AppName, UserId, SessionId}, StoredState, _Events, _Timestamp}] ->
+            {_Local, User, App} = split_state(StoredState),
+            {User, App};
+        [] ->
+            {#{}, #{}}
+    end.
+
+with_scope_locks(AppName, UserId, SessionId, NeedApp, NeedUser, Fun) ->
+    WithSession = fun() ->
+        with_session_lock(AppName, UserId, SessionId, Fun)
+    end,
+    WithUser = case NeedUser of
+        true -> fun() -> with_user_lock(AppName, UserId, WithSession) end;
+        false -> WithSession
+    end,
+    case NeedApp of
+        true -> with_app_scope_lock(AppName, WithUser);
+        false -> WithUser()
+    end.
+
+with_app_scope_lock(AppName, Fun) ->
+    with_lock({?MODULE, app_scope, AppName}, Fun).
+
+with_user_lock(AppName, UserId, Fun) ->
+    with_lock({?MODULE, user_scope, AppName, UserId}, Fun).
+
+with_session_lock(AppName, UserId, SessionId, Fun) ->
+    with_lock({?MODULE, session, AppName, UserId, SessionId}, Fun).
+
+with_lock(Resource, Fun) ->
+    global:trans({Resource, self()}, Fun, [node()], infinity).
 
 generate_id() ->
     <<A:32, B:16, C:16, D:16, E:48>> = crypto:strong_rand_bytes(16),

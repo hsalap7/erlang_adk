@@ -108,9 +108,12 @@ execute_node(CompiledGraph, NodeName, State, Steps, MaxSteps) ->
                 execute_node(CompiledGraph, NextNode, NewState,
                              Steps + 1, MaxSteps)
             catch
-                E:R:S ->
-                    logger:error("Graph execution error at ~p: ~p:~p~n~p", [NodeName, E, R, S]),
-                    {error, {node_execution_failed, NodeName, R}}
+                Class:Reason:_Stack ->
+                    Failure = adk_failure:exception(
+                                graph, execute_node, Class, Reason),
+                    logger:error("Graph node execution failed: ~p",
+                                 [Failure]),
+                    {error, Failure}
             end;
         error ->
             {error, {unknown_node, NodeName}}

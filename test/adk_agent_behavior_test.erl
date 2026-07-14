@@ -29,20 +29,24 @@ callback_module_is_loaded_and_can_halt() ->
     _ = code:purge(adk_unloaded_callback),
     _ = code:delete(adk_unloaded_callback),
     ?assertEqual(false, code:is_loaded(adk_unloaded_callback)),
+    persistent_term:put({adk_unloaded_callback, observer}, self()),
     {ok, Pid} = erlang_adk:spawn_agent("CallbackContractAgent", #{
         provider => adk_llm_probe,
         test_pid => self(),
-        callback_pid => self(),
-        callback_action => halt,
+        callback_config => #{action => halt},
         callbacks => [adk_unloaded_callback]
     }, []),
-    ?assertEqual({ok, <<"blocked by callback">>},
-                 erlang_adk:prompt(Pid, "hello")),
-    receive before_model -> ok after 1000 -> ?assert(false) end,
-    receive after_model -> ok after 1000 -> ?assert(false) end,
-    %% The provider must have been skipped by the before-model callback.
-    receive {probe_generate, _, _} -> ?assert(false) after 20 -> ok end,
-    ok = erlang_adk:stop_agent(Pid).
+    try
+        ?assertEqual({ok, <<"blocked by callback">>},
+                     erlang_adk:prompt(Pid, "hello")),
+        receive before_model -> ok after 1000 -> ?assert(false) end,
+        receive after_model -> ok after 1000 -> ?assert(false) end,
+        %% The provider must have been skipped by the before-model callback.
+        receive {probe_generate, _, _} -> ?assert(false) after 20 -> ok end
+    after
+        persistent_term:erase({adk_unloaded_callback, observer}),
+        _ = catch erlang_adk:stop_agent(Pid)
+    end.
 
 correlated_delegation() ->
     {ok, Pid} = erlang_adk:spawn_agent("CorrelatedAgent", #{
@@ -180,11 +184,21 @@ restored_session_keeps_instructions() ->
     ok = erlang_adk_session:delete(SessionId).
 
 registry_and_agents_have_coupled_restart_strategy() ->
-    {ok, {Flags, [SessionOwner, Registry, AgentSup]}} = erlang_adk_sup:init([]),
+    {ok, {Flags, Children}} = erlang_adk_sup:init([]),
+    ChildById = maps:from_list(
+                  [{maps:get(id, Child), Child} || Child <- Children]),
+    SessionOwner = maps:get(erlang_adk_session_owner, ChildById),
+    Registry = maps:get(adk_agent_registry, ChildById),
+    AgentSup = maps:get(adk_agent_sup, ChildById),
     ?assertEqual(rest_for_one, maps:get(strategy, Flags)),
     ?assertEqual(erlang_adk_session_owner, maps:get(id, SessionOwner)),
     ?assertEqual(adk_agent_registry, maps:get(id, Registry)),
-    ?assertEqual(adk_agent_sup, maps:get(id, AgentSup)).
+    ?assertEqual(adk_agent_sup, maps:get(id, AgentSup)),
+    ?assert(maps:is_key(adk_agent_config_store, ChildById)),
+    ?assert(maps:is_key(adk_agent_turn_sup, ChildById)),
+    ?assert(maps:is_key(adk_task_sup, ChildById)),
+    ?assert(maps:is_key(adk_invocation_sup, ChildById)),
+    ?assert(maps:is_key(adk_auth_sup, ChildById)).
 
 restore_agent_call_timeout(undefined) ->
     application:unset_env(erlang_adk, agent_call_timeout);

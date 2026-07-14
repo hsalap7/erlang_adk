@@ -118,7 +118,9 @@ binary_reviewer(Parent, Iteration) ->
     end.
 
 receive_message() ->
-    receive Message -> Message
+    receive
+        {worker_prompt, _Iteration, _IsBinary} = Message -> Message;
+        {reviewer_prompt, _Iteration, _IsBinary} = Message -> Message
     after 1000 -> timeout
     end.
 

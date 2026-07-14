@@ -18,6 +18,19 @@ generate(Config, History, Tools) ->
                         tool -> {ok, <<"delegation complete">>};
                         _ -> call_sub_agent(Config)
                     end
+            end;
+        tool_call ->
+            case lists:any(
+                   fun(#{role := tool}) -> true;
+                      (_) -> false
+                   end, History) of
+                true -> {ok, maps:get(response, Config, <<"tool complete">>)};
+                false ->
+                    Name = maps:get(call_name, Config),
+                    Args = maps:get(call_args, Config, #{}),
+                    {tool_calls, [{Name, Args, undefined,
+                                   maps:get(call_id, Config,
+                                            <<"probe-call-id">>)}]}
             end
     end.
 

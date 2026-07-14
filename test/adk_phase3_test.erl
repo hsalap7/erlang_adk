@@ -20,11 +20,16 @@ long_running_tool_test() ->
                  adk_long_running_tool:execute(#{<<"action_summary">> => <<"Test">>}, #{})).
 
 
-on_tool_start(Name, _Args) ->
-    put(last_hook, Name),
+on_tool_start(Name, #{target := Target}) ->
+    Target ! {tool_started, Name},
     ok.
 
 callbacks_test() ->
-    put(last_hook, undefined),
-    adk_callbacks:execute([?MODULE], on_tool_start, [<<"my_tool">>, #{}]),
-    ?assertEqual(<<"my_tool">>, get(last_hook)).
+    adk_callbacks:execute(
+      [?MODULE], on_tool_start, [<<"my_tool">>, #{target => self()}]),
+    receive
+        {tool_started, Name} ->
+            ?assertEqual(<<"my_tool">>, Name)
+    after 1000 ->
+        ?assert(false)
+    end.

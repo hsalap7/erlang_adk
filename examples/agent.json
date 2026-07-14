@@ -1,0 +1,22 @@
+{
+  "name": "CliAgent",
+  "provider": "gemini",
+  "model": "gemini-3.1-flash-lite",
+  "instructions": "Answer concisely and follow exact-output requests.",
+  "global_instruction": "Never expose credentials.",
+  "generation_config": {
+    "thinking_config": {
+      "thinking_level": "low"
+    },
+    "safety_settings": [
+      {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+      }
+    ]
+  },
+  "runner_options": {
+    "max_llm_calls": 8,
+    "max_tool_rounds": 4
+  }
+}

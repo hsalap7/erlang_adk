@@ -6,18 +6,48 @@
 init(Req0, State) ->
     case cowboy_req:method(Req0) of
         <<"POST">> ->
-            {ok, Body, Req1} = read_body(Req0, <<>>),
-            handle_body(Body, Req1, State);
+            MaxBodyBytes = maps:get(max_body_bytes, State, 1048576),
+            case body_too_large(Req0, MaxBodyBytes) of
+                true -> payload_too_large(Req0, State);
+                false ->
+                    case read_body(Req0, <<>>, MaxBodyBytes) of
+                        {ok, Body, Req1} -> handle_body(Body, Req1, State);
+                        {error, payload_too_large, Req1} ->
+                            payload_too_large(Req1, State)
+                    end
+            end;
         _ ->
             Req1 = cowboy_req:reply(405, #{}, <<"Method Not Allowed">>, Req0),
             {ok, Req1, State}
     end.
 
-read_body(Req, Acc) ->
-    case cowboy_req:read_body(Req) of
-        {ok, Data, Req1} -> {ok, <<Acc/binary, Data/binary>>, Req1};
-        {more, Data, Req1} -> read_body(Req1, <<Acc/binary, Data/binary>>)
+body_too_large(Req, MaxBodyBytes) ->
+    case cowboy_req:body_length(Req) of
+        Length when is_integer(Length) -> Length > MaxBodyBytes;
+        undefined -> false
     end.
+
+read_body(Req, Acc, MaxBodyBytes) ->
+    Remaining = MaxBodyBytes - byte_size(Acc),
+    ReadOptions = #{length => Remaining + 1, period => 5000},
+    case cowboy_req:read_body(Req, ReadOptions) of
+        {ok, Data, Req1} when byte_size(Data) =< Remaining ->
+            {ok, <<Acc/binary, Data/binary>>, Req1};
+        {more, Data, Req1} when byte_size(Data) =< Remaining ->
+            read_body(Req1, <<Acc/binary, Data/binary>>, MaxBodyBytes);
+        {ok, _Data, Req1} ->
+            {error, payload_too_large, Req1};
+        {more, _Data, Req1} ->
+            {error, payload_too_large, Req1}
+    end.
+
+payload_too_large(Req, State) ->
+    Req1 = cowboy_req:reply(
+             413,
+             #{<<"connection">> => <<"close">>,
+               <<"content-type">> => <<"text/plain">>},
+             <<"Payload Too Large">>, Req),
+    {ok, Req1, State}.
 
 handle_body(Body, Req, State) ->
     Decoded = try jsx:decode(Body, [return_maps]) of
@@ -43,7 +73,9 @@ dispatch_prompt(AgentName, Prompt, Req, State) ->
             PromptResult = try erlang_adk:prompt(Pid, Prompt) of
                 Result -> Result
             catch
-                Class:PromptFailure -> {error, {Class, PromptFailure}}
+                Class:PromptFailure ->
+                    {error, adk_failure:exception(
+                              a2a_http, prompt, Class, PromptFailure)}
             end,
             case PromptResult of
                 {ok, Response} ->
@@ -55,10 +87,15 @@ dispatch_prompt(AgentName, Prompt, Req, State) ->
                              #{<<"content-type">> => <<"application/json">>},
                              JsonResp, Req),
                     {ok, Req1, State};
-                {error, Reason} ->
-                    ErrorBody = unicode:characters_to_binary(
-                                  io_lib:format("~p", [Reason])),
-                    Req1 = cowboy_req:reply(500, #{}, ErrorBody, Req),
+                {error, _Reason} ->
+                    ErrorBody = jsx:encode(
+                                  #{<<"error">> =>
+                                        <<"agent_execution_failed">>}),
+                    Req1 = cowboy_req:reply(
+                             500,
+                             #{<<"content-type">> =>
+                                   <<"application/json">>},
+                             ErrorBody, Req),
                     {ok, Req1, State}
             end
     end.

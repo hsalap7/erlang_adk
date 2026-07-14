@@ -32,20 +32,26 @@ loop(State) ->
             From ! {memory_reply, Ref, {ok, Id}},
             loop(State);
         {search, From, Ref, Query, Filter, Limit} ->
-            %% Naive substring search instead of vector similarity
+            %% Deterministic lexical search instead of vector similarity.
+            %% Token overlap is more useful than requiring the complete user
+            %% prompt to be a literal substring of a stored memory.
             MatchSpec = [{'$1', [], ['$1']}],
             All = ets:select(State#state.table, MatchSpec),
-            QStr = string:to_lower(binary_to_list(Query)),
+            QueryTokens = search_tokens(Query),
             Results = lists:foldl(fun({Id, Content, Metadata}, Acc) ->
-                CStr = string:to_lower(binary_to_list(Content)),
-                case string:find(CStr, QStr) =/= nomatch andalso
-                     metadata_matches(Metadata, Filter) of
+                Score = lexical_score(QueryTokens, search_tokens(Content)),
+                case Score > 0.0 andalso metadata_matches(Metadata, Filter) of
                     false -> Acc;
                     true -> [#{id => Id, content => Content,
-                               metadata => Metadata, score => 1.0} | Acc]
+                               metadata => Metadata, score => Score} | Acc]
                 end
             end, [], All),
-            Sorted = lists:sublist(Results, Limit),
+            Sorted0 = lists:sort(
+                        fun(Left, Right) ->
+                            {-maps:get(score, Left), maps:get(id, Left)} =<
+                            {-maps:get(score, Right), maps:get(id, Right)}
+                        end, Results),
+            Sorted = lists:sublist(Sorted0, Limit),
             From ! {memory_reply, Ref, {ok, Sorted}},
             loop(State);
         {delete, From, Ref, Id} ->
@@ -55,8 +61,13 @@ loop(State) ->
         {add_session, From, Ref, SessionId, Events} ->
             %% Combine all event texts into one document
             Content = lists:foldl(fun(E, Acc) ->
-                case adk_event:to_map(E) of
-                    #{<<"content">> := #{<<"type">> := <<"text">>, <<"text">> := Text}} ->
+                %% Encoding is checked because session history can contain
+                %% internal-only action state (for example a continuation).
+                %% Such events are not searchable text and must not terminate
+                %% the memory service through the strict to_map/1 wrapper.
+                case adk_event:encode(E) of
+                    {ok, #{<<"content">> := #{<<"type">> := <<"text">>,
+                                                  <<"text">> := Text}}} ->
                         <<Acc/binary, "\n", Text/binary>>;
                     _ -> Acc
                 end
@@ -113,3 +124,15 @@ metadata_matches(Metadata, Filter) ->
     maps:fold(fun(Key, Value, Matches) ->
         Matches andalso maps:get(Key, Metadata, '$missing') =:= Value
     end, true, Filter).
+
+search_tokens(Text) when is_binary(Text) ->
+    Lower = string:lowercase(Text),
+    Parts = re:split(Lower, <<"[^\\p{L}\\p{N}_]+">>,
+                     [unicode, {return, binary}, trim]),
+    lists:usort([Token || Token <- Parts, byte_size(Token) > 0]).
+
+lexical_score([], _ContentTokens) -> 0.0;
+lexical_score(QueryTokens, ContentTokens) ->
+    Matches = length([Token || Token <- QueryTokens,
+                               lists:member(Token, ContentTokens)]),
+    Matches / length(QueryTokens).

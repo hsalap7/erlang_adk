@@ -24,24 +24,28 @@ test_tool_node() ->
     ?assertEqual([], maps:get(<<"pending_tools">>, Result2)).
 
 test_agent_node_instructions_and_callbacks() ->
+    persistent_term:put({adk_unloaded_callback, observer}, self()),
     NodeFn = adk_graph_node:agent_node(<<"graph_agent">>, #{
         provider => adk_llm_probe,
         instructions => <<"GRAPH INSTRUCTION">>,
         test_pid => self(),
-        callback_pid => self(),
         callbacks => [adk_unloaded_callback]
     }, []),
-    Result = NodeFn(#{<<"events">> =>
-                          [adk_event:new(<<"user">>, <<"hello">>)]}),
-    ?assertEqual(<<"graph_agent">>, maps:get(<<"last_agent">>, Result)),
-    receive
-        {probe_generate, History, []} ->
-            ?assert(lists:any(
-                      fun(#{role := system,
-                            content := <<"GRAPH INSTRUCTION">>}) -> true;
-                         (_) -> false
-                      end, History))
-    after 1000 -> ?assert(false)
-    end,
-    receive before_model -> ok after 1000 -> ?assert(false) end,
-    receive after_model -> ok after 1000 -> ?assert(false) end.
+    try
+        Result = NodeFn(#{<<"events">> =>
+                              [adk_event:new(<<"user">>, <<"hello">>)]}),
+        ?assertEqual(<<"graph_agent">>, maps:get(<<"last_agent">>, Result)),
+        receive
+            {probe_generate, History, []} ->
+                ?assert(lists:any(
+                          fun(#{role := system,
+                                content := <<"GRAPH INSTRUCTION">>}) -> true;
+                             (_) -> false
+                          end, History))
+        after 1000 -> ?assert(false)
+        end,
+        receive before_model -> ok after 1000 -> ?assert(false) end,
+        receive after_model -> ok after 1000 -> ?assert(false) end
+    after
+        persistent_term:erase({adk_unloaded_callback, observer})
+    end.

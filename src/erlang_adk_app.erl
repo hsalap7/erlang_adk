@@ -10,39 +10,67 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    %% Preserve the application's existing Mnesia backend bootstrap. The ETS
-    %% backend is now initialized by its supervised owner below, but Mnesia is
-    %% an independent session backend and still needs its tables at app start.
-    erlang_adk_session_mnesia:init(),
-    case erlang_adk_sup:start_link() of
-        {ok, SupPid} ->
-            maybe_start_a2a_listener(),
-            {ok, SupPid};
-        Error ->
-            Error
+    case configure_oidcc() of
+        ok -> start_after_oidcc();
+        {error, _} = Error -> Error
     end.
 
 stop(_State) ->
-    _ = catch cowboy:stop_listener(erlang_adk_a2a_http),
     ok.
 
 %% internal functions
 
-maybe_start_a2a_listener() ->
-    case application:get_env(erlang_adk, a2a_enabled, true) of
-        false -> ok;
-        true ->
-            Port = application:get_env(erlang_adk, a2a_port, 8080),
-            Dispatch = cowboy_router:compile([
-                {'_', [{"/a2a/prompt", erlang_adk_a2a_handler, []}]}
-            ]),
-            case cowboy:start_clear(erlang_adk_a2a_http,
-                                    [{port, Port}],
-                                    #{env => #{dispatch => Dispatch}}) of
-                {ok, _} -> ok;
-                {error, {already_started, _}} -> ok;
-                {error, Reason} ->
-                    logger:warning("A2A listener disabled: ~p", [Reason]),
-                    ok
-            end
+start_after_oidcc() ->
+    case init_configured_session_backend() of
+        ok -> erlang_adk_sup:start_link();
+        {error, _} = Error -> Error
+    end.
+
+%% Oidcc performs its standard JWT time checks before adk_jwt_policy applies
+%% the issuer-specific policy. Configure the dependency to accept the widest
+%% skew this library permits; adk_jwt_policy then independently enforces the
+%% narrower value selected for each issuer.
+configure_oidcc() ->
+    case application:get_env(
+           erlang_adk, oidc_max_clock_skew_seconds, 300) of
+        Seconds when is_integer(Seconds), Seconds >= 0, Seconds =< 300 ->
+            application:set_env(oidcc, max_clock_skew, Seconds);
+        Invalid ->
+            {error, {invalid_oidc_max_clock_skew_seconds, Invalid}}
+    end.
+
+init_configured_session_backend() ->
+    case application:get_env(erlang_adk, session_backend, undefined) of
+        undefined -> ok;
+        erlang_adk_session -> ok;
+        Backend when is_atom(Backend) -> init_session_backend(Backend);
+        Invalid -> {error, {invalid_session_backend, Invalid}}
+    end.
+
+init_session_backend(Backend) ->
+    case code:ensure_loaded(Backend) of
+        {module, Backend} ->
+            case erlang:function_exported(Backend, init, 0) of
+                false -> ok;
+                true -> call_session_backend_init(Backend)
+            end;
+        {error, Reason} ->
+            {error, adk_failure:external(
+                      application, session_backend_load, Reason)}
+    end.
+
+call_session_backend_init(Backend) ->
+    try Backend:init() of
+        ok -> ok;
+        {atomic, ok} -> ok;
+        {error, Reason} ->
+            {error, adk_failure:external(
+                      application, session_backend_init, Reason)};
+        Other ->
+            {error, adk_failure:external(
+                      application, session_backend_init_result, Other)}
+    catch
+        Class:Reason:_Stacktrace ->
+            {error, adk_failure:exception(
+                      application, session_backend_init, Class, Reason)}
     end.

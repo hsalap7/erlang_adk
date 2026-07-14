@@ -21,7 +21,8 @@ session_service_test_() ->
      [
       fun test_create_get_delete/0,
       fun test_scoped_state/0,
-      fun test_add_event/0
+      fun test_add_event/0,
+      fun test_compare_and_append_event/0
      ]}.
 
 test_create_get_delete() ->
@@ -61,3 +62,28 @@ test_add_event() ->
     ?assertEqual(1, length(Events)),
     [E1] = Events,
     ?assertEqual(<<"Hello">>, E1#adk_event.content).
+
+test_compare_and_append_event() ->
+    SessionId = <<"compare-and-append">>,
+    Key = <<"continuation">>,
+    Expected = #{<<"revision">> => 1},
+    {ok, _} = erlang_adk_session:create_session(
+                ?APP, ?USER,
+                #{session_id => SessionId,
+                  state => #{Key => Expected}}),
+    Event = adk_event:new(
+              <<"tool">>, <<"progress">>,
+              #{actions =>
+                    #{<<"state_delta">> => #{<<"progress">> => 50}}}),
+    ok = erlang_adk_session:add_event_if_state(
+           ?APP, ?USER, SessionId, Key, Expected, Event),
+    ?assertEqual(
+       {error, conflict},
+       erlang_adk_session:add_event_if_state(
+         ?APP, ?USER, SessionId, Key,
+         #{<<"revision">> => 2}, Event)),
+    {ok, Session} = erlang_adk_session:get_session(
+                      ?APP, ?USER, SessionId),
+    ?assertEqual(Expected, maps:get(Key, maps:get(state, Session))),
+    ?assertEqual(50, maps:get(<<"progress">>, maps:get(state, Session))),
+    ?assertEqual([Event], maps:get(events, Session)).

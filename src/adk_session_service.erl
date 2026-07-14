@@ -20,3 +20,14 @@
     ok | {error, not_found}.
 -callback take_state(AppName :: binary(), UserId :: binary(), SessionId :: binary(), Key :: term()) ->
     {ok, term()} | {error, not_found}.
+
+%% Optional atomic compare-and-append used by durable external tool progress.
+%% Backends which do not implement it remain valid session services; callers
+%% must fail explicitly instead of falling back to a racy read/append pair.
+-callback add_event_if_state(AppName :: binary(), UserId :: binary(),
+                             SessionId :: binary(), Key :: term(),
+                             Expected :: term(),
+                             Event :: adk_event:event()) ->
+    ok | {error, not_found | conflict | term()}.
+
+-optional_callbacks([add_event_if_state/6]).
