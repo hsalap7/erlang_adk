@@ -25,7 +25,8 @@ if config_env() != :test do
   scopes =
     System.get_env(
       "OIDC_SCOPES",
-      "openid adk.agents.read adk.run.start adk.run.read adk.run.control"
+      "openid adk.agents.read adk.run.start adk.run.read adk.run.control " <>
+        "adk.live.read adk.live.control adk.observability.read adk.evaluation.read"
     )
     |> String.split(" ", trim: true)
 

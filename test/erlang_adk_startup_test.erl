@@ -16,6 +16,7 @@
          dev_session_service, dev_runner_options, dev_run_options,
          dev_max_body_bytes, dev_max_field_bytes, dev_sse_heartbeat_ms,
          dev_sse_max_events, dev_sse_max_bytes, dev_sse_max_duration_ms,
+         dev_max_session_results, dev_live_principal, dev_live_credit,
          dev_resource_provider, dev_max_resource_results,
          dev_diagnostic_timeout_ms, dev_diagnostic_context_policy,
          a2a_port, a2a_ip, a2a_max_body_bytes,
@@ -235,7 +236,8 @@ supervised_dev_listener_is_authenticated() ->
     Keys = [a2a_enabled, a2a_v1_enabled, dev_enabled,
             dev_auth_token, dev_resource_provider,
             dev_max_resource_results, dev_diagnostic_timeout_ms,
-            dev_diagnostic_context_policy, a2a_port, a2a_ip],
+            dev_diagnostic_context_policy, dev_live_principal,
+            dev_live_credit, a2a_port, a2a_ip],
     SavedEnv = save_env(erlang_adk, Keys),
     Port = free_port(),
     App = <<"startup-dev-app">>,
@@ -260,6 +262,10 @@ supervised_dev_listener_is_authenticated() ->
           erlang_adk, dev_resource_provider,
           {adk_dev_v05_resource_provider, ProviderConfig}),
         application:set_env(erlang_adk, dev_max_resource_results, 1),
+        application:set_env(erlang_adk, dev_live_principal,
+                            <<"startup-live-principal">>),
+        application:set_env(erlang_adk, dev_live_credit,
+                            #{messages => 3, bytes => 1048576}),
         application:set_env(erlang_adk, dev_diagnostic_timeout_ms, 2000),
         application:set_env(
           erlang_adk, dev_diagnostic_context_policy,
@@ -304,7 +310,16 @@ supervised_dev_listener_is_authenticated() ->
             httpc:request(
               get, {ArtifactUrl ++ "?limit=2",
                     [{"authorization", Authorization}]}, [],
-              [{body_format, binary}])
+              [{body_format, binary}]),
+
+        LiveUrl = "http://127.0.0.1:" ++ integer_to_list(Port) ++
+                  "/dev/v1/live/sessions",
+        {ok, {{_HttpVersion5, 200, _Reason5}, _Headers5, LiveBody}} =
+            httpc:request(
+              get, {LiveUrl, [{"authorization", Authorization}]}, [],
+              [{body_format, binary}]),
+        LivePayload = jsx:decode(LiveBody, [return_maps]),
+        ?assert(is_list(maps:get(<<"sessions">>, LivePayload)))
     after
         _ = catch erlang_adk_session:delete_session(App, User, Session),
         _ = adk_artifact_ets:stop(ArtifactPid),

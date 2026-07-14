@@ -15,8 +15,11 @@ cli_test_() ->
       fun deterministic_run_case/0,
       fun deterministic_console_case/0,
       fun deterministic_evaluation_case/0,
+      fun versioned_evaluation_case/0,
       fun option_and_url_validation_case/0,
       fun developer_connection_failure_is_structured_case/0,
+      fun oversized_chunked_developer_success_is_bounded_case/0,
+      fun oversized_chunked_developer_error_is_bounded_case/0,
       fun successful_developer_commands_case/0]}.
 
 setup() ->
@@ -231,6 +234,119 @@ deterministic_evaluation_case() ->
         _ = file:delete(DatasetPath)
     end.
 
+versioned_evaluation_case() ->
+    AgentPath = temp_path("eval-v2-agent"),
+    SetPath = temp_path("eval-v2-set"),
+    CriteriaPath = temp_path("eval-v2-criteria"),
+    BaselinePath = temp_path("eval-v2-baseline"),
+    MarkdownPath = temp_path("eval-v2-report"),
+    Name = unique_binary(<<"CliEvalV2Agent">>),
+    AgentConfig = #{<<"name">> => Name,
+                    <<"provider">> => <<"adk_llm_probe">>,
+                    <<"response">> => <<"ERLANG">>},
+    PassingSet = versioned_eval_set(<<"ERLANG">>),
+    FailingSet = versioned_eval_set(<<"NOT ERLANG">>),
+    Criteria = [#{<<"id">> => <<"response">>,
+                  <<"criterion">> => <<"exact_response">>,
+                  <<"threshold">> => 1.0,
+                  <<"config">> =>
+                      #{<<"normalization">> => <<"exact">>}}],
+    BaseArgs = ["eval", "run", "--config", AgentPath,
+                "--eval-set", SetPath,
+                "--criteria", CriteriaPath,
+                "--samples", "2",
+                "--concurrency", "2",
+                "--sample-concurrency", "2",
+                "--timeout", "5000",
+                "--case-timeout", "2000"],
+    try
+        ok = file:write_file(AgentPath, jsx:encode(AgentConfig)),
+        ok = file:write_file(SetPath, jsx:encode(PassingSet)),
+        ok = file:write_file(CriteriaPath, jsx:encode(Criteria)),
+
+        {ok, Passing} = adk_cli:command(BaseArgs),
+        ?assertEqual(eval_run, maps:get(command, Passing)),
+        ?assertEqual(stdout, maps:get(delivery, Passing)),
+        ?assertEqual(0, maps:get(ci_exit_code, Passing)),
+        ?assertEqual(true, maps:get(passed, Passing)),
+        PassingReport = maps:get(evaluation, Passing),
+        ?assertEqual(2, maps:get(<<"result_schema_version">>,
+                                PassingReport)),
+        ?assertEqual(2, maps:get(<<"sample_count">>, PassingReport)),
+        ?assertMatch(#{<<"result_schema_version">> := 2},
+                     jsx:decode(maps:get(report, Passing),
+                                [return_maps])),
+
+        ok = file:write_file(
+               BaselinePath, jsx:encode(PassingReport)),
+        {ok, Markdown} = adk_cli:command(
+                           BaseArgs ++
+                           ["--format", "markdown",
+                            "--output", MarkdownPath]),
+        ?assertEqual(file, maps:get(delivery, Markdown)),
+        {ok, MarkdownBytes} = file:read_file(MarkdownPath),
+        ?assertEqual(maps:get(report, Markdown), MarkdownBytes),
+        ?assertNotEqual(
+           nomatch, binary:match(MarkdownBytes,
+                                 <<"# Evaluation report">>)),
+
+        ok = file:write_file(SetPath, jsx:encode(FailingSet)),
+        {ok, Failing} = adk_cli:command(BaseArgs),
+        ?assertEqual(2, maps:get(ci_exit_code, Failing)),
+        ?assertEqual(false, maps:get(passed, Failing)),
+
+        {ok, Regression} = adk_cli:command(
+                             BaseArgs ++
+                             ["--baseline", BaselinePath]),
+        ?assertEqual(2, maps:get(ci_exit_code, Regression)),
+        ?assertEqual(false, maps:get(passed, Regression)),
+        DecodedComparison =
+            jsx:decode(maps:get(report, Regression), [return_maps]),
+        ?assertMatch(
+           #{<<"report_type">> := <<"baseline_comparison">>,
+             <<"passed">> := false},
+           DecodedComparison),
+        ?assertEqual(maps:get(comparison, Regression),
+                     DecodedComparison),
+        ?assertMatch({ok, baseline_comparison, _},
+                     adk_eval_dev_view:classify(DecodedComparison)),
+        ?assertEqual(false,
+                     maps:is_key(<<"evaluation_passed">>,
+                                 DecodedComparison)),
+
+        %% A candidate may fail its absolute threshold while showing no
+        %% regression against an equally failing baseline. Keep the comparison
+        %% canonical while the command-level CI gate remains failed.
+        FailingReport = maps:get(evaluation, Failing),
+        ok = file:write_file(BaselinePath, jsx:encode(FailingReport)),
+        {ok, AbsoluteFailureOnly} =
+            adk_cli:command(BaseArgs ++ ["--baseline", BaselinePath]),
+        ?assertEqual(false, maps:get(passed, AbsoluteFailureOnly)),
+        ?assertEqual(2, maps:get(ci_exit_code, AbsoluteFailureOnly)),
+        PassingComparison = maps:get(comparison, AbsoluteFailureOnly),
+        ?assertEqual(true, maps:get(<<"passed">>, PassingComparison)),
+        ?assertEqual(PassingComparison,
+                     jsx:decode(maps:get(report, AbsoluteFailureOnly),
+                                [return_maps]))
+    after
+        _ = file:delete(AgentPath),
+        _ = file:delete(SetPath),
+        _ = file:delete(CriteriaPath),
+        _ = file:delete(BaselinePath),
+        _ = file:delete(MarkdownPath)
+    end.
+
+versioned_eval_set(Expected) ->
+    #{<<"schema_version">> => 2,
+      <<"id">> => <<"cli-versioned">>,
+      <<"version">> => <<"1">>,
+      <<"cases">> =>
+          [#{<<"id">> => <<"language">>,
+             <<"turns">> =>
+                 [#{<<"id">> => <<"turn-1">>,
+                    <<"input">> => <<"language">>,
+                    <<"expected_response">> => Expected}]}]}.
+
 option_and_url_validation_case() ->
     ?assertEqual(
        {error, developer_server_must_bind_loopback},
@@ -259,6 +375,30 @@ developer_connection_failure_is_structured_case() ->
            adk_cli:command(["inspect", "agents", "--url", Base]))
     after
         restore_env("ERLANG_ADK_DEV_TOKEN", OldToken)
+    end.
+
+oversized_chunked_developer_success_is_bounded_case() ->
+    assert_oversized_chunked_developer_response(
+      200, {error, invalid_developer_api_response}).
+
+oversized_chunked_developer_error_is_bounded_case() ->
+    assert_oversized_chunked_developer_response(
+      429,
+      {error, {developer_api_http_error, 429,
+               <<"developer_api_request_failed">>}}).
+
+assert_oversized_chunked_developer_response(Status, Expected) ->
+    {Listener, Server, Monitor, Base} =
+        start_oversized_chunked_server(Status),
+    OldToken = os:getenv("ERLANG_ADK_DEV_TOKEN"),
+    try
+        true = os:putenv("ERLANG_ADK_DEV_TOKEN", ?CLI_DEV_TOKEN),
+        ?assertEqual(
+           Expected,
+           adk_cli:command(["inspect", "agents", "--url", Base]))
+    after
+        restore_env("ERLANG_ADK_DEV_TOKEN", OldToken),
+        stop_raw_http_server(Listener, Server, Monitor)
     end.
 
 successful_developer_commands_case() ->
@@ -517,6 +657,85 @@ free_port() ->
     {ok, {{127, 0, 0, 1}, Port}} = inet:sockname(Socket),
     ok = gen_tcp:close(Socket),
     Port.
+
+start_oversized_chunked_server(Status) ->
+    {ok, Listener} = gen_tcp:listen(
+                       0, [binary, {packet, raw}, {active, false},
+                           {reuseaddr, true}, {ip, {127, 0, 0, 1}}]),
+    {ok, {{127, 0, 0, 1}, Port}} = inet:sockname(Listener),
+    {Server, Monitor} = spawn_monitor(
+                          fun() ->
+                              oversized_chunked_server(Listener, Status)
+                          end),
+    Base = "http://127.0.0.1:" ++ integer_to_list(Port),
+    {Listener, Server, Monitor, Base}.
+
+oversized_chunked_server(Listener, Status) ->
+    try gen_tcp:accept(Listener, 2000) of
+        {ok, Socket} ->
+            try
+                {ok, _Request} = receive_http_headers(Socket, <<>>),
+                send_oversized_chunked_response(Socket, Status)
+            catch
+                _:_ -> ok
+            after
+                _ = catch gen_tcp:close(Socket)
+            end;
+        {error, _} -> ok
+    catch
+        _:_ -> ok
+    end.
+
+receive_http_headers(_Socket, Acc) when byte_size(Acc) > 16384 ->
+    {error, request_headers_too_large};
+receive_http_headers(Socket, Acc) ->
+    case binary:match(Acc, <<"\r\n\r\n">>) of
+        nomatch ->
+            case gen_tcp:recv(Socket, 0, 2000) of
+                {ok, Chunk} ->
+                    receive_http_headers(
+                      Socket, <<Acc/binary, Chunk/binary>>);
+                {error, _} = Error -> Error
+            end;
+        _ -> {ok, Acc}
+    end.
+
+send_oversized_chunked_response(Socket, Status) ->
+    Phrase = case Status of
+        200 -> <<"OK">>;
+        429 -> <<"Too Many Requests">>
+    end,
+    ok = gen_tcp:send(
+           Socket,
+           [<<"HTTP/1.1 ">>, integer_to_binary(Status), <<" ">>, Phrase,
+            <<"\r\ncontent-type: application/json"
+              "\r\ntransfer-encoding: chunked"
+              "\r\nconnection: close\r\n\r\n">>]),
+    Chunk = binary:copy(<<"x">>, 65536),
+    ChunkFrame = [integer_to_binary(byte_size(Chunk), 16), <<"\r\n">>,
+                  Chunk, <<"\r\n">>],
+    send_chunk_frames(Socket, ChunkFrame, 18).
+
+send_chunk_frames(Socket, _ChunkFrame, 0) ->
+    _ = gen_tcp:send(Socket, <<"0\r\n\r\n">>),
+    ok;
+send_chunk_frames(Socket, ChunkFrame, Remaining) ->
+    case gen_tcp:send(Socket, ChunkFrame) of
+        ok -> send_chunk_frames(Socket, ChunkFrame, Remaining - 1);
+        {error, _} -> ok
+    end.
+
+stop_raw_http_server(Listener, Server, Monitor) ->
+    _ = catch gen_tcp:close(Listener),
+    receive
+        {'DOWN', Monitor, process, Server, _Reason} -> ok
+    after 2000 ->
+        exit(Server, kill),
+        receive
+            {'DOWN', Monitor, process, Server, _Reason} -> ok
+        after 1000 -> ok
+        end
+    end.
 
 temp_path(Prefix) ->
     filename:join(

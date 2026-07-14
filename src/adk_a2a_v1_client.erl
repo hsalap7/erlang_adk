@@ -415,7 +415,14 @@ await_resolver(Pid, Monitor, ReplyAlias, Ref, Deadline) ->
             {error, a2a_timeout};
         {'DOWN', Monitor, process, Pid, _OpaqueReason} ->
             _ = erlang:unalias(ReplyAlias),
-            {error, a2a_dns_resolution_failed}
+            %% The owner watchdog uses this same absolute deadline. If it
+            %% wins the scheduler race and kills the resolver just as the
+            %% receive timeout becomes eligible, preserve deadline semantics
+            %% rather than misclassifying that kill as a DNS failure.
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> {error, a2a_timeout};
+                false -> {error, a2a_dns_resolution_failed}
+            end
     after remaining_deadline(Deadline) ->
         stop_isolated_worker(Pid, Monitor, ReplyAlias),
         {error, a2a_timeout}

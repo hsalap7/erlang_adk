@@ -76,4 +76,5 @@ invocation_context(Opts) ->
     maps:with(
       [state, app_name, user_id, session_id, invocation_id,
        state_ref, artifact_service, artifact_scope, memory_service,
-       '$adk_agent_path', '$adk_inherited_global_instruction'], Opts).
+       '$adk_agent_path', '$adk_inherited_global_instruction',
+       '$adk_plugin_runtime'], Opts).

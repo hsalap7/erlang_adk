@@ -873,36 +873,45 @@ merge_cache_usage(Existing, New) when is_map(Existing), is_map(New) ->
 merge_cache_usage(_, _) -> {error, invalid_gemini_cache_usage_metadata}.
 
 finalize_provider_metadata(Outcome, GroundingMetadata,
-                           CacheContext, CacheUsage) ->
-    case context_cache_metadata(CacheContext, CacheUsage) of
-        {ok, undefined} ->
-            finalize_grounding_only(Outcome, GroundingMetadata);
+                           CacheContext, ResponseMetadata) ->
+    case context_cache_metadata(CacheContext, ResponseMetadata) of
         {ok, CacheMetadata} ->
-            case GroundingMetadata of
-                undefined ->
-                    new_cache_provider_result(Outcome, CacheMetadata);
+            Metadata0 = optional_metadata(ResponseMetadata),
+            Metadata1 = case GroundingMetadata of
+                undefined -> Metadata0;
                 Grounding when is_map(Grounding) ->
+                    maps:merge(Grounding, Metadata0)
+            end,
+            Metadata = case {GroundingMetadata, CacheMetadata} of
+                {_, undefined} -> Metadata1;
+                {undefined, Cache} -> maps:merge(Metadata1, Cache);
+                {_, Cache} -> Metadata1#{<<"context_cache">> => Cache}
+            end,
+            case map_size(Metadata) of
+                0 -> outcome_result(Outcome);
+                _ ->
+                    Type = provider_metadata_type(
+                             GroundingMetadata, CacheMetadata),
                     case adk_provider_result:new(
-                           <<"gemini">>, <<"google_search_grounding">>,
-                           Outcome,
-                           Grounding#{<<"context_cache">> =>
-                                         CacheMetadata}) of
+                           <<"gemini">>, Type, Outcome, Metadata) of
                         {ok, ProviderResult} -> ProviderResult;
                         {error, Reason} ->
-                            {error, {invalid_grounding_metadata, Reason}}
+                            {error, {invalid_gemini_response_metadata,
+                                     Reason}}
                     end
             end;
         {error, _} = Error -> Error
     end.
 
-finalize_grounding_only(Outcome, undefined) -> outcome_result(Outcome);
-finalize_grounding_only(Outcome, GroundingMetadata) ->
-    case adk_provider_result:new(
-           <<"gemini">>, <<"google_search_grounding">>,
-           Outcome, GroundingMetadata) of
-        {ok, ProviderResult} -> ProviderResult;
-        {error, Reason} -> {error, {invalid_grounding_metadata, Reason}}
-    end.
+optional_metadata(undefined) -> #{};
+optional_metadata(Metadata) when is_map(Metadata) -> Metadata.
+
+provider_metadata_type(Grounding, _Cache) when is_map(Grounding) ->
+    <<"google_search_grounding">>;
+provider_metadata_type(_Grounding, Cache) when is_map(Cache) ->
+    <<"context_cache_usage">>;
+provider_metadata_type(_Grounding, _Cache) ->
+    <<"generation_metadata">>.
 
 new_cache_provider_result(Outcome, CacheMetadata) ->
     case adk_provider_result:new(
@@ -921,35 +930,40 @@ context_cache_metadata(#{status := bypass,
                          public_metadata := Public}, _Usage) ->
     {ok, #{<<"lifecycle">> => Public}};
 context_cache_metadata(#{status := active,
-                         public_metadata := Public}, Usage)
-  when is_map(Usage) ->
-    {ok, #{<<"lifecycle">> => Public,
-           <<"usage_metadata">> => Usage}};
+                         public_metadata := Public}, ResponseMetadata)
+  when is_map(ResponseMetadata) ->
+    Usage = maps:get(<<"usage_metadata">>, ResponseMetadata, #{}),
+    case maps:is_key(<<"cachedContentTokenCount">>, Usage) of
+        true ->
+            {ok, #{<<"lifecycle">> => Public,
+                   <<"usage_metadata">> => Usage}};
+        false -> {error, missing_gemini_cached_token_usage}
+    end;
 context_cache_metadata(#{status := active}, undefined) ->
     {error, missing_gemini_cached_token_usage};
 context_cache_metadata(_, _) ->
     {error, invalid_gemini_context_cache_metadata}.
 
 response_cache_usage(Response) when is_map(Response) ->
+    case normalize_response_usage(Response) of
+        {ok, Usage} -> response_metadata(Response, Usage);
+        {error, _} = Error -> Error
+    end;
+response_cache_usage(_) -> {error, invalid_gemini_cache_usage_metadata}.
+
+normalize_response_usage(Response) ->
     case maps:find(<<"usageMetadata">>, Response) of
         error -> {ok, undefined};
         {ok, Usage} when is_map(Usage) -> normalize_cache_usage(Usage);
         {ok, _} -> {error, invalid_gemini_cache_usage_metadata}
-    end;
-response_cache_usage(_) -> {error, invalid_gemini_cache_usage_metadata}.
+    end.
 
 normalize_cache_usage(Usage) ->
-    case maps:find(<<"cachedContentTokenCount">>, Usage) of
-        error -> {ok, undefined};
-        {ok, Cached} when is_integer(Cached), Cached >= 0 ->
-            normalize_cache_usage_fields(
-              Usage,
-              [<<"cachedContentTokenCount">>, <<"promptTokenCount">>,
-               <<"candidatesTokenCount">>, <<"totalTokenCount">>,
-               <<"thoughtsTokenCount">>,
-               <<"toolUsePromptTokenCount">>], #{});
-        {ok, _} -> {error, invalid_gemini_cache_usage_metadata}
-    end.
+    normalize_cache_usage_fields(
+      Usage,
+      [<<"cachedContentTokenCount">>, <<"promptTokenCount">>,
+       <<"candidatesTokenCount">>, <<"totalTokenCount">>,
+       <<"thoughtsTokenCount">>, <<"toolUsePromptTokenCount">>], #{}).
 
 normalize_cache_usage_fields(_Usage, [], Acc) -> {ok, Acc};
 normalize_cache_usage_fields(Usage, [Key | Rest], Acc) ->
@@ -959,6 +973,62 @@ normalize_cache_usage_fields(Usage, [Key | Rest], Acc) ->
             normalize_cache_usage_fields(Usage, Rest, Acc#{Key => Value});
         {ok, _} -> {error, invalid_gemini_cache_usage_metadata}
     end.
+
+response_metadata(Response, Usage) ->
+    case {response_optional_binary(Response, <<"modelVersion">>),
+          response_optional_binary(Response, <<"responseId">>),
+          response_finish_reasons(Response)} of
+        {{ok, Model}, {ok, ResponseId}, {ok, FinishReasons}} ->
+            Metadata0 = #{},
+            Metadata1 = maybe_put_binary(
+                          <<"model_version">>, Model, Metadata0),
+            Metadata2 = maybe_put_binary(
+                          <<"response_id">>, ResponseId, Metadata1),
+            Metadata3 = case Usage of
+                undefined -> Metadata2;
+                UsageMap -> Metadata2#{<<"usage_metadata">> => UsageMap}
+            end,
+            Metadata = case FinishReasons of
+                [] -> Metadata3;
+                _ -> Metadata3#{<<"finish_reasons">> => FinishReasons}
+            end,
+            case map_size(Metadata) of
+                0 -> {ok, undefined};
+                _ -> {ok, Metadata}
+            end;
+        {{error, _} = Error, _, _} -> Error;
+        {_, {error, _} = Error, _} -> Error;
+        {_, _, {error, _} = Error} -> Error
+    end.
+
+response_optional_binary(Response, Key) ->
+    case maps:find(Key, Response) of
+        error -> {ok, undefined};
+        {ok, Value} when is_binary(Value), byte_size(Value) > 0,
+                         byte_size(Value) =< 256 -> {ok, Value};
+        {ok, _} -> {error, invalid_gemini_response_metadata}
+    end.
+
+response_finish_reasons(Response) ->
+    Candidates = maps:get(<<"candidates">>, Response, []),
+    case is_list(Candidates) of
+        true -> response_finish_reasons(Candidates, []);
+        false -> {error, invalid_gemini_response_metadata}
+    end.
+
+response_finish_reasons([], Acc) -> {ok, lists:reverse(Acc)};
+response_finish_reasons([Candidate | Rest], Acc) when is_map(Candidate) ->
+    case maps:find(<<"finishReason">>, Candidate) of
+        error -> response_finish_reasons(Rest, Acc);
+        {ok, Value} when is_binary(Value), byte_size(Value) > 0,
+                         byte_size(Value) =< 64 ->
+            response_finish_reasons(Rest, [Value | Acc]);
+        {ok, _} -> {error, invalid_gemini_response_metadata}
+    end;
+response_finish_reasons(_, _) -> {error, invalid_gemini_response_metadata}.
+
+maybe_put_binary(_Key, undefined, Map) -> Map;
+maybe_put_binary(Key, Value, Map) -> Map#{Key => Value}.
 
 merge_grounding_metadata(Existing, undefined) ->
     {ok, Existing};
@@ -1095,12 +1165,45 @@ decode_response(Body, Limits, CacheContext) ->
                   response_cache_usage(ResponseMap)} of
                 {{error, _} = Error, _} -> Error;
                 {_, {error, _} = Error} -> Error;
-                {Result, {ok, CacheUsage}} ->
-                    add_context_cache_to_result(
-                      Result, CacheContext, CacheUsage)
+                {Result, {ok, ResponseMetadata}} ->
+                    case add_response_metadata_to_result(
+                           Result, ResponseMetadata) of
+                        {error, _} = Error -> Error;
+                        EnrichedResult ->
+                            add_context_cache_to_result(
+                              EnrichedResult, CacheContext,
+                              ResponseMetadata)
+                    end
             end
     catch
         error:Reason -> {error, {invalid_json, Reason}}
+    end.
+
+add_response_metadata_to_result(Result, undefined) -> Result;
+add_response_metadata_to_result({provider_result, _} = Result,
+                                ResponseMetadata) ->
+    case adk_provider_result:decode(Result) of
+        {ok, Outcome, ProviderMetadata} ->
+            Existing = maps:get(<<"metadata">>, ProviderMetadata),
+            case adk_provider_result:new(
+                   maps:get(<<"provider">>, ProviderMetadata),
+                   maps:get(<<"type">>, ProviderMetadata), Outcome,
+                   maps:merge(Existing, ResponseMetadata)) of
+                {ok, ProviderResult} -> ProviderResult;
+                {error, Reason} ->
+                    {error, {invalid_gemini_response_metadata, Reason}}
+            end;
+        {error, _} = Error -> Error;
+        not_provider_result -> {error, invalid_provider_result}
+    end;
+add_response_metadata_to_result(Result, ResponseMetadata)
+  when is_map(ResponseMetadata) ->
+    case adk_provider_result:new(
+           <<"gemini">>, <<"generation_metadata">>,
+           model_result_outcome(Result), ResponseMetadata) of
+        {ok, ProviderResult} -> ProviderResult;
+        {error, Reason} ->
+            {error, {invalid_gemini_response_metadata, Reason}}
     end.
 
 add_context_cache_to_result(Result, disabled, _CacheUsage) -> Result;
@@ -1110,11 +1213,21 @@ add_context_cache_to_result({provider_result, _} = Result,
           context_cache_metadata(CacheContext, CacheUsage)} of
         {{ok, Outcome, ProviderMetadata}, {ok, CacheMetadata}} ->
             Existing = maps:get(<<"metadata">>, ProviderMetadata),
+            ExistingType = maps:get(<<"type">>, ProviderMetadata),
+            Type = case ExistingType of
+                <<"generation_metadata">> -> <<"context_cache_usage">>;
+                _ -> ExistingType
+            end,
+            CombinedMetadata = case ExistingType of
+                <<"generation_metadata">> ->
+                    maps:merge(Existing, CacheMetadata);
+                _ -> Existing#{<<"context_cache">> => CacheMetadata}
+            end,
             case adk_provider_result:new(
                    maps:get(<<"provider">>, ProviderMetadata),
-                   maps:get(<<"type">>, ProviderMetadata),
+                   Type,
                    Outcome,
-                   Existing#{<<"context_cache">> => CacheMetadata}) of
+                   CombinedMetadata) of
                 {ok, ProviderResult} -> ProviderResult;
                 {error, Reason} ->
                     {error, {invalid_gemini_cache_usage_metadata, Reason}}

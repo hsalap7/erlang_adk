@@ -13,6 +13,10 @@ defmodule ErlangAdkUiWeb.Layouts do
         <div>
           <h1>Erlang ADK</h1>
           <span class="muted">Production LiveView companion</span>
+          <nav class="nav" aria-label="ADK console">
+            <a href={~p"/agent"}>Agent runs</a>
+            <a href={~p"/live"}>Live and operations</a>
+          </nav>
         </div>
         <form action={~p"/auth/logout"} method="post">
           <input type="hidden" name="_csrf_token" value={get_csrf_token()} />

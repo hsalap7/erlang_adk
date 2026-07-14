@@ -73,6 +73,10 @@ plugin_value(on_model_error, Value) ->
     adk_failure:callback_value(plugin, on_model_error, Value);
 plugin_value(on_tool_error, Value) ->
     adk_failure:callback_value(plugin, on_tool_error, Value);
+plugin_value(on_agent_error, Value) ->
+    adk_failure:callback_value(plugin, on_agent_error, Value);
+plugin_value(on_run_error, Value) ->
+    adk_failure:callback_value(plugin, on_run_error, Value);
 plugin_value(on_error, Value) ->
     adk_failure:callback_value(plugin, on_error, Value);
 plugin_value(before_tool, Value) -> prune(Value);

@@ -614,13 +614,22 @@ test_stream_metadata_frame(#{config := Config}) ->
     StreamConfig = Config#{model => <<"stream-metadata-model">>},
     Ref = make_ref(),
     Caller = self(),
-    ?assertEqual(
-       ok,
-       adk_llm_gemini:stream(
-         StreamConfig, [#{role => user, content => <<"Count frames">>}], [],
-         fun(Delta) -> Caller ! {Ref, Delta} end)),
+    {provider_result, _} = Result = adk_llm_gemini:stream(
+                                      StreamConfig,
+                                      [#{role => user,
+                                         content => <<"Count frames">>}], [],
+                                      fun(Delta) ->
+                                          Caller ! {Ref, Delta}
+                                      end),
     receive {Ref, <<"only content">>} -> ok after 2000 -> ?assert(false) end,
-    receive {Ref, _Phantom} -> ?assert(false) after 0 -> ok end.
+    receive {Ref, _Phantom} -> ?assert(false) after 0 -> ok end,
+    {ok, streamed, ProviderMetadata} = adk_provider_result:decode(Result),
+    ?assertEqual(<<"generation_metadata">>,
+                 maps:get(<<"type">>, ProviderMetadata)),
+    Metadata = maps:get(<<"metadata">>, ProviderMetadata),
+    ?assertEqual(1,
+                 maps:get(<<"promptTokenCount">>,
+                          maps:get(<<"usage_metadata">>, Metadata))).
 
 test_stream_grounding(#{config := Config}) ->
     StreamConfig = Config#{model => <<"stream-grounding-model">>,

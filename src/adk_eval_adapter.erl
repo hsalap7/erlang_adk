@@ -17,3 +17,16 @@
 -callback run_turn(Target :: term(), Turn :: map(), State :: term(),
                    Context :: map(), Config :: map()) ->
     {ok, turn_result()} | {error, term()}.
+
+%% A v2 adapter may allocate a fresh target/session for every case and sample.
+%% The callbacks are optional so existing v1 adapters remain source compatible.
+-callback init_case(Target :: term(), Case :: map(), Context :: map(),
+                    Config :: map()) ->
+    {ok, CaseTarget :: term(), InitialState :: term()}
+    | {ok, InitialState :: term()}
+    | {error, term()}.
+
+-callback terminate_case(CaseTarget :: term(), FinalState :: term(),
+                         Config :: map()) -> ok | {error, term()}.
+
+-optional_callbacks([init_case/4, terminate_case/3]).

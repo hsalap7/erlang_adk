@@ -585,10 +585,14 @@ start_run_lifecycle(Runner, UserId, SessionId, InvId,
             before_run_lifecycle(
               Runner, UserId, SessionId, InvId,
               Message, Caller, Runtime);
-        {intervened, Message} ->
+        {amended, Message} ->
             before_run_lifecycle(
               Runner, UserId, SessionId, InvId,
               Message, Caller, Runtime);
+        {returned, Content} ->
+            finish_early_run(
+              Runner, UserId, SessionId, InvId,
+              Content, Caller, Runtime);
         {halt, Content} ->
             finish_early_run(
               Runner, UserId, SessionId, InvId,
@@ -604,7 +608,11 @@ before_run_lifecycle(Runner, UserId, SessionId, InvId,
             begin_run_execution(
               Runner, UserId, SessionId, InvId,
               EffectiveMessage, Caller, Runtime);
-        {intervened, Content} ->
+        {amended, EffectiveMessage} ->
+            begin_run_execution(
+              Runner, UserId, SessionId, InvId,
+              EffectiveMessage, Caller, Runtime);
+        {returned, Content} ->
             finish_early_run(
               Runner, UserId, SessionId, InvId,
               Content, Caller, Runtime);
@@ -673,7 +681,24 @@ start_agent_lifecycle(Runner, UserId, SessionId, InvId,
                     run_loop(Runner, UserId, SessionId, InvId, Caller,
                              Runtime, 0, 0)
             end;
-        {intervened, Value} ->
+        {amended, EffectiveMessage} ->
+            adk_callbacks:execute(
+              Handlers, on_agent_start, [AgentNameBin, EffectiveMessage]),
+            case adk_callbacks:run(
+                   Handlers, before_agent, [AgentName, EffectiveMessage]) of
+                {halt, Value} ->
+                    finish_agent_short_circuit(
+                      Runner, UserId, SessionId, InvId,
+                      AgentNameBin, Value, Caller, Runtime);
+                {replace, Value} ->
+                    finish_agent_short_circuit(
+                      Runner, UserId, SessionId, InvId,
+                      AgentNameBin, Value, Caller, Runtime);
+                _ ->
+                    run_loop(Runner, UserId, SessionId, InvId, Caller,
+                             Runtime, 0, 0)
+            end;
+        {returned, Value} ->
             finish_agent_short_circuit(
               Runner, UserId, SessionId, InvId,
               AgentNameBin, Value, Caller, Runtime);
@@ -804,11 +829,12 @@ run_global_plugin(Runtime, Hook, Value, ExtraContext) ->
         disabled -> {continue, Value, []};
         Pipeline ->
             case adk_plugin_pipeline:run(Pipeline, Hook, Context, Value) of
-                {ok, NewValue, Trace} ->
-                    case plugin_replaced(Trace) of
-                        true -> {intervened, NewValue, Trace};
-                        false -> {continue, NewValue, Trace}
-                    end;
+                {continue, NewValue, Trace} ->
+                    {continue, NewValue, Trace};
+                {amend, NewValue, Trace} ->
+                    {amended, NewValue, Trace};
+                {return, NewValue, Trace} ->
+                    {returned, NewValue, Trace};
                 {halt, NewValue, Trace} -> {halt, NewValue, Trace};
                 {error, PipelineReason, Trace} ->
                     {error, PipelineReason, Trace}
@@ -823,13 +849,9 @@ run_global_plugin(Runtime, Hook, Value, ExtraContext) ->
             {error, {observability_failed, ObservationReason}}
     end.
 
-plugin_replaced(Trace) ->
-    lists:any(
-      fun(Entry) -> maps:get(<<"outcome">>, Entry, <<>>) =:= <<"replaced">> end,
-      Trace).
-
 strip_plugin_trace({continue, Value, _Trace}) -> {continue, Value};
-strip_plugin_trace({intervened, Value, _Trace}) -> {intervened, Value};
+strip_plugin_trace({amended, Value, _Trace}) -> {amended, Value};
+strip_plugin_trace({returned, Value, _Trace}) -> {returned, Value};
 strip_plugin_trace({halt, Value, _Trace}) -> {halt, Value};
 strip_plugin_trace({error, Reason, _Trace}) -> {error, Reason}.
 
@@ -857,10 +879,8 @@ emit_lifecycle(Runtime, Hook, Duration, Value, ExtraContext, Outcome) ->
             case adk_observability:emit(
                    EventName, #{duration_ms => Duration}, Child, EmitOpts) of
                 {ok, Envelope} ->
-                    case adk_observability:export(
-                           Envelope, maps:get(exporters, Config)) of
-                        {ok, _Statuses} -> ok;
-                        {error, Reason, _Statuses} -> {error, Reason};
+                    case adk_observability:deliver(Envelope, Config) of
+                        {ok, _DeliveryStatus} -> ok;
                         {error, Reason} -> {error, Reason}
                     end;
                 {error, Reason} -> {error, Reason}
@@ -869,7 +889,8 @@ emit_lifecycle(Runtime, Hook, Duration, Value, ExtraContext, Outcome) ->
     end.
 
 plugin_outcome_tag({continue, _, _}) -> <<"continue">>;
-plugin_outcome_tag({intervened, _, _}) -> <<"intervened">>;
+plugin_outcome_tag({amended, _, _}) -> <<"amended">>;
+plugin_outcome_tag({returned, _, _}) -> <<"returned">>;
 plugin_outcome_tag({halt, _, _}) -> <<"halt">>;
 plugin_outcome_tag({error, _, _}) -> <<"error">>.
 
@@ -887,7 +908,10 @@ publish_event(Runner, UserId, SessionId, Event0, Caller, Runtime)
         {continue, Candidate} ->
             persist_published_event(
               Runner, UserId, SessionId, Event0, Candidate, Caller);
-        {intervened, Candidate} ->
+        {amended, Candidate} ->
+            persist_published_event(
+              Runner, UserId, SessionId, Event0, Candidate, Caller);
+        {returned, Candidate} ->
             persist_published_event(
               Runner, UserId, SessionId, Event0, Candidate, Caller);
         {halt, Candidate} ->
@@ -1800,7 +1824,8 @@ run_agent_model(Runner, UserId, SessionId, History, InvId, Context,
         '$adk_observability' => #{
             config => maps:get(observability, Runtime, disabled),
             context => maps:get(observation_context, Runtime, undefined)
-        }
+        },
+        '$adk_plugin_runtime' => plugin_runtime_capsule(Runtime, Context)
     },
     case Runner#runner.streaming_mode of
         none ->
@@ -1830,7 +1855,7 @@ finish_final(Runner, UserId, SessionId, FinalEvent0, Caller, Runtime) ->
     case apply_global_after_agent(
            Runtime, Handlers, AgentName, Content0) of
         {ok, Content1, ExecuteAgentEnd} ->
-            finish_after_run(
+            persist_final_event(
               Runner, UserId, SessionId, FinalEvent0,
               Content1, Caller, Runtime, ExecuteAgentEnd);
         {error, Reason} ->
@@ -1848,28 +1873,18 @@ apply_global_after_agent(Runtime, Handlers, AgentName, Content0) ->
                 _ -> PluginContent
             end,
             {ok, Content, true};
-        {intervened, Content} -> {ok, Content, false};
+        {amended, PluginContent} ->
+            Content = case adk_callbacks:run(
+                             Handlers, after_agent,
+                             [AgentName, PluginContent]) of
+                {replace, Replacement} -> Replacement;
+                {halt, Replacement} -> Replacement;
+                _ -> PluginContent
+            end,
+            {ok, Content, true};
+        {returned, Content} -> {ok, Content, false};
         {halt, Content} -> {ok, Content, false};
         {error, Reason} -> {error, Reason}
-    end.
-
-finish_after_run(Runner, UserId, SessionId, FinalEvent0,
-                 Content0, Caller, Runtime, ExecuteAgentEnd) ->
-    case run_global_plugin(Runtime, after_run, Content0) of
-        {continue, Content} ->
-            persist_final_event(
-              Runner, UserId, SessionId, FinalEvent0,
-              Content, Caller, Runtime, ExecuteAgentEnd);
-        {intervened, Content} ->
-            persist_final_event(
-              Runner, UserId, SessionId, FinalEvent0,
-              Content, Caller, Runtime, ExecuteAgentEnd);
-        {halt, Content} ->
-            persist_final_event(
-              Runner, UserId, SessionId, FinalEvent0,
-              Content, Caller, Runtime, ExecuteAgentEnd);
-        {error, Reason} ->
-            finish_error(Runner, UserId, SessionId, Reason, Caller, Runtime)
     end.
 
 persist_final_event(Runner, UserId, SessionId, FinalEvent0,
@@ -1897,6 +1912,7 @@ persist_final_event(Runner, UserId, SessionId, FinalEvent0,
                                 ok ->
                                     safe_clear_temp_state(
                                       Runner, UserId, SessionId),
+                                    run_after_run_teardown(Runtime, Content),
                                     Caller ! {adk_done, self()},
                                     ok;
                                 {error, IngestionReason} ->
@@ -1933,9 +1949,21 @@ finish_early_run(Runner, UserId, SessionId, InvId,
     FinalEvent = adk_event:new(
                    maps:get(name_binary, Runtime), Content,
                    #{invocation_id => InvId, is_final => true}),
-    finish_after_run(
+    persist_final_event(
       Runner, UserId, SessionId, FinalEvent,
       Content, Caller, Runtime, false).
+
+run_after_run_teardown(Runtime, Content) ->
+    %% after_run is a success-only teardown notification. The final event and
+    %% any configured memory ingestion have already committed, so a plugin can
+    %% neither rewrite the result nor turn a completed run into an error.
+    case run_global_plugin(Runtime, after_run, Content) of
+        {error, Reason} ->
+            logger:warning("after_run plugin notification failed: ~p",
+                           [adk_secret_redactor:redact(Reason)]),
+            ok;
+        _ -> ok
+    end.
 
 finalize_runner_output(Agent, FinalEvent0, Content0, Runtime) ->
     Config = maps:get(config, Runtime, #{}),
@@ -1962,34 +1990,15 @@ finalize_runner_output(Agent, FinalEvent0, Content0, Runtime) ->
     end.
 
 finish_error(Runner, UserId, SessionId, Reason, Caller, Runtime) ->
-    {EffectiveReason, RunLocalError} =
-        case run_global_plugin(Runtime, on_error, Reason) of
-            {continue, PluginReason} -> {PluginReason, true};
-            {intervened, PluginReason} -> {PluginReason, false};
-            {halt, PluginReason} -> {PluginReason, false};
-            {error, PluginFailure} -> {PluginFailure, false}
-        end,
-    case RunLocalError of
-        true ->
-            adk_callbacks:execute(
-              runtime_handlers(Runtime), on_error, [EffectiveReason]);
-        false -> ok
-    end,
-    FinalReason = apply_error_after_run(Runtime, EffectiveReason),
+    %% Error hooks are best-effort notifications. They may record or emit
+    %% diagnostics but must never recover, replace, or mask the original run
+    %% failure.
+    _ = run_global_plugin(Runtime, on_run_error, Reason),
+    adk_callbacks:execute(
+      runtime_handlers(Runtime), on_error, [Reason]),
     safe_clear_temp_state(Runner, UserId, SessionId),
-    Caller ! {adk_error, self(), FinalReason},
+    Caller ! {adk_error, self(), Reason},
     ok.
-
-apply_error_after_run(Runtime, Reason) ->
-    case run_global_plugin(Runtime, after_run, {error, Reason}) of
-        {continue, {error, NewReason}} -> NewReason;
-        {intervened, {error, NewReason}} -> NewReason;
-        {halt, {error, NewReason}} -> NewReason;
-        {continue, NewReason} -> NewReason;
-        {intervened, NewReason} -> NewReason;
-        {halt, NewReason} -> NewReason;
-        {error, PluginFailure} -> PluginFailure
-    end.
 
 %% @private Execute tools in model order. Serial is the compatibility default.
 %% Parallel mode groups only consecutive calls which explicitly opt in as
@@ -2343,17 +2352,33 @@ prepare_parallel_descriptor(Descriptor, Runtime) ->
     NameBin = maps:get(name, Descriptor),
     ArgsMap = maps:get(args, Descriptor),
     Context = maps:get(context, Descriptor),
-    Base = descriptor_executor_base(Descriptor),
-    ExecutorCall = case begin_tool_callbacks(
+    {EffectiveDescriptor, ExecutorCall} = case begin_tool_callbacks(
                           NameBin, ArgsMap, Context, Runtime) of
         execute ->
-            descriptor_execution_call(Descriptor, Base, Runtime);
+            Base = descriptor_executor_base(Descriptor),
+            {Descriptor,
+             descriptor_execution_call(Descriptor, Base, Runtime)};
+        {execute, EffectiveArgs} ->
+            AmendedDescriptor = Descriptor#{args => EffectiveArgs},
+            Base = descriptor_executor_base(AmendedDescriptor),
+            {AmendedDescriptor,
+             descriptor_execution_call(
+               AmendedDescriptor, Base, Runtime)};
         {ready, RawResult} ->
-            Base#{execute => fun() -> RawResult end,
-                  parallel_safe => true,
-                  pause_capable => false}
+            Base = descriptor_executor_base(Descriptor),
+            {Descriptor,
+             Base#{execute => fun() -> RawResult end,
+                   parallel_safe => true,
+                   pause_capable => false}};
+        {ready, RawResult, EffectiveArgs} ->
+            AmendedDescriptor = Descriptor#{args => EffectiveArgs},
+            Base = descriptor_executor_base(AmendedDescriptor),
+            {AmendedDescriptor,
+             Base#{execute => fun() -> RawResult end,
+                   parallel_safe => true,
+                   pause_capable => false}}
     end,
-    {Descriptor, ExecutorCall}.
+    {EffectiveDescriptor, ExecutorCall}.
 
 descriptor_executor_base(Descriptor) ->
     #{name => maps:get(name, Descriptor),
@@ -2362,23 +2387,52 @@ descriptor_executor_base(Descriptor) ->
       thought_signature => maps:get(thought_signature, Descriptor),
       call_id => maps:get(call_id, Descriptor)}.
 
-descriptor_execution_call(#{kind := tool, module := Mod}, Base, _Runtime) ->
-    Base#{module => Mod};
+descriptor_execution_call(#{kind := tool, module := Mod}, Base, Runtime) ->
+    instrument_executor_call(
+      execute_tool, Base#{module => Mod}, Runtime);
 descriptor_execution_call(
-  #{kind := resolved_tool, resolved_call := ResolvedCall}, Base, _Runtime) ->
-    maps:merge(ResolvedCall, Base);
+  #{kind := resolved_tool, resolved_call := ResolvedCall}, Base, Runtime) ->
+    instrument_executor_call(
+      execute_tool, maps:merge(ResolvedCall, Base), Runtime);
 descriptor_execution_call(
   #{kind := sub_agent, name := NameBin, args := ArgsMap,
     sub_agents := SubAgents}, Base, Runtime) ->
     Context = maps:get(context, Base),
-    Config = maps:get(config, Runtime, #{}),
-    Base#{execute =>
-              fun() ->
-                  execute_sub_agent(
-                    NameBin, ArgsMap, SubAgents, Context, Config)
-              end,
-          parallel_safe => true,
-          pause_capable => false}.
+    instrument_executor_call(
+      invoke_agent,
+      Base#{execute =>
+                fun() ->
+                    execute_sub_agent(
+                      NameBin, ArgsMap, SubAgents, Context, Runtime)
+                end,
+            parallel_safe => true,
+            pause_capable => false},
+      Runtime).
+
+instrument_executor_call(Operation, ExecutorCall, Runtime) ->
+    Name = maps:get(name, ExecutorCall),
+    Context = maps:get(context, ExecutorCall, #{}),
+    ParallelSafe = adk_tool_executor:is_parallel_safe(ExecutorCall),
+    PauseCapable = adk_tool_executor:is_pause_capable(ExecutorCall),
+    Uninstrumented = ExecutorCall,
+    WithoutExecutor = maps:remove(
+                        module, maps:remove(execute, ExecutorCall)),
+    WithoutExecutor#{parallel_safe => ParallelSafe,
+      pause_capable => PauseCapable,
+      execute =>
+          fun() ->
+              observe_runner_operation(
+                Operation, internal,
+                tool_observation_details(Name, Context), Runtime,
+                fun() -> invoke_uninstrumented_call(Uninstrumented) end)
+          end}.
+
+invoke_uninstrumented_call(#{execute := Execute})
+  when is_function(Execute, 0) ->
+    Execute();
+invoke_uninstrumented_call(#{module := Module, args := Args,
+                             context := Context}) ->
+    Module:execute(Args, Context).
 
 commit_parallel_results(_Runner, _UserId, _SessionId, _InvId, _Caller,
                         [], [], _Runtime) ->
@@ -2438,65 +2492,139 @@ executor_outcome_to_raw({paused, Reason, Summary}) ->
     {adk_pause, Reason, Summary}.
 
 execute_tool_with_callbacks(Mod, NameBin, ArgsMap, Context, Runtime) ->
-    RawResult = case begin_tool_callbacks(
+    {EffectiveArgs, RawResult} = case begin_tool_callbacks(
                        NameBin, ArgsMap, Context, Runtime) of
         {ready, Replacement} ->
-            Replacement;
+            {ArgsMap, Replacement};
+        {ready, Replacement, AmendedArgs} ->
+            {AmendedArgs, Replacement};
+        {execute, AmendedArgs} ->
+            {AmendedArgs,
+             invoke_runner_tool(
+               Mod, NameBin, AmendedArgs, Context, Runtime)};
         execute ->
-            invoke_runner_tool(Mod, NameBin, ArgsMap, Context)
+            {ArgsMap,
+             invoke_runner_tool(Mod, NameBin, ArgsMap, Context, Runtime)}
     end,
     finish_tool_callbacks(
-      NameBin, ArgsMap, Context, RawResult, Runtime).
+      NameBin, EffectiveArgs, Context, RawResult, Runtime).
 
 execute_resolved_tool_with_callbacks(ResolvedCall, NameBin, ArgsMap,
                                      Context, Runtime) ->
-    RawResult = case begin_tool_callbacks(
+    {EffectiveArgs, RawResult} = case begin_tool_callbacks(
                        NameBin, ArgsMap, Context, Runtime) of
         {ready, Replacement} ->
-            Replacement;
+            {ArgsMap, Replacement};
+        {ready, Replacement, AmendedArgs} ->
+            {AmendedArgs, Replacement};
+        {execute, AmendedArgs} ->
+            {AmendedArgs,
+             invoke_runner_resolved_tool(
+               ResolvedCall, NameBin, AmendedArgs, Context, Runtime)};
         execute ->
-            invoke_runner_resolved_tool(
-              ResolvedCall, NameBin, ArgsMap, Context)
+            {ArgsMap,
+             invoke_runner_resolved_tool(
+               ResolvedCall, NameBin, ArgsMap, Context, Runtime)}
     end,
     finish_tool_callbacks(
-      NameBin, ArgsMap, Context, RawResult, Runtime).
+      NameBin, EffectiveArgs, Context, RawResult, Runtime).
 
 execute_failed_tool_with_callbacks(Reason, NameBin, ArgsMap, Context,
                                    Runtime) ->
-    RawResult = case begin_tool_callbacks(
+    {EffectiveArgs, RawResult} = case begin_tool_callbacks(
                        NameBin, ArgsMap, Context, Runtime) of
-        {ready, Replacement} -> Replacement;
-        execute -> {error, Reason}
+        {ready, Replacement} -> {ArgsMap, Replacement};
+        {ready, Replacement, AmendedArgs} ->
+            {AmendedArgs, Replacement};
+        {execute, AmendedArgs} ->
+            {AmendedArgs, {error, Reason}};
+        execute -> {ArgsMap, {error, Reason}}
     end,
     finish_tool_callbacks(
-      NameBin, ArgsMap, Context, RawResult, Runtime).
+      NameBin, EffectiveArgs, Context, RawResult, Runtime).
 
-invoke_runner_tool(Mod, _NameBin, ArgsMap, Context) ->
-    try Mod:execute(ArgsMap, Context) of
-        ToolResult -> ToolResult
+invoke_runner_tool(Mod, NameBin, ArgsMap, Context, Runtime) ->
+    observe_runner_operation(
+      execute_tool, internal, tool_observation_details(NameBin, Context),
+      Runtime,
+      fun() ->
+          try Mod:execute(ArgsMap, Context) of
+              ToolResult -> ToolResult
+          catch
+              throw:{adk_pause, _, _} = Pause -> Pause;
+              Class:ToolError:_Stack ->
+                  Failure = adk_failure:exception(
+                              runner_tool, execute, Class, ToolError),
+                  logger:error("Runner tool failed: ~p", [Failure]),
+                  {error, Failure}
+          end
+      end).
+
+invoke_runner_resolved_tool(ResolvedCall, NameBin, ArgsMap, Context,
+                            Runtime) ->
+    observe_runner_operation(
+      execute_tool, internal, tool_observation_details(NameBin, Context),
+      Runtime,
+      fun() ->
+          Base = #{name => NameBin, args => ArgsMap, context => Context},
+          ExecutorCall = maps:merge(ResolvedCall, Base),
+          case adk_tool_executor:execute(
+                 [ExecutorCall], #{mode => serial, timeout => infinity}) of
+              {ok, [#{outcome := {ok, Result}}]} -> {ok, Result};
+              {ok, [#{outcome := {error, Reason}}]} -> {error, Reason};
+              {ok, [#{outcome := {paused, Reason, Summary}}]} ->
+                  {adk_pause, Reason, Summary};
+              {ok, Other} ->
+                  {error, adk_failure:external(
+                            runner_tool, invalid_executor_result, Other)};
+              {error, Reason} -> {error, Reason}
+          end
+      end).
+
+tool_observation_details(NameBin, Context) ->
+    #{tool => NameBin,
+      call_id => maps:get(call_id, Context, undefined)}.
+
+observe_runner_operation(Operation, Kind, Details, Runtime, Execute) ->
+    Delivery = maps:get(observability, Runtime, disabled),
+    Parent = maps:get(observation_context, Runtime, undefined),
+    case {Delivery, Parent} of
+        {DeliveryConfig, ParentContext}
+          when is_map(DeliveryConfig), is_map(ParentContext) ->
+            case adk_observability:start_span(
+                   Operation, Kind, ParentContext, Details,
+                   DeliveryConfig) of
+                {ok, Span} ->
+                    execute_observed_runner_operation(
+                      Span, Details, Execute);
+                {error, Reason} ->
+                    {error, {observability_failed, Reason}}
+            end;
+        _ -> Execute()
+    end.
+
+execute_observed_runner_operation(Span, Details, Execute) ->
+    try Execute() of
+        Result ->
+            case adk_observability:finish_span(
+                   Span, runner_operation_status(Result), Details) of
+                {ok, _Signal} -> Result;
+                {error, Reason} ->
+                    ok = adk_observability:report_delivery_failure(
+                           finish_span, Reason, Span),
+                    Result
+            end
     catch
-        throw:{adk_pause, _, _} = Pause -> Pause;
-        Class:ToolError:_Stack ->
-            Failure = adk_failure:exception(
-                        runner_tool, execute, Class, ToolError),
-            logger:error("Runner tool failed: ~p", [Failure]),
-            {error, Failure}
+        Class:Reason:Stack ->
+            _ = adk_observability:finish_span(
+                  Span, {error, exception},
+                  Details#{error_type => atom_to_binary(Class, utf8)}),
+            erlang:raise(Class, Reason, Stack)
     end.
 
-invoke_runner_resolved_tool(ResolvedCall, NameBin, ArgsMap, Context) ->
-    Base = #{name => NameBin, args => ArgsMap, context => Context},
-    ExecutorCall = maps:merge(ResolvedCall, Base),
-    case adk_tool_executor:execute(
-           [ExecutorCall], #{mode => serial, timeout => infinity}) of
-        {ok, [#{outcome := {ok, Result}}]} -> {ok, Result};
-        {ok, [#{outcome := {error, Reason}}]} -> {error, Reason};
-        {ok, [#{outcome := {paused, Reason, Summary}}]} ->
-            {adk_pause, Reason, Summary};
-        {ok, Other} ->
-            {error, adk_failure:external(
-                      runner_tool, invalid_executor_result, Other)};
-        {error, Reason} -> {error, Reason}
-    end.
+runner_operation_status({error, timeout}) -> {error, timeout};
+runner_operation_status({error, _}) -> {error, tool_error};
+runner_operation_status(_) -> ok.
 
 begin_tool_callbacks(NameBin, ArgsMap, Context, Runtime) ->
     Handlers = runtime_handlers(Runtime),
@@ -2514,10 +2642,129 @@ begin_tool_callbacks(NameBin, ArgsMap, Context, Runtime) ->
                 {replace, Replacement} -> {ready, {ok, Replacement}};
                 _ -> execute
             end;
-        {intervened, Replacement} -> {ready, {ok, Replacement}};
+        {amended, Amendment} ->
+            case validate_tool_amendment(
+                   NameBin, ArgsMap, Context, HookValue,
+                   Amendment, Runtime) of
+                {ok, EffectiveArgs} ->
+                    adk_callbacks:execute(
+                      Handlers, on_tool_start,
+                      [NameBin, EffectiveArgs]),
+                    case adk_callbacks:run(
+                           Handlers, before_tool,
+                           [NameBin, EffectiveArgs, Context]) of
+                        {halt, Replacement} ->
+                            {ready, {ok, Replacement}, EffectiveArgs};
+                        {replace, Replacement} ->
+                            {ready, {ok, Replacement}, EffectiveArgs};
+                        _ -> {execute, EffectiveArgs}
+                    end;
+                {error, Reason} -> {ready, {error, Reason}}
+            end;
+        {returned, Replacement} -> {ready, {ok, Replacement}};
         {halt, Replacement} -> {ready, {ok, Replacement}};
         {error, Reason} -> {ready, {error, Reason}}
     end.
+
+validate_tool_amendment(Name, _Args, Context, Original,
+                        Amendment, Runtime) when is_map(Amendment) ->
+    case {map_size(maps:without([name, args, context], Amendment)),
+          maps:get(name, Amendment, undefined),
+          maps:get(args, Amendment, undefined),
+          maps:get(context, Amendment, undefined)} of
+        {0, Name, EffectiveArgs, PublicContext}
+          when is_map(EffectiveArgs) ->
+            case PublicContext =:= maps:get(context, Original, undefined) of
+                false ->
+                    {error, {invalid_plugin_amendment, before_tool,
+                             context_change_not_allowed}};
+                true ->
+                    validate_amended_tool_args(
+                      Name, EffectiveArgs, Context, Runtime)
+            end;
+        {0, _OtherName, _EffectiveArgs, _PublicContext} ->
+            {error, {invalid_plugin_amendment, before_tool,
+                     tool_reroute_not_allowed}};
+        _ ->
+            {error, {invalid_plugin_amendment, before_tool,
+                     invalid_tool_request}}
+    end;
+validate_tool_amendment(_Name, _Args, _Context, _Original,
+                        _Amendment, _Runtime) ->
+    {error, {invalid_plugin_amendment, before_tool, expected_map}}.
+
+validate_amended_tool_args(Name, Args, Context, Runtime) ->
+    case validate_amended_tool_schema(Name, Args, Runtime) of
+        {ok, _Kind} ->
+            case apply_amended_tool_policy(Name, Args, Runtime) of
+                allow ->
+                    case amended_tool_confirmation(Name, Args, Context,
+                                                    Runtime) of
+                        none -> {ok, Args};
+                        required ->
+                            {error,
+                             {invalid_plugin_amendment, before_tool,
+                              confirmation_required}}
+                    end;
+                deny ->
+                    {error, {invalid_plugin_amendment, before_tool,
+                             runtime_policy_denied}}
+            end;
+        {error, Reason} ->
+            {error, {invalid_plugin_amendment, before_tool, Reason}}
+    end.
+
+validate_amended_tool_schema(Name, Args, Runtime) ->
+    case adk_toolset:preflight(maps:get(tools, Runtime, []), Name, Args) of
+        {ok, {module_target, _Module}} -> {ok, module};
+        {ok, _DynamicTarget} ->
+            %% A dynamic target may change executor, credentials, policy and
+            %% confirmation metadata while materializing. The original
+            %% resolved call cannot safely execute amended arguments.
+            {error, amendment_not_revalidatable};
+        {error, not_found} ->
+            case maps:find(Name, maps:get(sub_agents, Runtime, #{})) of
+                {ok, SubSpec} ->
+                    Description = case SubSpec of
+                        #{description := Desc} -> Desc;
+                        _ -> <<"Delegate a task to this specialist agent.">>
+                    end,
+                    Schema = adk_agent_tool:schema(
+                               #{name => Name,
+                                 description => Description}),
+                    case adk_toolset:validate_arguments(Schema, Args) of
+                        {ok, _} -> {ok, sub_agent};
+                        {error, _} -> {error, invalid_tool_arguments}
+                    end;
+                error -> {error, tool_not_found}
+            end;
+        {error, _} -> {error, invalid_tool_arguments}
+    end.
+
+apply_amended_tool_policy(_Name, _Args,
+                          #{runtime_policy := disabled}) -> allow;
+apply_amended_tool_policy(Name, Args, Runtime) ->
+    case adk_runtime_policy:check_tool(
+           maps:get(runtime_policy, Runtime), Name, Args) of
+        {allow, _} -> allow;
+        {deny, _} -> deny
+    end.
+
+amended_tool_confirmation(Name, Args, Context, Runtime) ->
+    case adk_toolset:preflight(maps:get(tools, Runtime, []), Name, Args) of
+        {ok, {module_target, Module}} ->
+            confirmation_tag(
+              adk_tool_confirmation:module_requirement(
+                Module, Args, Context));
+        _ -> none
+    end.
+
+confirmation_tag({ok, Requirement}) ->
+    case adk_tool_confirmation:is_required(Requirement) of
+        true -> required;
+        false -> none
+    end;
+confirmation_tag({error, _}) -> required.
 
 finish_tool_callbacks(NameBin, ArgsMap, Context, RawResult, Runtime) ->
     case RawResult of
@@ -2556,7 +2803,16 @@ apply_after_tool(Runtime, Handlers, NameBin, ArgsMap,
                 _ -> PluginResult
             end,
             {ok, FinalResult, true};
-        {intervened, Replacement} -> {ok, {ok, Replacement}, false};
+        {amended, PluginResult} ->
+            FinalResult = case adk_callbacks:run(
+                                 Handlers, after_tool,
+                                 [NameBin, ArgsMap, Context, PluginResult]) of
+                {replace, Replacement} -> {ok, Replacement};
+                {halt, Replacement} -> {ok, Replacement};
+                _ -> PluginResult
+            end,
+            {ok, FinalResult, true};
+        {returned, Replacement} -> {ok, {ok, Replacement}, false};
         {halt, Replacement} -> {ok, {ok, Replacement}, false};
         {error, Reason} -> {error, Reason}
     end.
@@ -2571,7 +2827,8 @@ apply_tool_error_plugin_value(Runtime, NameBin, Context, Error) ->
     Extra = plugin_extra_tool(NameBin, maps:get(call_id, Context, undefined)),
     case run_global_plugin(Runtime, on_tool_error, Error, Extra) of
         {continue, OriginalError} -> OriginalError;
-        {intervened, Replacement} -> {ok, Replacement};
+        {amended, AmendedError} -> AmendedError;
+        {returned, Replacement} -> {ok, Replacement};
         {halt, Replacement} -> {ok, Replacement};
         {error, PluginReason} -> {error, PluginReason}
     end.
@@ -2602,19 +2859,25 @@ normalize_tool_execution(Other) ->
 
 execute_sub_agent_with_callbacks(NameBin, ArgsMap, Context,
                                  SubAgents, Runtime) ->
-    RawResult = case begin_tool_callbacks(
+    {EffectiveArgs, RawResult} = case begin_tool_callbacks(
                        NameBin, ArgsMap, Context, Runtime) of
         {ready, Replacement} ->
-            Replacement;
+            {ArgsMap, Replacement};
+        {ready, Replacement, AmendedArgs} ->
+            {AmendedArgs, Replacement};
+        {execute, AmendedArgs} ->
+            {AmendedArgs,
+             execute_sub_agent(
+               NameBin, AmendedArgs, SubAgents, Context, Runtime)};
         execute ->
-            execute_sub_agent(
-              NameBin, ArgsMap, SubAgents, Context,
-              maps:get(config, Runtime, #{}))
+            {ArgsMap,
+             execute_sub_agent(
+               NameBin, ArgsMap, SubAgents, Context, Runtime)}
     end,
     finish_tool_callbacks(
-      NameBin, ArgsMap, Context, RawResult, Runtime).
+      NameBin, EffectiveArgs, Context, RawResult, Runtime).
 
-execute_sub_agent(NameBin, ArgsMap, SubAgents, Context, Config) ->
+execute_sub_agent(NameBin, ArgsMap, SubAgents, Context, Runtime) ->
     case maps:find(NameBin, SubAgents) of
         {ok, SubSpec} ->
             SubPrompt = maps:get(<<"prompt">>, ArgsMap, <<>>),
@@ -2622,7 +2885,9 @@ execute_sub_agent(NameBin, ArgsMap, SubAgents, Context, Config) ->
                 {ok, SubPid} ->
                     case safe_sub_agent_prompt(
                            SubPid, SubPrompt,
-                           delegation_context(Config, Context)) of
+                           delegation_context(
+                             maps:get(config, Runtime, #{}),
+                             Context, Runtime)) of
                         {ok, SubResult} -> {ok, SubResult};
                         {error, Reason} ->
                             {error, Reason}
@@ -2679,7 +2944,7 @@ safe_sub_agent_prompt(SubPid, Prompt, Context) ->
                       sub_agent, prompt, Class, Reason)}
     end.
 
-delegation_context(Config, Context) ->
+delegation_context(Config, Context, Runtime) ->
     Base0 = maps:with(
               [state, app_name, user_id, session_id, invocation_id,
                state_ref, artifact_service, artifact_scope,
@@ -2691,10 +2956,20 @@ delegation_context(Config, Context) ->
     Source = maps:get(
                '$adk_inherited_global_instruction', Config,
                maps:get(global_instruction, Config, <<>>)),
+    WithPlugin = Base#{'$adk_plugin_runtime' =>
+                           plugin_runtime_capsule(Runtime, Context)},
     case Source of
-        undefined -> Base;
-        _ -> Base#{'$adk_inherited_global_instruction' => Source}
+        undefined -> WithPlugin;
+        _ -> WithPlugin#{'$adk_inherited_global_instruction' => Source}
     end.
+
+plugin_runtime_capsule(Runtime, Context) ->
+    #{pipeline => maps:get(plugin_pipeline, Runtime, disabled),
+      plugin_context => maps:get(plugin_context, Runtime, #{}),
+      observability => #{
+          config => maps:get(observability, Runtime, disabled),
+          context => maps:get(observation_context, Runtime, undefined)},
+      request_budget => maps:get('$adk_request_budget', Context, disabled)}.
 
 delegation_state(#{state_ref := Store, app_name := App,
                    user_id := User, session_id := Session})
@@ -3659,19 +3934,28 @@ validate_plugin_pipeline(Plugins, Defaults) ->
 
 validate_observability(disabled) -> disabled;
 validate_observability(Config) when is_map(Config) ->
-    Unknown = maps:without([exporters, capture_content, attributes], Config),
+    Unknown = maps:without(
+                [exporters, capture_content, attributes, delivery, bus,
+                 failure_policy], Config),
     Exporters = maps:get(exporters, Config, []),
     CaptureContent = maps:get(capture_content, Config, false),
     Attributes = maps:get(attributes, Config, #{}),
+    Delivery = maps:get(delivery, Config, sync),
+    Bus = maps:get(bus, Config, adk_observability_bus),
+    FailurePolicy = maps:get(failure_policy, Config, open),
     case map_size(Unknown) =:= 0 andalso is_boolean(CaptureContent)
          andalso is_map(Attributes) of
         true ->
-            case {adk_observability:validate_exporters(Exporters),
+            case {validate_observability_delivery(
+                    Delivery, Bus, FailurePolicy, Exporters),
                   adk_context_guard:sanitize_value(Attributes)} of
                 {ok, {ok, SafeAttributes}} when is_map(SafeAttributes) ->
                     #{exporters => Exporters,
                       capture_content => CaptureContent,
-                      attributes => SafeAttributes};
+                      attributes => SafeAttributes,
+                      delivery => Delivery,
+                      bus => Bus,
+                      failure_policy => FailurePolicy};
                 {{error, Reason}, _} ->
                     erlang:error({invalid_runner_observability, Reason});
                 {_, _} ->
@@ -3681,6 +3965,20 @@ validate_observability(Config) when is_map(Config) ->
     end;
 validate_observability(Config) ->
     erlang:error({invalid_runner_observability, Config}).
+
+validate_observability_delivery(sync, _Bus, _FailurePolicy, Exporters) ->
+    adk_observability:validate_exporters(Exporters);
+validate_observability_delivery(async, Bus, FailurePolicy, []) ->
+    case valid_server_ref(Bus) andalso
+         (FailurePolicy =:= open orelse FailurePolicy =:= closed) of
+        true -> ok;
+        false -> {error, invalid_async_observability_delivery}
+    end;
+validate_observability_delivery(async, _Bus, _FailurePolicy, _Exporters) ->
+    {error, async_observability_exporters_belong_to_bus};
+validate_observability_delivery(_Delivery, _Bus, _FailurePolicy,
+                                _Exporters) ->
+    {error, invalid_observability_delivery}.
 
 valid_utf8(Value) ->
     case unicode:characters_to_binary(Value, utf8, utf8) of

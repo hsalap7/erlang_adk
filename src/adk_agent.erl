@@ -637,15 +637,8 @@ execute_prompt_like(Kind, Message, InvocationContext, State) ->
                       #{agent => State#state.name}),
     StartTime = erlang:monotonic_time(millisecond),
     Memory1 = adk_memory:add_message(State#state.memory, user, Message),
-    RunResult = case prepare_agent_turn(
-                       State, Message, Memory1, InvocationContext) of
-        {ok, EffectiveConfig, PreparedMemory, PreparedContext} ->
-            run_agent_invocation(
-              State, Message, PreparedMemory, EffectiveConfig,
-              PreparedContext);
-        {error, PrepareReason} ->
-            {error, PrepareReason, Memory1}
-    end,
+    RunResult = run_direct_invocation_with_plugins(
+                  State, Message, Memory1, InvocationContext),
     {Reply, Memory2} = case RunResult of
         {ok, Response, UpdatedMemory} ->
             {{ok, Response}, UpdatedMemory};
@@ -666,15 +659,8 @@ execute_invocation_prompt(Message, InvocationContext, State) ->
     FreshMemory = ensure_system_instruction(
                     adk_memory:new(), State#state.llm_config),
     Memory1 = adk_memory:add_message(FreshMemory, user, Message),
-    RunResult = case prepare_agent_turn(
-                       State, Message, Memory1, InvocationContext) of
-        {ok, EffectiveConfig, PreparedMemory, PreparedContext} ->
-            run_agent_invocation(
-              State, Message, PreparedMemory, EffectiveConfig,
-              PreparedContext);
-        {error, PrepareReason} ->
-            {error, PrepareReason, Memory1}
-    end,
+    RunResult = run_direct_invocation_with_plugins(
+                  State, Message, Memory1, InvocationContext),
     {Reply, Memory2} = case RunResult of
         {ok, Response, UpdatedMemory} ->
             {{ok, Response}, UpdatedMemory};
@@ -686,6 +672,68 @@ execute_invocation_prompt(Message, InvocationContext, State) ->
                       #{duration => Duration},
                       #{agent => State#state.name}),
     {Reply, Memory2}.
+
+run_direct_invocation_with_plugins(State, Message, Memory,
+                                   InvocationContext) ->
+    PluginRuntime = scope_plugin_runtime(
+                      model_plugin_runtime(InvocationContext),
+                      State#state.name),
+    ScopedInvocationContext = case PluginRuntime of
+        disabled -> InvocationContext;
+        _ -> InvocationContext#{'$adk_plugin_runtime' => PluginRuntime}
+    end,
+    case run_model_plugin(PluginRuntime, before_agent, Message) of
+        {continue, EffectiveMessage} ->
+            prepare_and_run_direct_invocation(
+              State, EffectiveMessage, Memory,
+              ScopedInvocationContext, PluginRuntime);
+        {amended, EffectiveMessage} ->
+            EffectiveMemory = replace_latest_user_input(
+                                Memory, EffectiveMessage),
+            prepare_and_run_direct_invocation(
+              State, EffectiveMessage, EffectiveMemory,
+              ScopedInvocationContext, PluginRuntime);
+        {returned, Response} ->
+            complete_direct_agent_success(
+              State, Response, Memory, Memory,
+              State#state.llm_config, ScopedInvocationContext,
+              PluginRuntime);
+        {halt, Response} ->
+            complete_direct_agent_success(
+              State, Response, Memory, Memory,
+              State#state.llm_config, ScopedInvocationContext,
+              PluginRuntime);
+        {error, Reason} ->
+            direct_agent_failure(
+              State#state.llm_config, PluginRuntime, Reason, Memory)
+    end.
+
+scope_plugin_runtime(disabled, _AgentName) -> disabled;
+scope_plugin_runtime(Runtime, AgentName) when is_map(Runtime) ->
+    PluginContext = maps:get(plugin_context, Runtime, #{}),
+    Runtime#{plugin_context =>
+                 PluginContext#{agent => to_binary(AgentName)}}.
+
+prepare_and_run_direct_invocation(State, Message, Memory,
+                                  InvocationContext, PluginRuntime) ->
+    case prepare_agent_turn(
+           State, Message, Memory, InvocationContext) of
+        {ok, EffectiveConfig, PreparedMemory, PreparedContext} ->
+            run_agent_invocation(
+              State, Message, PreparedMemory, EffectiveConfig,
+              PreparedContext, PluginRuntime);
+        {error, PrepareReason} ->
+            direct_agent_failure(
+              State#state.llm_config, PluginRuntime,
+              PrepareReason, Memory)
+    end.
+
+replace_latest_user_input([#{role := user} = Message | Rest], Input) ->
+    [Message#{content => Input} | Rest];
+replace_latest_user_input([Message | Rest], Input) ->
+    [Message | replace_latest_user_input(Rest, Input)];
+replace_latest_user_input([], Input) ->
+    adk_memory:add_message([], user, Input).
 
 execute_event_turn(HistoryEvents, InvocationId, Context, State) ->
     telemetry:execute([erlang_adk, agent, run_with_events, start], #{},
@@ -703,6 +751,14 @@ execute_event_turn(HistoryEvents, InvocationId, Context, State) ->
                 Config, History, ModelTools, PluginRuntime),
               InvocationId);
         {error, _} = Error -> Error
+    end,
+    case Result of
+        {error, AgentReason} ->
+            _ = run_model_plugin(
+                  model_plugin_runtime(Context),
+                  on_agent_error, AgentReason),
+            ok;
+        _ -> ok
     end,
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     telemetry:execute([erlang_adk, agent, run_with_events, stop],
@@ -1018,7 +1074,9 @@ run_agent_loop(Config, Memory, Tools, State, InvocationContext, Round) ->
             case model_tools(Tools, State#state.sub_agents) of
                 {ok, ModelTools} ->
                     ModelResult = generate_with_callbacks(
-                                    Config, Memory, ModelTools),
+                                    Config, Memory, ModelTools,
+                                    model_plugin_runtime(
+                                      InvocationContext)),
                     case direct_model_result(ModelResult) of
                         {ok, ModelOutput} ->
                             ResponseText = output_value(ModelOutput),
@@ -1090,36 +1148,45 @@ execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList,
                 state_ref => State#state.session_store},
     LocalContext = copy_agent_path(InvocationContext, Context),
     Handlers = maps:get(callbacks, State#state.llm_config, []),
+    PluginRuntime = model_plugin_runtime(InvocationContext),
+    DelegationContext = case PluginRuntime of
+        disabled -> LocalContext;
+        _ -> LocalContext#{'$adk_plugin_runtime' => PluginRuntime}
+    end,
     Result = case adk_toolset:resolve(
                     ToolsList, NameBin, ArgsMap, Context) of
         {ok, {module, Mod}} ->
             execute_direct_module_tool(
-              Mod, NameBin, ArgsMap, LocalContext, Handlers);
+              Mod, NameBin, ArgsMap, LocalContext,
+              Handlers, PluginRuntime);
         {ok, {resolved, ResolvedCall}} ->
             ResolvedContext = resolved_execution_context(
                                 ResolvedCall, Context, LocalContext),
             execute_direct_resolved_tool(
               ResolvedCall, NameBin, ArgsMap,
-              ResolvedContext, Handlers);
+              ResolvedContext, Handlers, PluginRuntime);
         {error, not_found} ->
             case validate_sub_agent_arguments(
                    NameBin, ArgsMap, State#state.sub_agents) of
                 ok ->
                     execute_sub_agent_with_callbacks(
-                      NameBin, ArgsMap, LocalContext, LocalContext,
-                      State#state.sub_agents, Handlers, Config);
+                      NameBin, ArgsMap, LocalContext, DelegationContext,
+                      State#state.sub_agents, Handlers, Config,
+                      PluginRuntime);
                 {error, {invalid_tool_arguments, _} = Reason} ->
                     adk_toolset:invalid_arguments_response(Reason);
                 {error, not_found} ->
                     execute_sub_agent_with_callbacks(
-                      NameBin, ArgsMap, LocalContext, LocalContext,
-                      State#state.sub_agents, Handlers, Config)
+                      NameBin, ArgsMap, LocalContext, DelegationContext,
+                      State#state.sub_agents, Handlers, Config,
+                      PluginRuntime)
             end;
         {error, {invalid_tool_arguments, _} = Reason} ->
             adk_toolset:invalid_arguments_response(Reason);
         {error, Reason} ->
             execute_failed_tool_with_callbacks(
-              Reason, NameBin, ArgsMap, Context, Handlers)
+              Reason, NameBin, ArgsMap, Context,
+              Handlers, PluginRuntime)
     end,
     Memory1 = adk_memory:add_message(
                 MemoryAcc, tool,
@@ -1127,20 +1194,22 @@ execute_tools_inner(NameBin, ArgsMap, Sig, CallId, Rest, ToolsList,
     execute_tools(Rest, ToolsList, Memory1, State, Config,
                   InvocationContext).
 
-execute_direct_module_tool(Mod, NameBin, ArgsMap, Context, Handlers) ->
+execute_direct_module_tool(Mod, NameBin, ArgsMap, Context, Handlers,
+                           PluginRuntime) ->
     case adk_tool_confirmation:module_requirement(Mod, ArgsMap, Context) of
         {ok, Requirement} ->
             case adk_tool_confirmation:is_required(Requirement) of
                 true -> direct_confirmation_required(Requirement);
                 false ->
                     execute_tool_with_callbacks(
-                      Mod, NameBin, ArgsMap, Context, Handlers)
+                      Mod, NameBin, ArgsMap, Context,
+                      Handlers, PluginRuntime)
             end;
         {error, Reason} -> direct_confirmation_error(Reason)
     end.
 
 execute_direct_resolved_tool(ResolvedCall, NameBin, ArgsMap,
-                             Context, Handlers) ->
+                             Context, Handlers, PluginRuntime) ->
     case adk_tool_confirmation:resolved_requirement(
            ResolvedCall, ArgsMap, Context) of
         {ok, Requirement} ->
@@ -1148,7 +1217,8 @@ execute_direct_resolved_tool(ResolvedCall, NameBin, ArgsMap,
                 true -> direct_confirmation_required(Requirement);
                 false ->
                     execute_resolved_tool_with_callbacks(
-                      ResolvedCall, NameBin, ArgsMap, Context, Handlers)
+                      ResolvedCall, NameBin, ArgsMap, Context,
+                      Handlers, PluginRuntime)
             end;
         {error, Reason} -> direct_confirmation_error(Reason)
     end.
@@ -1218,9 +1288,10 @@ normalize_json_path(Path) ->
          Value when is_integer(Value) -> Value
      end || Part <- Path].
 
-execute_tool_with_callbacks(Mod, NameBin, ArgsMap, Context, Handlers) ->
-    Execute = fun() ->
-        try Mod:execute(ArgsMap, Context) of
+execute_tool_with_callbacks(Mod, NameBin, ArgsMap, Context, Handlers,
+                            PluginRuntime) ->
+    Execute = fun(EffectiveArgs) ->
+        try Mod:execute(EffectiveArgs, Context) of
             ToolResult -> ToolResult
         catch
             Class:ToolFailure:_Stack ->
@@ -1230,39 +1301,100 @@ execute_tool_with_callbacks(Mod, NameBin, ArgsMap, Context, Handlers) ->
                 {error, Failure}
         end
     end,
+    Validate = fun(EffectiveArgs) ->
+        validate_direct_module_amendment(
+          Mod, EffectiveArgs, Context)
+    end,
     execute_tool_operation_with_callbacks(
-      Execute, NameBin, ArgsMap, Context, Handlers).
+      Execute, Validate, NameBin, ArgsMap, Context,
+      Handlers, PluginRuntime).
 
 execute_resolved_tool_with_callbacks(ResolvedCall, NameBin, ArgsMap,
-                                     Context, Handlers) ->
-    Execute = fun() ->
-        execute_resolved_call(ResolvedCall, NameBin, ArgsMap, Context)
+                                     Context, Handlers, PluginRuntime) ->
+    Execute = fun(EffectiveArgs) ->
+        execute_resolved_call(
+          ResolvedCall, NameBin, EffectiveArgs, Context)
     end,
+    %% Opaque catalog calls have already been resolved against the original
+    %% arguments. Without the catalog target there is no safe way to repeat
+    %% schema, credential, confirmation and policy resolution here.
+    Validate = fun(EffectiveArgs) when EffectiveArgs =:= ArgsMap -> ok;
+                  (_EffectiveArgs) ->
+                       {error, amendment_not_revalidatable}
+               end,
     execute_tool_operation_with_callbacks(
-      Execute, NameBin, ArgsMap, Context, Handlers).
+      Execute, Validate, NameBin, ArgsMap, Context,
+      Handlers, PluginRuntime).
 
 execute_failed_tool_with_callbacks(Reason, NameBin, ArgsMap, Context,
-                                   Handlers) ->
-    Execute = fun() -> {error, Reason} end,
+                                   Handlers, PluginRuntime) ->
+    Execute = fun(_EffectiveArgs) -> {error, Reason} end,
+    Validate = fun(EffectiveArgs) when EffectiveArgs =:= ArgsMap -> ok;
+                  (_EffectiveArgs) ->
+                       {error, amendment_not_revalidatable}
+               end,
     execute_tool_operation_with_callbacks(
-      Execute, NameBin, ArgsMap, Context, Handlers).
+      Execute, Validate, NameBin, ArgsMap, Context,
+      Handlers, PluginRuntime).
 
-execute_tool_operation_with_callbacks(Execute, NameBin, ArgsMap, Context,
-                                      Handlers) ->
-    adk_callbacks:execute(Handlers, on_tool_start, [NameBin, ArgsMap]),
-    RawResult = case adk_callbacks:run(Handlers, before_tool,
-                                       [NameBin, ArgsMap, Context]) of
-        {halt, Replacement} -> {ok, Replacement};
-        {replace, Replacement} -> {ok, Replacement};
-        _ -> Execute()
+execute_tool_operation_with_callbacks(Execute, Validate, NameBin,
+                                      ArgsMap, Context, Handlers,
+                                      PluginRuntime) ->
+    HookValue = direct_tool_hook_value(NameBin, ArgsMap, Context),
+    ObservedExecute = fun(EffectiveArgs) ->
+        observed_tool_execute(
+          PluginRuntime, NameBin, Execute, EffectiveArgs)
     end,
-    FinalResult = case adk_callbacks:run(Handlers, after_tool,
-                                         [NameBin, ArgsMap, Context, RawResult]) of
-        {replace, ReplacementResult} -> {ok, ReplacementResult};
-        {halt, ReplacementResult} -> {ok, ReplacementResult};
-        _ -> RawResult
+    {EffectiveArgs, RawResult} =
+        case run_model_plugin(
+               PluginRuntime, before_tool, HookValue) of
+            {continue, _Observed} ->
+                execute_direct_local_before(
+                  ObservedExecute, NameBin, ArgsMap, Context, Handlers);
+            {amended, Amendment} ->
+                case validate_direct_tool_amendment(
+                       NameBin, Context, HookValue,
+                       Amendment, Validate) of
+                    {ok, AmendedArgs} ->
+                        execute_direct_local_before(
+                          ObservedExecute, NameBin, AmendedArgs,
+                          Context, Handlers);
+                    {error, AmendmentReason} ->
+                        {ArgsMap, {error, AmendmentReason}}
+                end;
+            {returned, Replacement} ->
+                {ArgsMap, {ok, Replacement}};
+            {halt, Replacement} ->
+                {ArgsMap, {ok, Replacement}};
+            {error, BeforePluginReason} ->
+                {ArgsMap, {error, BeforePluginReason}}
+        end,
+    ErrorHandled = direct_tool_error_plugin(
+                     PluginRuntime, RawResult),
+    {FinalResult, RunToolEnd} = case run_model_plugin(
+                                      PluginRuntime, after_tool,
+                                      ErrorHandled) of
+        {continue, PluginResult} ->
+            {apply_direct_local_after(
+               Handlers, NameBin, EffectiveArgs,
+               Context, PluginResult), true};
+        {amended, PluginResult} ->
+            {apply_direct_local_after(
+               Handlers, NameBin, EffectiveArgs,
+               Context, PluginResult), true};
+        {returned, ReplacementResult} ->
+            {{ok, ReplacementResult}, false};
+        {halt, ReplacementResult} ->
+            {{ok, ReplacementResult}, false};
+        {error, AfterPluginReason} ->
+            {{error, AfterPluginReason}, false}
     end,
-    adk_callbacks:execute(Handlers, on_tool_end, [NameBin, FinalResult]),
+    case RunToolEnd of
+        true ->
+            adk_callbacks:execute(
+              Handlers, on_tool_end, [NameBin, FinalResult]);
+        false -> ok
+    end,
     case FinalResult of
         {ok, Res} -> #{<<"success">> => true, <<"result">> => format_result(Res)};
         {error, ToolError} ->
@@ -1273,6 +1405,92 @@ execute_tool_operation_with_callbacks(Execute, NameBin, ArgsMap, Context,
             #{<<"success">> => false,
               <<"error">> => adk_failure:model_response(
                                 agent_tool, invalid_result, Other)}
+    end.
+
+execute_direct_local_before(Execute, NameBin, Args, Context, Handlers) ->
+    adk_callbacks:execute(Handlers, on_tool_start, [NameBin, Args]),
+    RawResult = case adk_callbacks:run(
+                       Handlers, before_tool,
+                       [NameBin, Args, Context]) of
+        {halt, Replacement} -> {ok, Replacement};
+        {replace, Replacement} -> {ok, Replacement};
+        _ -> Execute(Args)
+    end,
+    {Args, RawResult}.
+
+apply_direct_local_after(Handlers, NameBin, Args, Context, RawResult) ->
+    case adk_callbacks:run(
+           Handlers, after_tool,
+           [NameBin, Args, Context, RawResult]) of
+        {replace, Replacement} -> {ok, Replacement};
+        {halt, Replacement} -> {ok, Replacement};
+        _ -> RawResult
+    end.
+
+direct_tool_error_plugin(PluginRuntime, {error, _} = Error) ->
+    case run_model_plugin(PluginRuntime, on_tool_error, Error) of
+        {continue, Original} -> Original;
+        {amended, Amended} -> Amended;
+        {returned, Replacement} -> {ok, Replacement};
+        {halt, Replacement} -> {ok, Replacement};
+        {error, Reason} -> {error, Reason}
+    end;
+direct_tool_error_plugin(_PluginRuntime, Result) -> Result.
+
+direct_tool_hook_value(Name, Args, Context) ->
+    #{name => Name, args => Args,
+      context => maps:with(
+                   [app_name, session_id, user_id,
+                    invocation_id, call_id], Context)}.
+
+validate_direct_tool_amendment(Name, _Context, Original,
+                               Amendment, Validate)
+  when is_map(Amendment) ->
+    case {map_size(maps:without([name, args, context], Amendment)),
+          maps:get(name, Amendment, undefined),
+          maps:get(args, Amendment, undefined),
+          maps:get(context, Amendment, undefined)} of
+        {0, Name, EffectiveArgs, PublicContext}
+          when is_map(EffectiveArgs) ->
+            case PublicContext =:= maps:get(context, Original) of
+                false ->
+                    {error, {invalid_plugin_amendment, before_tool,
+                             context_change_not_allowed}};
+                true ->
+                    case Validate(EffectiveArgs) of
+                        ok -> {ok, EffectiveArgs};
+                        {error, Reason} ->
+                            {error,
+                             {invalid_plugin_amendment, before_tool,
+                              Reason}}
+                    end
+            end;
+        {0, _OtherName, _EffectiveArgs, _PublicContext} ->
+            {error, {invalid_plugin_amendment, before_tool,
+                     tool_reroute_not_allowed}};
+        _ ->
+            {error, {invalid_plugin_amendment, before_tool,
+                     invalid_tool_request}}
+    end;
+validate_direct_tool_amendment(_Name, _Context, _Original,
+                               _Amendment, _Validate) ->
+    {error, {invalid_plugin_amendment, before_tool, expected_map}}.
+
+validate_direct_module_amendment(Mod, Args, Context) ->
+    try adk_toolset:validate_arguments(Mod:schema(), Args) of
+        {ok, _Canonical} ->
+            case adk_tool_confirmation:module_requirement(
+                   Mod, Args, Context) of
+                {ok, Requirement} ->
+                    case adk_tool_confirmation:is_required(Requirement) of
+                        false -> ok;
+                        true -> {error, confirmation_required}
+                    end;
+                {error, _} -> {error, confirmation_evaluation_failed}
+            end;
+        {error, _} -> {error, invalid_tool_arguments}
+    catch
+        _:_ -> {error, invalid_tool_arguments}
     end.
 
 execute_resolved_call(ResolvedCall, NameBin, ArgsMap, Context) ->
@@ -1292,33 +1510,24 @@ execute_resolved_call(ResolvedCall, NameBin, ArgsMap, Context) ->
 
 execute_sub_agent_with_callbacks(NameBin, ArgsMap, Context,
                                  DelegationContext, SubAgents,
-                                 Handlers, Config) ->
-    adk_callbacks:execute(Handlers, on_tool_start, [NameBin, ArgsMap]),
-    RawResult = case adk_callbacks:run(Handlers, before_tool,
-                                       [NameBin, ArgsMap, Context]) of
-        {halt, Replacement} -> {ok, Replacement};
-        {replace, Replacement} -> {ok, Replacement};
-        _ -> execute_sub_agent(
-               NameBin, ArgsMap, SubAgents, DelegationContext, Config)
+                                 Handlers, Config, PluginRuntime) ->
+    Execute = fun(EffectiveArgs) ->
+        execute_sub_agent(
+          NameBin, EffectiveArgs, SubAgents,
+          DelegationContext, Config)
     end,
-    FinalResult = case adk_callbacks:run(
-                         Handlers, after_tool,
-                         [NameBin, ArgsMap, Context, RawResult]) of
-        {replace, ReplacementResult} -> {ok, ReplacementResult};
-        {halt, ReplacementResult} -> {ok, ReplacementResult};
-        _ -> RawResult
+    Validate = fun(EffectiveArgs) ->
+        case validate_sub_agent_arguments(
+               NameBin, EffectiveArgs, SubAgents) of
+            ok -> ok;
+            {error, {invalid_tool_arguments, _}} ->
+                {error, invalid_tool_arguments};
+            {error, not_found} -> {error, tool_not_found}
+        end
     end,
-    adk_callbacks:execute(Handlers, on_tool_end,
-                          [NameBin, FinalResult]),
-    case FinalResult of
-        {ok, SubResult} ->
-            #{<<"success">> => true,
-              <<"result">> => format_result(SubResult)};
-        {error, SubError} ->
-            #{<<"success">> => false,
-              <<"error">> => adk_failure:model_response(
-                                sub_agent, execute, SubError)}
-    end.
+    execute_tool_operation_with_callbacks(
+      Execute, Validate, NameBin, ArgsMap, Context,
+      Handlers, PluginRuntime).
 
 copy_agent_path(Source, Target) ->
     case maps:find('$adk_agent_path', Source) of
@@ -1352,26 +1561,25 @@ safe_generate(Config, History, Tools) ->
             {error, Failure}
     end.
 
-generate_with_callbacks(Config, Memory, ModelTools) ->
-    generate_with_callbacks(Config, Memory, ModelTools, disabled).
-
 generate_with_callbacks(Config, Memory, ModelTools, PluginRuntime) ->
     Handlers = maps:get(callbacks, Config, []),
     ModelRequest = #{config => Config, memory => Memory,
                      tools => ModelTools},
     case run_model_plugin(PluginRuntime, before_model, ModelRequest) of
         {continue, _ObservedRequest} ->
-            RawResult = case adk_callbacks:run(
-                               Handlers, before_model,
-                               [Config, Memory, ModelTools]) of
-                {halt, Replacement} -> Replacement;
-                {replace, Replacement} -> Replacement;
-                _ -> safe_generate(
-                       Config, adk_memory:get_history(Memory), ModelTools)
-            end,
-            finish_model_plugins(
-              Config, Handlers, PluginRuntime, RawResult);
-        {intervened, Replacement} ->
+            execute_generate_request(
+              Config, Memory, ModelTools, Handlers, PluginRuntime);
+        {amended, AmendedRequest} ->
+            case validate_model_request_amendment(
+                   Config, Memory, ModelTools, undefined,
+                   AmendedRequest, PluginRuntime) of
+                {ok, EffectiveConfig, EffectiveMemory, EffectiveTools} ->
+                    execute_generate_request(
+                      EffectiveConfig, EffectiveMemory, EffectiveTools,
+                      Handlers, PluginRuntime);
+                {error, Reason} -> {error, Reason}
+            end;
+        {returned, Replacement} ->
             finish_model_plugins(
               Config, Handlers, PluginRuntime, Replacement);
         {halt, Replacement} ->
@@ -1379,6 +1587,20 @@ generate_with_callbacks(Config, Memory, ModelTools, PluginRuntime) ->
               Config, Handlers, PluginRuntime, Replacement);
         {error, Reason} -> {error, Reason}
     end.
+
+execute_generate_request(Config, Memory, ModelTools,
+                         Handlers, PluginRuntime) ->
+    RawResult = case adk_callbacks:run(
+                       Handlers, before_model,
+                       [Config, Memory, ModelTools]) of
+        {halt, Replacement} -> Replacement;
+        {replace, Replacement} -> Replacement;
+        _ -> observed_generate(
+               Config, adk_memory:get_history(Memory), ModelTools,
+               PluginRuntime)
+    end,
+    finish_model_plugins(
+      Config, Handlers, PluginRuntime, RawResult).
 
 execute_prepared_stream(Pid, InvocationId, Prepared, Mode, EventCallback) ->
     Config = maps:get(config, Prepared),
@@ -1439,24 +1661,132 @@ stream_with_callbacks(Config, Memory, ModelTools, PluginRuntime,
                      tools => ModelTools, streaming => Mode},
     case run_model_plugin(PluginRuntime, before_model, ModelRequest) of
         {continue, _ObservedRequest} ->
-            RawResult = case adk_callbacks:run(
-                               Handlers, before_model,
-                               [Config, Memory, ModelTools]) of
-                {halt, Replacement} -> Replacement;
-                {replace, Replacement} -> Replacement;
-                _ -> safe_stream_generate(
-                       Config, adk_memory:get_history(Memory), ModelTools,
-                       Mode, PartialCallback, AccRef)
-            end,
-            finish_model_plugins(
-              Config, Handlers, PluginRuntime, RawResult);
-        {intervened, Replacement} ->
+            execute_stream_request(
+              Config, Memory, ModelTools, Handlers, PluginRuntime,
+              Mode, PartialCallback, AccRef);
+        {amended, AmendedRequest} ->
+            case validate_model_request_amendment(
+                   Config, Memory, ModelTools, Mode,
+                   AmendedRequest, PluginRuntime) of
+                {ok, EffectiveConfig, EffectiveMemory, EffectiveTools} ->
+                    execute_stream_request(
+                      EffectiveConfig, EffectiveMemory, EffectiveTools,
+                      Handlers, PluginRuntime, Mode,
+                      PartialCallback, AccRef);
+                {error, Reason} -> {error, Reason}
+            end;
+        {returned, Replacement} ->
             finish_model_plugins(
               Config, Handlers, PluginRuntime, Replacement);
         {halt, Replacement} ->
             finish_model_plugins(
               Config, Handlers, PluginRuntime, Replacement);
         {error, Reason} -> {error, Reason}
+    end.
+
+execute_stream_request(Config, Memory, ModelTools, Handlers,
+                       PluginRuntime, Mode, PartialCallback, AccRef) ->
+    RawResult = case adk_callbacks:run(
+                       Handlers, before_model,
+                       [Config, Memory, ModelTools]) of
+        {halt, Replacement} -> Replacement;
+        {replace, Replacement} -> Replacement;
+        _ -> observed_stream_generate(
+               Config, adk_memory:get_history(Memory), ModelTools,
+               Mode, PartialCallback, AccRef, PluginRuntime)
+    end,
+    finish_model_plugins(
+      Config, Handlers, PluginRuntime, RawResult).
+
+validate_model_request_amendment(Config, Memory, ModelTools,
+                                 ExpectedStreaming, Amendment,
+                                 PluginRuntime)
+  when is_map(Amendment) ->
+    Allowed = [config, memory, tools, streaming],
+    case map_size(maps:without(Allowed, Amendment)) of
+        0 ->
+            validate_model_request_fields(
+              Config, Memory, ModelTools, ExpectedStreaming,
+              Amendment, PluginRuntime);
+        _ ->
+            {error, {invalid_plugin_amendment, before_model,
+                     unknown_request_field}}
+    end;
+validate_model_request_amendment(_Config, _Memory, _ModelTools,
+                                 _ExpectedStreaming, _Amendment,
+                                 _PluginRuntime) ->
+    {error, {invalid_plugin_amendment, before_model, expected_map}}.
+
+validate_model_request_fields(Config, Memory, ModelTools,
+                              ExpectedStreaming, Amendment,
+                              PluginRuntime) ->
+    ConfigPatch = maps:get(config, Amendment, #{}),
+    CandidateMemory = maps:get(memory, Amendment, Memory),
+    CandidateTools = maps:get(tools, Amendment, ModelTools),
+    CandidateStreaming = maps:get(streaming, Amendment,
+                                  ExpectedStreaming),
+    case {valid_model_config_patch(Config, ConfigPatch),
+          is_list(CandidateMemory), is_list(CandidateTools),
+          CandidateStreaming =:= ExpectedStreaming} of
+        {{ok, CandidateConfig}, true, true, true} ->
+            validate_model_request_envelope(
+              CandidateConfig, CandidateMemory, CandidateTools,
+              PluginRuntime);
+        {{error, Reason}, _, _, _} ->
+            {error, {invalid_plugin_amendment, before_model, Reason}};
+        {_, false, _, _} ->
+            {error, {invalid_plugin_amendment, before_model,
+                     invalid_memory}};
+        {_, _, false, _} ->
+            {error, {invalid_plugin_amendment, before_model,
+                     invalid_tools}};
+        {_, _, _, false} ->
+            {error, {invalid_plugin_amendment, before_model,
+                     streaming_mode_change_not_allowed}}
+    end.
+
+valid_model_config_patch(Config, Patch) when is_map(Patch) ->
+    Allowed = [provider, model, temperature, top_p, top_k,
+               max_tokens, max_output_tokens, candidate_count,
+               response_mime_type, thinking_config, safety_settings,
+               builtin_tools, generation_config, callback_config],
+    case map_size(maps:without(Allowed, Patch)) of
+        0 ->
+            case maps:get(provider, Patch,
+                          maps:get(provider, Config, undefined)) =:=
+                 maps:get(provider, Config, undefined) of
+                false -> {error, provider_change_not_allowed};
+                true ->
+                    Candidate = maps:merge(Config,
+                                           maps:remove(provider, Patch)),
+                    case adk_llm:validate_config(Candidate) of
+                        ok -> {ok, Candidate};
+                        {error, _} -> {error, invalid_model_config}
+                    end
+            end;
+        _ -> {error, unknown_config_field}
+    end;
+valid_model_config_patch(_Config, _Patch) ->
+    {error, invalid_model_config}.
+
+validate_model_request_envelope(Config, Memory, Tools, PluginRuntime) ->
+    Chronological = adk_memory:get_history(Memory),
+    Budget = case PluginRuntime of
+        #{request_budget := RequestBudget} -> RequestBudget;
+        _ -> disabled
+    end,
+    case adk_context_envelope:sanitize_history(Chronological) of
+        {ok, SafeChronological} ->
+            case adk_context_envelope:check(
+                   Config, SafeChronological, Tools, Budget) of
+                {ok, _Metadata} ->
+                    {ok, Config, lists:reverse(SafeChronological), Tools};
+                {error, Reason} ->
+                    {error, {invalid_plugin_amendment, before_model,
+                             Reason}}
+            end;
+        {error, Reason} ->
+            {error, {invalid_plugin_amendment, before_model, Reason}}
     end.
 
 safe_stream_generate(Config, History, ModelTools, Mode,
@@ -1486,6 +1816,105 @@ safe_stream_generate(Config, History, ModelTools, Mode,
             {error, adk_failure:external(
                       agent_model, invalid_stream_result, Other)}
     end.
+
+observed_generate(Config, History, Tools, PluginRuntime) ->
+    with_operation_span(
+      generate_content, client, Config, PluginRuntime,
+      fun() -> safe_generate(Config, History, Tools) end).
+
+observed_stream_generate(Config, History, ModelTools, Mode,
+                         PartialCallback, AccRef, PluginRuntime) ->
+    with_operation_span(
+      generate_content, client, Config, PluginRuntime,
+      fun() -> safe_stream_generate(
+                 Config, History, ModelTools, Mode,
+                 PartialCallback, AccRef)
+      end).
+
+observed_tool_execute(PluginRuntime, NameBin, Execute, Args) ->
+    with_operation_span(
+      execute_tool, internal, #{tool => NameBin}, PluginRuntime,
+      fun() -> Execute(Args) end).
+
+with_operation_span(_Operation, _Kind, _Details, disabled, Execute) ->
+    Execute();
+with_operation_span(Operation, Kind, Details0, PluginRuntime, Execute)
+  when is_map(PluginRuntime) ->
+    case maps:get(observability, PluginRuntime,
+                  #{config => disabled, context => undefined}) of
+        #{config := disabled} -> Execute();
+        #{config := Delivery, context := Parent}
+          when is_map(Delivery), is_map(Parent) ->
+            Details = operation_details(Details0),
+            case adk_observability:start_span(
+                   Operation, Kind, Parent, Details, Delivery) of
+                {ok, Span} ->
+                    Result = Execute(),
+                    EndDetails = maps:merge(
+                                   Details,
+                                   provider_result_details(Result)),
+                    case adk_observability:finish_span(
+                           Span, operation_status(Result), EndDetails) of
+                        {ok, _Signal} -> Result;
+                        {error, Reason} ->
+                            ok = adk_observability:report_delivery_failure(
+                                   finish_span, Reason, Span),
+                            Result
+                    end;
+                {error, Reason} ->
+                    {error, {observability_failed, Reason}}
+            end;
+        _ -> Execute()
+    end.
+
+operation_details(#{tool := Tool}) -> #{tool => Tool};
+operation_details(Config) when is_map(Config) ->
+    Provider = maps:get(provider, Config, undefined),
+    Model = maps:get(model, Config, undefined),
+    Base = case Provider of
+        undefined -> #{};
+        adk_llm_gemini -> #{provider => <<"google">>};
+        Module when is_atom(Module) ->
+            #{provider => atom_to_binary(Module, utf8)};
+        ProviderValue when is_binary(ProviderValue) ->
+            #{provider => ProviderValue};
+        _ -> #{}
+    end,
+    case Model of
+        ModelValue when is_binary(ModelValue), byte_size(ModelValue) > 0 ->
+            Base#{request_model => ModelValue};
+        _ -> Base
+    end.
+
+provider_result_details({provider_result, _} = Result) ->
+    case adk_provider_result:decode(Result) of
+        {ok, _Outcome, ProviderMetadata} ->
+            Metadata = maps:get(<<"metadata">>, ProviderMetadata, #{}),
+            Usage = maps:get(<<"usage_metadata">>, Metadata, #{}),
+            #{response_model => maps:get(
+                                  <<"model_version">>, Metadata, undefined),
+              response_id => maps:get(
+                               <<"response_id">>, Metadata, undefined),
+              finish_reasons => maps:get(
+                                  <<"finish_reasons">>, Metadata, undefined),
+              input_tokens => maps:get(
+                                <<"promptTokenCount">>, Usage, undefined),
+              output_tokens => maps:get(
+                                 <<"candidatesTokenCount">>, Usage,
+                                 undefined),
+              cached_input_tokens => maps:get(
+                                       <<"cachedContentTokenCount">>, Usage,
+                                       undefined),
+              reasoning_tokens => maps:get(
+                                    <<"thoughtsTokenCount">>, Usage,
+                                    undefined)};
+        _ -> #{}
+    end;
+provider_result_details(_) -> #{}.
+
+operation_status({error, timeout}) -> {error, timeout};
+operation_status({error, _}) -> {error, provider_error};
+operation_status(_) -> ok.
 
 materialize_stream_provider_result(ProviderResult, AccRef) ->
     case adk_provider_result:decode(ProviderResult) of
@@ -1628,7 +2057,8 @@ stream_content_limits(Config) ->
 finish_model_plugins(Config, Handlers, PluginRuntime, {error, _} = Error0) ->
     case run_model_plugin(PluginRuntime, on_model_error, Error0) of
         {continue, Error} -> Error;
-        {intervened, Replacement} ->
+        {amended, Error} -> Error;
+        {returned, Replacement} ->
             apply_after_model_plugins(
               Config, Handlers, PluginRuntime, Replacement);
         {halt, Replacement} ->
@@ -1648,36 +2078,53 @@ apply_after_model_plugins(Config, Handlers, PluginRuntime, RawResult) ->
                 {halt, ReplacementResult} -> ReplacementResult;
                 _ -> PluginResult
             end;
-        {intervened, ReplacementResult} -> ReplacementResult;
+        {amended, PluginResult} ->
+            case adk_callbacks:run(
+                   Handlers, after_model, [Config, PluginResult]) of
+                {replace, ReplacementResult} -> ReplacementResult;
+                {halt, ReplacementResult} -> ReplacementResult;
+                _ -> PluginResult
+            end;
+        {returned, ReplacementResult} -> ReplacementResult;
         {halt, ReplacementResult} -> ReplacementResult;
         {error, Reason} -> {error, Reason}
     end.
 
 model_plugin_runtime(Context) ->
-    Pipeline = maps:get('$adk_plugin_pipeline', Context, disabled),
-    PluginContext = maps:get('$adk_plugin_context', Context, #{}),
-    Observation = maps:get(
-                    '$adk_observability', Context,
-                    #{config => disabled, context => undefined}),
-    case {Pipeline, maps:get(config, Observation, disabled)} of
-        {disabled, disabled} -> disabled;
-        _ -> #{pipeline => Pipeline, plugin_context => PluginContext,
-               observability => Observation}
+    case maps:get('$adk_plugin_runtime', Context, undefined) of
+        Runtime when is_map(Runtime) -> Runtime;
+        _ ->
+            Pipeline = maps:get('$adk_plugin_pipeline', Context, disabled),
+            PluginContext = maps:get('$adk_plugin_context', Context, #{}),
+            Observation = maps:get(
+                            '$adk_observability', Context,
+                            #{config => disabled, context => undefined}),
+            case {Pipeline, maps:get(config, Observation, disabled)} of
+                {disabled, disabled} -> disabled;
+                _ -> #{pipeline => Pipeline,
+                       plugin_context => PluginContext,
+                       observability => Observation,
+                       request_budget =>
+                           maps:get('$adk_request_budget', Context,
+                                    disabled)}
+            end
     end.
 
 run_model_plugin(disabled, _Hook, Value) -> {continue, Value};
 run_model_plugin(Runtime, Hook, Value) ->
     Started = erlang:monotonic_time(millisecond),
-    Context = (maps:get(plugin_context, Runtime, #{}))#{phase => model},
+    Phase = plugin_phase(Hook),
+    Context = (maps:get(plugin_context, Runtime, #{}))#{phase => Phase},
     RawOutcome = case maps:get(pipeline, Runtime, disabled) of
         disabled -> {continue, Value, []};
         Pipeline ->
             case adk_plugin_pipeline:run(Pipeline, Hook, Context, Value) of
-                {ok, NewValue, Trace} ->
-                    case model_plugin_replaced(Trace) of
-                        true -> {intervened, NewValue, Trace};
-                        false -> {continue, NewValue, Trace}
-                    end;
+                {continue, NewValue, Trace} ->
+                    {continue, NewValue, Trace};
+                {amend, NewValue, Trace} ->
+                    {amended, NewValue, Trace};
+                {return, NewValue, Trace} ->
+                    {returned, NewValue, Trace};
                 {halt, NewValue, Trace} -> {halt, NewValue, Trace};
                 {error, PipelineReason, Trace} ->
                     {error, PipelineReason, Trace}
@@ -1685,38 +2132,43 @@ run_model_plugin(Runtime, Hook, Value) ->
     end,
     Duration = erlang:max(
                  0, erlang:monotonic_time(millisecond) - Started),
-    case emit_model_lifecycle(Runtime, Hook, Duration, Value, RawOutcome) of
+    case emit_model_lifecycle(
+           Runtime, Phase, Hook, Duration, Value, RawOutcome) of
         ok -> strip_model_plugin_trace(RawOutcome);
         {error, ObservationReason} ->
             {error, {observability_failed, ObservationReason}}
     end.
 
-model_plugin_replaced(Trace) ->
-    lists:any(
-      fun(Entry) -> maps:get(<<"outcome">>, Entry, <<>>) =:= <<"replaced">> end,
-      Trace).
-
 strip_model_plugin_trace({continue, Value, _}) -> {continue, Value};
-strip_model_plugin_trace({intervened, Value, _}) -> {intervened, Value};
+strip_model_plugin_trace({amended, Value, _}) -> {amended, Value};
+strip_model_plugin_trace({returned, Value, _}) -> {returned, Value};
 strip_model_plugin_trace({halt, Value, _}) -> {halt, Value};
 strip_model_plugin_trace({error, Reason, _}) -> {error, Reason}.
 
+plugin_phase(before_agent) -> agent;
+plugin_phase(after_agent) -> agent;
+plugin_phase(on_agent_error) -> agent;
+plugin_phase(before_tool) -> tool;
+plugin_phase(after_tool) -> tool;
+plugin_phase(on_tool_error) -> tool;
+plugin_phase(_) -> model.
+
 emit_model_lifecycle(#{observability := #{config := disabled}},
-                     _Hook, _Duration, _Value, _Outcome) -> ok;
-emit_model_lifecycle(Runtime, Hook, Duration, Value, Outcome) ->
+                     _Phase, _Hook, _Duration, _Value, _Outcome) -> ok;
+emit_model_lifecycle(Runtime, Phase, Hook, Duration, Value, Outcome) ->
     Observation = maps:get(observability, Runtime),
     Config = maps:get(config, Observation),
     Parent = maps:get(context, Observation),
     OutcomeTag = model_plugin_outcome_tag(Outcome),
     case adk_observability:child_context(
-           Parent, #{phase => <<"model">>,
+           Parent, #{phase => atom_to_binary(Phase, utf8),
                      hook => atom_to_binary(Hook, utf8),
                      outcome => OutcomeTag}) of
         {ok, Child} ->
             Opts = #{capture_content => maps:get(capture_content, Config),
                      content => Value,
                      attributes => #{
-                         phase => <<"model">>,
+                         phase => atom_to_binary(Phase, utf8),
                          hook => atom_to_binary(Hook, utf8),
                          outcome => OutcomeTag,
                          plugin_trace => model_plugin_trace(Outcome)}},
@@ -1724,10 +2176,8 @@ emit_model_lifecycle(Runtime, Hook, Duration, Value, Outcome) ->
                    [erlang_adk, lifecycle, Hook],
                    #{duration_ms => Duration}, Child, Opts) of
                 {ok, Envelope} ->
-                    case adk_observability:export(
-                           Envelope, maps:get(exporters, Config)) of
+                    case adk_observability:deliver(Envelope, Config) of
                         {ok, _} -> ok;
-                        {error, Reason, _} -> {error, Reason};
                         {error, Reason} -> {error, Reason}
                     end;
                 {error, Reason} -> {error, Reason}
@@ -1736,13 +2186,15 @@ emit_model_lifecycle(Runtime, Hook, Duration, Value, Outcome) ->
     end.
 
 model_plugin_outcome_tag({continue, _, _}) -> <<"continue">>;
-model_plugin_outcome_tag({intervened, _, _}) -> <<"intervened">>;
+model_plugin_outcome_tag({amended, _, _}) -> <<"amended">>;
+model_plugin_outcome_tag({returned, _, _}) -> <<"returned">>;
 model_plugin_outcome_tag({halt, _, _}) -> <<"halt">>;
 model_plugin_outcome_tag({error, _, _}) -> <<"error">>.
 
 model_plugin_trace({_Tag, _Value, Trace}) when is_list(Trace) -> Trace.
 
-run_agent_invocation(State, Message, Memory, Config, InvocationContext) ->
+run_agent_invocation(State, Message, Memory, Config, InvocationContext,
+                     PluginRuntime) ->
     Handlers = maps:get(callbacks, Config, []),
     AgentName = State#state.name,
     adk_callbacks:execute(Handlers, on_agent_start,
@@ -1757,12 +2209,22 @@ run_agent_invocation(State, Message, Memory, Config, InvocationContext) ->
     end,
     case Result0 of
         {ok, Response0, UpdatedMemory} ->
-            Response0a = case adk_callbacks:run(Handlers, after_agent,
-                                                [AgentName, Response0]) of
-                {replace, Replacement} -> Replacement;
-                {halt, Replacement} -> Replacement;
-                _ -> Response0
-            end,
+            complete_direct_agent_success(
+              State, Response0, Memory, UpdatedMemory,
+              Config, InvocationContext, PluginRuntime);
+        {error, Reason, UpdatedMemory} ->
+            direct_agent_failure(
+              Config, PluginRuntime, Reason, UpdatedMemory)
+    end.
+
+complete_direct_agent_success(State, Response0, InputMemory,
+                              UpdatedMemory, Config,
+                              InvocationContext, PluginRuntime) ->
+    Handlers = maps:get(callbacks, Config, []),
+    AgentName = State#state.name,
+    case apply_direct_after_agent_plugin(
+           PluginRuntime, Handlers, AgentName, Response0) of
+        {ok, Response0a} ->
             %% Text remains a UTF-8 binary. Canonical multimodal content stays
             %% structured instead of being coerced to JSON text.
             case adk_agent_spec:finalize(
@@ -1770,7 +2232,7 @@ run_agent_invocation(State, Message, Memory, Config, InvocationContext) ->
                 {ok, CanonicalOutput, StateDelta} ->
                     Response = output_value(CanonicalOutput),
                     FinalMemory = persist_agent_response(
-                                    Memory, UpdatedMemory,
+                                    InputMemory, UpdatedMemory,
                                     Response0, Response),
                     case apply_direct_state_delta(
                            State, InvocationContext, StateDelta) of
@@ -1780,18 +2242,47 @@ run_agent_invocation(State, Message, Memory, Config, InvocationContext) ->
                               [to_binary(AgentName), Response]),
                             {ok, Response, FinalMemory};
                         {error, Reason} ->
-                            adk_callbacks:execute(
-                              Handlers, on_error, [Reason]),
-                            {error, Reason, FinalMemory}
+                            direct_agent_failure(
+                              Config, PluginRuntime, Reason, FinalMemory)
                     end;
                 {error, Reason} ->
-                    adk_callbacks:execute(Handlers, on_error, [Reason]),
-                    {error, Reason, UpdatedMemory}
+                    direct_agent_failure(
+                      Config, PluginRuntime, Reason, UpdatedMemory)
             end;
-        {error, Reason, UpdatedMemory} ->
-            adk_callbacks:execute(Handlers, on_error, [Reason]),
-            {error, Reason, UpdatedMemory}
+        {error, Reason} ->
+            direct_agent_failure(
+              Config, PluginRuntime, Reason, UpdatedMemory)
     end.
+
+apply_direct_after_agent_plugin(PluginRuntime, Handlers,
+                                AgentName, Response0) ->
+    case run_model_plugin(PluginRuntime, after_agent, Response0) of
+        {continue, PluginResponse} ->
+            {ok, apply_local_after_agent(
+                   Handlers, AgentName, PluginResponse)};
+        {amended, PluginResponse} ->
+            {ok, apply_local_after_agent(
+                   Handlers, AgentName, PluginResponse)};
+        {returned, PluginResponse} -> {ok, PluginResponse};
+        {halt, PluginResponse} -> {ok, PluginResponse};
+        {error, Reason} -> {error, Reason}
+    end.
+
+apply_local_after_agent(Handlers, AgentName, Response) ->
+    case adk_callbacks:run(Handlers, after_agent,
+                           [AgentName, Response]) of
+        {replace, Replacement} -> Replacement;
+        {halt, Replacement} -> Replacement;
+        _ -> Response
+    end.
+
+direct_agent_failure(Config, PluginRuntime, Reason, Memory) ->
+    %% Notification results are ignored by the pipeline; the original reason
+    %% remains authoritative even when a plugin crashes or returns a value.
+    _ = run_model_plugin(PluginRuntime, on_agent_error, Reason),
+    adk_callbacks:execute(
+      maps:get(callbacks, Config, []), on_error, [Reason]),
+    {error, Reason, Memory}.
 
 %% Keep the conversation visible to the next model turn identical to the
 %% response returned to the caller. A before_agent short-circuit has not yet
@@ -2006,7 +2497,8 @@ prepare_event_model(State, HistoryEvents, Context)
                        ?DEFAULT_MAX_STREAM_OUTPUT_BYTES),
     AgentContext = maps:without(
                      ['$adk_plugin_pipeline', '$adk_plugin_context',
-                      '$adk_observability', '$adk_stream_max_bytes',
+                      '$adk_observability', '$adk_plugin_runtime',
+                      '$adk_stream_max_bytes',
                       '$adk_request_budget', '$adk_context_cache'], Context),
     case valid_max_stream_bytes(MaxStreamBytes) of
         false -> {error, {invalid_max_stream_output_bytes, MaxStreamBytes}};
@@ -2377,7 +2869,7 @@ delegation_context(Config, Context) ->
     Base = maps:with(
              [state, app_name, user_id, session_id, invocation_id,
               state_ref, artifact_service, artifact_scope,
-              '$adk_agent_path'], Context),
+              '$adk_agent_path', '$adk_plugin_runtime'], Context),
     Source = maps:get(
                '$adk_inherited_global_instruction', Config,
                maps:get(global_instruction, Config, <<>>)),

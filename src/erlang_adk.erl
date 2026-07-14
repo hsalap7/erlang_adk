@@ -19,6 +19,15 @@
          await_planning/1, await_planning/2,
          cancel_planning/1, cancel_planning/2]).
 
+-export([start_live_session/3,
+         live_send_text/3, live_send_audio/3, live_send_video_frame/3,
+         live_activity_start/2, live_activity_end/2,
+         live_audio_stream_end/2, live_send_tool_response/5,
+         live_subscribe/3, live_subscribe/4,
+         live_ack/3, live_ack/4,
+         live_unsubscribe/2, live_unsubscribe/3,
+         live_status/2, live_status/3, close_live_session/3]).
+
 -export_type([planning_ref/0]).
 
 -define(PLANNING_REF, adk_planning_ref).
@@ -206,3 +215,60 @@ cancel_planning({?PLANNING_REF, Owner, RuntimePid, RunRef}, _Reason)
     {error, not_planning_owner};
 cancel_planning(_PlanningRef, _Reason) ->
     {error, invalid_planning_ref}.
+
+%% Server-owned Gemini Live sessions
+
+%% @doc Start one independently supervised bidirectional Live session.
+%% `Principal' is checked on every subsequent operation and is never returned
+%% in status/events. Provider credentials stay inside the session transport.
+start_live_session(SessionId, Principal, Config) ->
+    adk_live_session_sup:start_session(SessionId, Principal, Config).
+
+live_send_text(Session, Principal, Text) ->
+    adk_live_session:send_text(Session, Principal, Text).
+
+live_send_audio(Session, Principal, Media) ->
+    adk_live_session:send_audio(Session, Principal, Media).
+
+live_send_video_frame(Session, Principal, Media) ->
+    adk_live_session:send_video_frame(Session, Principal, Media).
+
+live_activity_start(Session, Principal) ->
+    adk_live_session:activity_start(Session, Principal).
+
+live_activity_end(Session, Principal) ->
+    adk_live_session:activity_end(Session, Principal).
+
+live_audio_stream_end(Session, Principal) ->
+    adk_live_session:audio_stream_end(Session, Principal).
+
+live_send_tool_response(Session, Principal, CallId, ToolName, Response) ->
+    adk_live_session:send_tool_response(
+      Session, Principal, CallId, ToolName, Response).
+
+live_subscribe(Session, Principal, Credit) ->
+    adk_live_session:subscribe(Session, Principal, Credit).
+
+live_subscribe(Session, Principal, Subscriber, Credit) ->
+    adk_live_session:subscribe(Session, Principal, Subscriber, Credit).
+
+live_ack(Session, Principal, Sequence) ->
+    adk_live_session:ack(Session, Principal, Sequence).
+
+live_ack(Session, Principal, Subscriber, Sequence) ->
+    adk_live_session:ack(Session, Principal, Subscriber, Sequence).
+
+live_unsubscribe(Session, Principal) ->
+    adk_live_session:unsubscribe(Session, Principal).
+
+live_unsubscribe(Session, Principal, Subscriber) ->
+    adk_live_session:unsubscribe(Session, Principal, Subscriber).
+
+live_status(Session, Principal) ->
+    adk_live_session:status(Session, Principal).
+
+live_status(Session, Principal, TimeoutMs) ->
+    adk_live_session:status(Session, Principal, TimeoutMs).
+
+close_live_session(Session, Principal, Reason) ->
+    adk_live_session:close(Session, Principal, Reason).

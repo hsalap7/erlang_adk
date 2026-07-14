@@ -118,10 +118,13 @@ invocation_lanes_overlap_across_sessions() ->
                       adk_agent:invoke(
                         Agent, <<"b">>, SecondContext)}
         end),
-        {FirstExecutor, <<"a">>} =
-            await_started(<<"invocation-overlap">>),
-        {SecondExecutor, <<"b">>} =
-            await_started(<<"invocation-overlap">>),
+        %% Independent lane workers may reach the provider in either order;
+        %% the concurrency contract is that both start before either is
+        %% released, not that the scheduler favors session A.
+        Started = [await_started(<<"invocation-overlap">>),
+                   await_started(<<"invocation-overlap">>)],
+        FirstExecutor = executor_for_prompt(<<"a">>, Started),
+        SecondExecutor = executor_for_prompt(<<"b">>, Started),
         %% Both scoped turns reached the provider before either was released.
         FirstExecutor ! release,
         SecondExecutor ! release,

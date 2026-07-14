@@ -4,6 +4,7 @@ config :erlang_adk_ui,
   auth_provider: ErlangAdkUi.TestAuthProvider,
   gateway_server: ErlangAdkUi.TestGateway,
   start_gateway: false,
+  live_gateway: ErlangAdkUi.TestLiveGateway,
   auth_provider_call: [timeout_ms: 100, max_heap_words: 200_000],
   login_flow_store: [ttl_ms: 60_000, max_entries: 100],
   session_store: [ttl_ms: :timer.minutes(5), max_entries: 100]

@@ -104,6 +104,131 @@ exporter_order_failure_and_timeout_test() ->
         adk_observability:export(Envelope, [Timeout]),
     ?assert(erlang:monotonic_time(millisecond) - Started < 1000).
 
+exporter_descriptor_limits_are_preflighted_test() ->
+    ensure_telemetry(),
+    {ok, Context} = adk_observability:new_context(#{run_id => <<"limits">>}),
+    {ok, Envelope} = adk_observability:emit(
+                       [erlang_adk, test, exporter_limits], #{}, Context),
+    Base = exporter(<<"bounded">>, open, #{}),
+    ?assertEqual(
+       {error, {invalid_exporter_descriptor, 0,
+                {unknown_exporter_options, 1}}},
+       adk_observability:validate_exporters(
+         [Base#{unexpected_option => true}])),
+    LongId = binary:copy(<<"x">>, 129),
+    ?assertEqual(
+       {error, {invalid_exporter_descriptor, 0,
+                {exporter_id_too_long, 129, 128}}},
+       adk_observability:validate_exporters([Base#{id => LongId}])),
+    ?assertEqual(
+       {error, {invalid_exporter_descriptor, 0,
+                {exporter_timeout_out_of_range, 30000}}},
+       adk_observability:validate_exporters(
+         [Base#{timeout_ms => 30001}])),
+    ?assertEqual(
+       {error, {invalid_exporter_descriptor, 0,
+                {exporter_heap_out_of_range, 10000000}}},
+       adk_observability:validate_exporters(
+         [Base#{max_heap_words => 10000001}])),
+    ?assertMatch(
+       {error, {invalid_exporter_descriptor, 0,
+                {exporter_config_too_large, _, 1048576}}},
+       adk_observability:validate_exporters(
+         [Base#{config =>
+                    #{blob => binary:copy(<<"x">>, 1048577)}}])),
+    ?assertEqual(
+       {error, {duplicate_exporter_id, <<"bounded">>}},
+       adk_observability:validate_exporters([Base, Base])),
+    SixtyFour = [Base#{id => <<"exporter-",
+                               (integer_to_binary(N))/binary>>,
+                        config => #{test_pid => self(),
+                                    label => should_not_run}}
+                 || N <- lists:seq(1, 64)],
+    ?assertEqual(ok, adk_observability:validate_exporters(SixtyFour)),
+    SixtyFive = SixtyFour ++
+        [exporter(<<"exporter-65">>, open,
+                  #{test_pid => self(), label => should_not_run})],
+    ?assertEqual(
+       {error, {exporter_limit_exceeded, 64}},
+       adk_observability:validate_exporters(SixtyFive)),
+    ?assertEqual(
+       {error, {exporter_limit_exceeded, 64}, []},
+       adk_observability:export(Envelope, SixtyFive)),
+    receive
+        {exported, should_not_run, _} ->
+            erlang:error(invalid_exporter_tail_caused_side_effect)
+    after 0 -> ok
+    end.
+
+caller_death_kills_owned_exporter_callback_test() ->
+    ensure_telemetry(),
+    {ok, Context} = adk_observability:new_context(#{run_id => <<"owner">>}),
+    {ok, Envelope} = adk_observability:emit(
+                       [erlang_adk, test, exporter_owner], #{}, Context),
+    Blocking = (exporter(
+                  <<"owner-fenced">>, closed,
+                  #{action => owner_fence, test_pid => self(),
+                    label => owner_fenced}))#{timeout_ms => 30000},
+    TestPid = self(),
+    Caller = spawn(fun() ->
+        TestPid ! {unexpected_export_result,
+                   adk_observability:export(Envelope, [Blocking])}
+    end),
+    Callback = receive
+        {exporter_callback_started, Pid} -> Pid
+    after 1000 -> erlang:error(exporter_callback_not_started)
+    end,
+    CallbackMonitor = erlang:monitor(process, Callback),
+    CallerMonitor = erlang:monitor(process, Caller),
+    exit(Caller, kill),
+    receive
+        {'DOWN', CallerMonitor, process, Caller, killed} -> ok
+    after 1000 -> erlang:error(export_caller_not_killed)
+    end,
+    receive
+        {'DOWN', CallbackMonitor, process, Callback, _} -> ok
+    after 1000 -> erlang:error(orphan_exporter_callback_survived)
+    end,
+    receive
+        {unexpected_export_result, _} ->
+            erlang:error(dead_export_caller_returned)
+    after 0 -> ok
+    end.
+
+exporter_timeout_direct_kills_trapping_callback_test() ->
+    ensure_telemetry(),
+    {ok, Context} = adk_observability:new_context(
+                       #{run_id => <<"trap-exit-timeout">>}),
+    {ok, Envelope} = adk_observability:emit(
+                       [erlang_adk, test, trapping_exporter_timeout],
+                       #{}, Context),
+    Blocking = (exporter(
+                  <<"trapping-timeout">>, closed,
+                  #{action => owner_fence, test_pid => self(),
+                    label => trapping_timeout}))#{timeout_ms => 200},
+    TestPid = self(),
+    _Caller = spawn(fun() ->
+        TestPid ! {trapping_export_result,
+                   adk_observability:export(Envelope, [Blocking])}
+    end),
+    Callback = receive
+        {exporter_callback_started, Pid} -> Pid
+    after 1000 -> erlang:error(trapping_exporter_not_started)
+    end,
+    Monitor = erlang:monitor(process, Callback),
+    receive
+        {trapping_export_result,
+         {error, {exporter_failed, <<"trapping-timeout">>, timeout}, [_]}} ->
+            ok
+    after 1000 -> erlang:error(trapping_export_timeout_missing)
+    end,
+    receive
+        {'DOWN', Monitor, process, Callback, killed} -> ok;
+        {'DOWN', Monitor, process, Callback, OtherReason} ->
+            erlang:error({unexpected_trapping_callback_exit, OtherReason})
+    after 1000 -> erlang:error(trapping_exporter_survived_timeout)
+    end.
+
 envelope_roundtrip_test() ->
     ensure_telemetry(),
     {ok, Context} = adk_observability:new_context(#{run_id => <<"run">>}),

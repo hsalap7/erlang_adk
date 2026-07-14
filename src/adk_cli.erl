@@ -11,7 +11,11 @@
 -define(DEFAULT_MODEL, <<"gemini-3.1-flash-lite">>).
 -define(DEFAULT_BASE_URL, <<"http://127.0.0.1:8080">>).
 -define(DEFAULT_TIMEOUT, 120000).
+-define(DEFAULT_EVAL_CASE_TIMEOUT, 30000).
 -define(MAX_CONFIG_BYTES, 1048576).
+-define(MAX_EVAL_FILE_BYTES, 16777216).
+-define(MAX_DEVELOPER_RESPONSE_BYTES, 1048576).
+-define(DEVELOPER_HTTP_TIMEOUT, 5000).
 
 -spec main([string()]) -> no_return() | ok.
 main(Args) ->
@@ -19,6 +23,12 @@ main(Args) ->
         {ok, #{command := serve} = Result} ->
             write_result(Result),
             wait_for_shutdown();
+        {ok, #{command := eval_run} = Result} ->
+            write_eval_run_result(Result),
+            case maps:get(ci_exit_code, Result) of
+                0 -> ok;
+                ExitCode -> erlang:halt(ExitCode)
+            end;
         {ok, Result} ->
             write_result(Result),
             ok;
@@ -75,6 +85,32 @@ command_noninteractive(["evaluate" | Args]) ->
         "--concurrency" => concurrency,
         "--timeout" => timeout},
       fun evaluate_command/1);
+command_noninteractive(["eval", "run" | Args]) ->
+    with_options(
+      Args,
+      #{"--config" => config,
+        "--eval-set" => eval_set,
+        "--criteria" => criteria,
+        "--baseline" => baseline,
+        "--format" => format,
+        "--output" => output,
+        "--samples" => samples,
+        "--concurrency" => concurrency,
+        "--sample-concurrency" => sample_concurrency,
+        "--timeout" => timeout,
+        "--case-timeout" => case_timeout,
+        "--pass-rate-threshold" => pass_rate_threshold,
+        "--sample-pass-rate-threshold" =>
+            sample_pass_rate_threshold,
+        "--min-successful-samples" => min_successful_samples,
+        "--empty-criteria" => empty_criteria,
+        "--capture-events" => capture_events,
+        "--capture-tool-content" => capture_tool_content,
+        "--max-heap-words" => max_heap_words,
+        "--max-report-bytes" => max_report_bytes,
+        "--max-pass-rate-drop" => max_pass_rate_drop,
+        "--metric-tolerances" => metric_tolerances},
+      fun eval_run_command/1);
 command_noninteractive(["serve" | Args]) ->
     with_options(
       Args,
@@ -90,6 +126,18 @@ command_noninteractive(["inspect", "diagnostics" | Args]) ->
     with_options(
       Args, #{"--url" => base_url},
       fun inspect_diagnostics/1);
+command_noninteractive(["inspect", "observability" | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url},
+      fun inspect_observability/1);
+command_noninteractive(["inspect", "live" | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url},
+      fun inspect_live_sessions/1);
+command_noninteractive(["live", "send", SessionId | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--text" => text},
+      fun(Opts) -> send_remote_live_text(SessionId, Opts) end);
 command_noninteractive(["inspect", "run", RunId | Args]) ->
     with_options(
       Args, #{"--url" => base_url},
@@ -196,9 +244,13 @@ usage() ->
       "  adk run --config AGENT.json --message TEXT [--user ID --session ID]\n"
       "  adk console --config AGENT.json [--user ID --session ID]\n"
       "  adk evaluate --config AGENT.json --dataset DATASET.json\n"
+      "  adk eval run --config AGENT.json --eval-set SET.json [--criteria CRITERIA.json]\n"
       "  adk serve [--config AGENT.json] [--port 8080 --ip 127.0.0.1]\n"
       "  adk inspect agents [--url URL]\n"
       "  adk inspect diagnostics [--url URL]\n"
+      "  adk inspect observability [--url URL]\n"
+      "  adk inspect live [--url URL]\n"
+      "  adk live send SESSION_ID --text TEXT [--url URL]\n"
       "  adk inspect run RUN_ID [--url http://127.0.0.1:8080]\n"
       "  adk inspect sessions APP USER [--url URL]\n"
       "  adk inspect session APP USER SESSION [--url URL]\n"
@@ -649,6 +701,415 @@ evaluate_command(Opts) ->
           end
       end).
 
+%% Versioned evaluation is a separate command so the historical evaluate
+%% dataset contract and its output remain unchanged.
+eval_run_command(Opts) ->
+    with_required(
+      Opts, [config, eval_set],
+      fun() ->
+          case prepare_eval_run(Opts) of
+              {ok, Prepared} -> execute_eval_run(Prepared);
+              {error, _} = Error -> Error
+          end
+      end).
+
+prepare_eval_run(Opts) ->
+    case {parse_eval_format(maps:get(format, Opts, "json")),
+          parse_eval_output(maps:get(output, Opts, "-")),
+          parse_eval_option_overrides(Opts),
+          parse_comparison_overrides(Opts)} of
+        {{ok, Format}, {ok, Output},
+         {ok, EvalOptions}, {ok, ComparisonOptions}} ->
+            case validate_comparison_usage(Opts, ComparisonOptions) of
+                ok ->
+                    load_eval_run_inputs(
+                      Opts, Format, Output,
+                      EvalOptions, ComparisonOptions);
+                {error, _} = Error -> Error
+            end;
+        {{error, _} = Error, _, _, _} -> Error;
+        {_, {error, _} = Error, _, _} -> Error;
+        {_, _, {error, _} = Error, _} -> Error;
+        {_, _, _, {error, _} = Error} -> Error
+    end.
+
+load_eval_run_inputs(Opts, Format, Output,
+                     EvalOptions, ComparisonOptions) ->
+    case load_agent_file(maps:get(config, Opts)) of
+        {error, _} = Error -> Error;
+        {ok, Agent} ->
+            case load_versioned_eval_set(maps:get(eval_set, Opts)) of
+                {error, _} = Error -> Error;
+                {ok, EvalSet} ->
+                    case load_cli_eval_criteria(Opts) of
+                        {error, _} = Error -> Error;
+                        {ok, Criteria} ->
+                            case load_optional_baseline(Opts) of
+                                {error, _} = Error -> Error;
+                                {ok, Baseline} ->
+                                    {ok, #{agent => Agent,
+                                           eval_set => EvalSet,
+                                           criteria => Criteria,
+                                           eval_options => EvalOptions,
+                                           comparison_options =>
+                                               ComparisonOptions,
+                                           baseline => Baseline,
+                                           format => Format,
+                                           output => Output}}
+                            end
+                    end
+            end
+    end.
+
+execute_eval_run(Prepared) ->
+    case ensure_application_started() of
+        {error, _} = Error -> Error;
+        ok ->
+            Agent = maps:get(agent, Prepared),
+            EvalOptions = maps:get(eval_options, Prepared),
+            CaseTimeout = maps:get(
+                            case_timeout_ms, EvalOptions,
+                            ?DEFAULT_EVAL_CASE_TIMEOUT),
+            Adapter = #{
+                module => adk_eval_agent_adapter,
+                target => maps:with(
+                            [name, config, tools, runner_options], Agent),
+                config => #{run_timeout_ms => CaseTimeout}
+            },
+            case adk_eval_set:run(
+                   Adapter, maps:get(eval_set, Prepared),
+                   maps:get(criteria, Prepared), EvalOptions) of
+                {error, Reason} ->
+                    {error, {evaluation_failed, Reason}};
+                {ok, Current} ->
+                    finish_eval_run(Prepared, Current)
+            end
+    end.
+
+finish_eval_run(Prepared, Current) ->
+    Baseline = maps:get(baseline, Prepared),
+    ComparisonOptions = maps:get(comparison_options, Prepared),
+    case eval_gate_report(Baseline, Current, ComparisonOptions) of
+        {error, _} = Error -> Error;
+        {ok, ReportValue, Comparison, Passed} ->
+            Format = maps:get(format, Prepared),
+            case adk_eval_set:report(ReportValue, Format) of
+                {error, Reason} ->
+                    {error, {report_render_failed, Reason}};
+                {ok, Rendered0} ->
+                    Rendered = trailing_newline(Rendered0),
+                    case deliver_eval_report(
+                           maps:get(output, Prepared), Rendered) of
+                        {error, _} = Error -> Error;
+                        {ok, Delivery, OutputPath} ->
+                            ExitCode = case Passed of true -> 0; false -> 2 end,
+                            Base = #{command => eval_run,
+                                     delivery => Delivery,
+                                     format => Format,
+                                     report => Rendered,
+                                     evaluation => Current,
+                                     passed => Passed,
+                                     ci_exit_code => ExitCode},
+                            WithComparison = case Comparison of
+                                undefined -> Base;
+                                _ -> Base#{comparison => Comparison}
+                            end,
+                            Result = case OutputPath of
+                                undefined -> WithComparison;
+                                _ -> WithComparison#{
+                                       output_path => OutputPath}
+                            end,
+                            {ok, Result}
+                    end
+            end
+    end.
+
+eval_gate_report(undefined, Current, _ComparisonOptions) ->
+    Passed = maps:get(<<"passed">>, Current),
+    {ok, Current, undefined, Passed};
+eval_gate_report(Baseline, Current, ComparisonOptions) ->
+    case adk_eval_set:compare(Baseline, Current, ComparisonOptions) of
+        {error, Reason} ->
+            {error, {baseline_comparison_failed, Reason}};
+        {ok, Comparison} ->
+            EvaluationPassed = maps:get(<<"passed">>, Current),
+            ComparisonPassed = maps:get(<<"passed">>, Comparison),
+            Passed = EvaluationPassed andalso ComparisonPassed,
+            %% Keep the baseline comparison's validated public schema intact.
+            %% The command result carries the combined CI outcome separately.
+            {ok, Comparison, Comparison, Passed}
+    end.
+
+parse_eval_format("json") -> {ok, json};
+parse_eval_format("markdown") -> {ok, markdown};
+parse_eval_format(_) -> {error, invalid_eval_report_format}.
+
+parse_eval_output("-") -> {ok, stdout};
+parse_eval_output(Path0) ->
+    try unicode:characters_to_list(Path0) of
+        Path when is_list(Path), Path =/= [] ->
+            case lists:member(0, Path) of
+                true -> {error, invalid_eval_output_path};
+                false -> {ok, {file, Path}}
+            end;
+        _ -> {error, invalid_eval_output_path}
+    catch
+        _:_ -> {error, invalid_eval_output_path}
+    end.
+
+parse_eval_option_overrides(Opts) ->
+    Specs = [
+        {samples, sample_count, positive},
+        {concurrency, concurrency, positive},
+        {sample_concurrency, sample_concurrency, positive},
+        {timeout, timeout_ms, positive},
+        {case_timeout, case_timeout_ms, positive},
+        {pass_rate_threshold, pass_rate_threshold, fraction},
+        {sample_pass_rate_threshold, sample_pass_rate_threshold, fraction},
+        {min_successful_samples, min_successful_samples, positive},
+        {empty_criteria, empty_criteria, empty_policy},
+        {capture_events, capture_events, boolean},
+        {capture_tool_content, capture_tool_content, boolean},
+        {max_heap_words, max_heap_words, positive},
+        {max_report_bytes, max_report_bytes, positive}
+    ],
+    parse_override_specs(Specs, Opts, #{}).
+
+parse_comparison_overrides(Opts) ->
+    case parse_override_specs(
+           [{max_pass_rate_drop, max_pass_rate_drop, fraction}],
+           Opts, #{}) of
+        {error, _} = Error -> Error;
+        {ok, Acc} ->
+            case maps:find(metric_tolerances, Opts) of
+                error -> {ok, Acc};
+                {ok, Path} ->
+                    case load_metric_tolerances(Path) of
+                        {ok, Tolerances} ->
+                            {ok, Acc#{metric_tolerances => Tolerances}};
+                        {error, _} = Error -> Error
+                    end
+            end
+    end.
+
+parse_override_specs([], _Opts, Acc) -> {ok, Acc};
+parse_override_specs([{CliKey, EvalKey, Type} | Rest], Opts, Acc) ->
+    case maps:find(CliKey, Opts) of
+        error -> parse_override_specs(Rest, Opts, Acc);
+        {ok, Value} ->
+            case parse_override_value(Value, CliKey, Type) of
+                {ok, Parsed} ->
+                    parse_override_specs(
+                      Rest, Opts, Acc#{EvalKey => Parsed});
+                {error, _} = Error -> Error
+            end
+    end.
+
+parse_override_value(Value, Name, positive) ->
+    parse_positive_integer(Value, Name);
+parse_override_value(Value, Name, fraction) ->
+    parse_fraction(Value, Name);
+parse_override_value("pass", _Name, empty_policy) -> {ok, pass};
+parse_override_value("error", _Name, empty_policy) -> {ok, error};
+parse_override_value(_Value, Name, empty_policy) ->
+    {error, {invalid_empty_criteria_policy, Name}};
+parse_override_value("true", _Name, boolean) -> {ok, true};
+parse_override_value("false", _Name, boolean) -> {ok, false};
+parse_override_value(_Value, Name, boolean) ->
+    {error, {invalid_boolean, Name}}.
+
+parse_fraction(Value, Name) ->
+    try unicode:characters_to_binary(Value) of
+        Binary ->
+            case fraction_number(Binary) of
+                Number when is_number(Number),
+                            Number >= 0, Number =< 1 ->
+                    {ok, Number};
+                _ -> {error, {invalid_fraction, Name}}
+            end
+    catch
+        _:_ -> {error, {invalid_fraction, Name}}
+    end.
+
+fraction_number(Binary) ->
+    try binary_to_integer(Binary) of
+        Integer -> Integer
+    catch
+        _:_ ->
+            try binary_to_float(Binary) of
+                Float -> Float
+            catch
+                _:_ -> invalid
+            end
+    end.
+
+validate_comparison_usage(Opts, ComparisonOptions) ->
+    case {maps:is_key(baseline, Opts), map_size(ComparisonOptions)} of
+        {false, Size} when Size > 0 ->
+            {error, baseline_required_for_comparison_options};
+        _ -> ok
+    end.
+
+load_versioned_eval_set(Path) ->
+    case read_eval_json_file(Path) of
+        {ok, Value} when is_map(Value) ->
+            case adk_eval_set:decode(Value) of
+                {ok, EvalSet} -> {ok, EvalSet};
+                {error, Reason} -> {error, {invalid_eval_set, Reason}}
+            end;
+        {ok, _} -> {error, eval_set_must_be_object};
+        {error, _} = Error -> Error
+    end.
+
+load_cli_eval_criteria(Opts) ->
+    case maps:find(criteria, Opts) of
+        error ->
+            {ok, [#{id => <<"response">>,
+                    criterion => <<"exact_response">>,
+                    threshold => 1.0}]};
+        {ok, Path} ->
+            case read_json_file(Path) of
+                {ok, Criteria} when is_list(Criteria) ->
+                    normalize_cli_criteria(Criteria, 0, []);
+                {ok, #{<<"criteria">> := Criteria} = Wrapper}
+                  when is_list(Criteria) ->
+                    case maps:keys(
+                           maps:without([<<"criteria">>], Wrapper)) of
+                        [] -> normalize_cli_criteria(Criteria, 0, []);
+                        Unknown ->
+                            {error, {unknown_eval_criteria_keys, Unknown}}
+                    end;
+                {ok, _} -> {error, eval_criteria_must_be_array};
+                {error, _} = Error -> Error
+            end
+    end.
+
+normalize_cli_criteria([], _Index, Acc) ->
+    {ok, lists:reverse(Acc)};
+normalize_cli_criteria([Criterion | Rest], Index, Acc)
+  when is_map(Criterion) ->
+    Allowed = [<<"id">>, <<"criterion">>, <<"threshold">>,
+               <<"kind">>, <<"config">>],
+    Unknown = maps:keys(maps:without(Allowed, Criterion)),
+    Id = maps:get(<<"id">>, Criterion, undefined),
+    Name = maps:get(<<"criterion">>, Criterion, undefined),
+    Threshold = maps:get(<<"threshold">>, Criterion, 1.0),
+    Kind0 = maps:get(<<"kind">>, Criterion, <<"metric">>),
+    Config = maps:get(<<"config">>, Criterion, #{}),
+    case {Unknown, valid_nonempty_binary(Id),
+          builtin_criterion(Name), metric_kind(Kind0),
+          valid_cli_score(Threshold), criterion_config(Config)} of
+        {[], true, true, {ok, Kind}, true, ok} ->
+            Descriptor = #{id => Id, criterion => Name,
+                           threshold => Threshold, kind => Kind,
+                           config => Config},
+            normalize_cli_criteria(
+              Rest, Index + 1, [Descriptor | Acc]);
+        {[_ | _], _, _, _, _, _} ->
+            {error, {unknown_eval_criterion_keys, Index, Unknown}};
+        _ -> {error, {invalid_eval_criterion, Index}}
+    end;
+normalize_cli_criteria([_ | _], Index, _Acc) ->
+    {error, {invalid_eval_criterion, Index}}.
+
+builtin_criterion(<<"exact_response">>) -> true;
+builtin_criterion(<<"trajectory_exact">>) -> true;
+builtin_criterion(<<"trajectory_in_order">>) -> true;
+builtin_criterion(<<"trajectory_any_order">>) -> true;
+builtin_criterion(<<"trajectory_subset">>) -> true;
+builtin_criterion(<<"tool_trajectory">>) -> true;
+builtin_criterion(_) -> false.
+
+metric_kind(<<"metric">>) -> {ok, metric};
+metric_kind(<<"judge">>) -> {ok, judge};
+metric_kind(_) -> error.
+
+criterion_config(Config) when is_map(Config) ->
+    Allowed = [<<"normalization">>, <<"args">>, <<"match">>],
+    case maps:keys(maps:without(Allowed, Config)) of
+        [] -> ok;
+        _ -> error
+    end;
+criterion_config(_) -> error.
+
+valid_cli_score(Value) when is_integer(Value) ->
+    Value >= 0 andalso Value =< 1;
+valid_cli_score(Value) when is_float(Value) ->
+    Value =:= Value andalso Value >= 0.0 andalso Value =< 1.0;
+valid_cli_score(_) -> false.
+
+load_optional_baseline(Opts) ->
+    case maps:find(baseline, Opts) of
+        error -> {ok, undefined};
+        {ok, Path} ->
+            case read_eval_json_file(Path) of
+                {ok, Value} when is_map(Value) ->
+                    case adk_eval_set:decode_result(Value) of
+                        {ok, Baseline} -> {ok, Baseline};
+                        {error, Reason} ->
+                            {error, {invalid_eval_baseline, Reason}}
+                    end;
+                {ok, _} -> {error, eval_baseline_must_be_object};
+                {error, _} = Error -> Error
+            end
+    end.
+
+load_metric_tolerances(Path) ->
+    case read_json_file(Path) of
+        {ok, Value} when is_map(Value) ->
+            case lists:all(
+                   fun({Id, Tolerance}) ->
+                       valid_nonempty_binary(Id)
+                           andalso valid_cli_score(Tolerance)
+                   end, maps:to_list(Value)) of
+                true -> {ok, Value};
+                false -> {error, invalid_metric_tolerances}
+            end;
+        {ok, _} -> {error, metric_tolerances_must_be_object};
+        {error, _} = Error -> Error
+    end.
+
+read_eval_json_file(Path0) ->
+    Path = unicode:characters_to_list(Path0),
+    case file:read_file(Path) of
+        {ok, Binary} when byte_size(Binary) =< ?MAX_EVAL_FILE_BYTES ->
+            decode_json_binary(Binary);
+        {ok, _Binary} -> {error, eval_file_too_large};
+        {error, Reason} -> {error, {file_read_failed, Reason}}
+    end.
+
+deliver_eval_report(stdout, _Rendered) ->
+    {ok, stdout, undefined};
+deliver_eval_report({file, Path}, Rendered) ->
+    case atomic_write_eval_report(Path, Rendered) of
+        ok ->
+            {ok, file, unicode:characters_to_binary(Path)};
+        {error, Reason} ->
+            {error, {report_write_failed, Reason}}
+    end.
+
+atomic_write_eval_report(Path, Rendered) ->
+    Suffix = integer_to_list(
+               erlang:unique_integer([positive, monotonic])),
+    Temporary = Path ++ ".tmp-" ++ Suffix,
+    case file:write_file(Temporary, Rendered, [binary, exclusive]) of
+        ok ->
+            case file:rename(Temporary, Path) of
+                ok -> ok;
+                {error, Reason} ->
+                    _ = file:delete(Temporary),
+                    {error, Reason}
+            end;
+        {error, Reason} -> {error, Reason}
+    end.
+
+trailing_newline(<<>>) -> <<"\n">>;
+trailing_newline(Binary) ->
+    case binary:last(Binary) of
+        $\n -> Binary;
+        _ -> <<Binary/binary, "\n">>
+    end.
+
 evaluate_loaded(Opts, Timeout, Concurrency) ->
     case {load_agent_file(maps:get(config, Opts)),
           load_dataset(maps:get(dataset, Opts))} of
@@ -740,6 +1201,30 @@ inspect_agents(Opts) ->
 
 inspect_diagnostics(Opts) ->
     remote_json(get, <<"/dev/v1/diagnostics">>, undefined, Opts).
+
+inspect_observability(Opts) ->
+    remote_json(get, <<"/dev/v1/observability">>, undefined, Opts).
+
+inspect_live_sessions(Opts) ->
+    remote_json(get, <<"/dev/v1/live/sessions">>, undefined, Opts).
+
+send_remote_live_text(SessionId0, Opts) ->
+    with_required(
+      Opts, [text],
+      fun() ->
+          SessionId = safe_binary(SessionId0),
+          Text = option_binary(Opts, text, <<>>),
+          case valid_nonempty_binary(SessionId)
+               andalso valid_nonempty_binary(Text) of
+              true ->
+                  remote_json(
+                    post,
+                    <<"/dev/v1/live/sessions/",
+                      (quote(SessionId))/binary, "/text">>,
+                    jsx:encode(#{<<"text">> => Text}), Opts);
+              false -> {error, invalid_live_text_command}
+          end
+      end).
 
 inspect_sessions(App0, User0, Opts) ->
     App = quote(safe_binary(App0)),
@@ -1112,51 +1597,251 @@ remote_json(Method, Path, Body, Opts) ->
             case developer_token_value() of
                 {error, _} = Error -> Error;
                 {ok, Token} ->
-                    {ok, _} = application:ensure_all_started(inets),
-                    Url = binary_to_list(<<Base/binary, Path/binary>>),
-                    Auth = {"authorization",
-                            "Bearer " ++ binary_to_list(Token)},
-                    Request = case Method of
-                        get -> {Url, [Auth]};
-                        delete -> {Url, [Auth]};
-                        post -> {Url, [Auth], "application/json", Body}
-                    end,
-                    HttpOptions = developer_http_options(Base),
-                    case safe_httpc_request(Method, Request, HttpOptions) of
-                        {ok, {{_Version, Status, _Phrase}, _Headers,
-                              ResponseBody}}
+                    case safe_developer_request(
+                           Method, Base, Path, Body, Token) of
+                        {ok, Status, ResponseBody}
                           when Status >= 200, Status < 300 ->
                             case decode_json_binary(ResponseBody) of
                                 {ok, Json} -> {ok, Json};
                                 {error, _} ->
                                     {error, invalid_developer_api_response}
                             end;
-                        {ok, {{_Version, Status, _Phrase}, _Headers,
-                              ResponseBody}} ->
+                        {ok, Status, ResponseBody} ->
                             {error, {developer_api_http_error, Status,
                                      public_http_error(ResponseBody)}};
+                        {error, {developer_response_too_large, Status}}
+                          when Status >= 200, Status < 300 ->
+                            {error, invalid_developer_api_response};
+                        {error, {developer_response_too_large, Status}} ->
+                            {error, {developer_api_http_error, Status,
+                                     <<"developer_api_request_failed">>}};
                         {error, Reason} ->
                             {error, developer_api_transport_error(Reason)}
                     end
             end
     end.
 
-%% Supplying an explicit SSL option prevents OTP's httpc defaults from loading
-%% OS CA certificates for a plain loopback HTTP request. HTTPS deliberately
-%% retains httpc's verified defaults.
-developer_http_options(<<"http://", _/binary>>) ->
-    [{timeout, 5000}, {ssl, [{verify, verify_none}]}];
-developer_http_options(_Base) ->
-    [{timeout, 5000}].
-
-safe_httpc_request(Method, Request, HttpOptions) ->
-    try httpc:request(
-          Method, Request, HttpOptions, [{body_format, binary}]) of
+%% `httpc' only streams 200 and 206 responses; all other status bodies are
+%% accumulated internally before the caller can enforce a limit.  Gun's
+%% per-stream flow credit lets the CLI apply the same hard cap to success and
+%% error responses while retaining verified TLS for HTTPS endpoints.
+safe_developer_request(Method, Base, Path, Body, Token) ->
+    try bounded_developer_request(Method, Base, Path, Body, Token) of
         Result -> Result
     catch
         Class:Reason:_Stacktrace ->
             {error, {http_client_exception, Class, Reason}}
     end.
+
+bounded_developer_request(Method, Base, Path, Body, Token) ->
+    case application:ensure_all_started(gun) of
+        {ok, _} ->
+            case developer_endpoint(Base, Path) of
+                {ok, Endpoint} ->
+                    Deadline = developer_deadline(),
+                    open_developer_connection(
+                      Endpoint, Method, Body, Token, Deadline);
+                {error, _} = Error -> Error
+            end;
+        {error, Reason} -> {error, {gun_start_failed, Reason}}
+    end.
+
+developer_endpoint(Base, Path) ->
+    try uri_string:parse(Base) of
+        #{scheme := Scheme0, host := Host0} = Parsed ->
+            Scheme = safe_binary(Scheme0),
+            Host = safe_binary(Host0),
+            Port = maps:get(
+                     port, Parsed,
+                     case Scheme of
+                         <<"https">> -> 443;
+                         <<"http">> -> 80
+                     end),
+            BasePath = safe_binary(maps:get(path, Parsed, <<>>)),
+            {ok, #{scheme => Scheme,
+                   host => Host,
+                   port => Port,
+                   path => <<BasePath/binary, Path/binary>>}};
+        _ -> {error, invalid_base_url}
+    catch
+        _:_ -> {error, invalid_base_url}
+    end.
+
+open_developer_connection(Endpoint, Method, Body, Token, Deadline) ->
+    case developer_gun_options(Endpoint, Deadline) of
+        {error, _} = Error -> Error;
+        {ok, GunOptions} ->
+            Host = binary_to_list(maps:get(host, Endpoint)),
+            case gun:open(Host, maps:get(port, Endpoint), GunOptions) of
+                {ok, Connection} ->
+                    try await_developer_connection(
+                          Connection, Endpoint, Method, Body, Token,
+                          Deadline)
+                    after
+                        _ = catch gun:close(Connection)
+                    end;
+                {error, Reason} -> {error, Reason}
+            end
+    end.
+
+await_developer_connection(Connection, Endpoint, Method, Body, Token,
+                           Deadline) ->
+    case gun:await_up(Connection, developer_remaining(Deadline)) of
+        {ok, http} ->
+            Headers0 = [{<<"authorization">>,
+                         <<"Bearer ", Token/binary>>},
+                        {<<"accept">>, <<"application/json">>}],
+            Headers = case Method of
+                post -> [{<<"content-type">>, <<"application/json">>} |
+                         Headers0];
+                _ -> Headers0
+            end,
+            RequestBody = case Body of undefined -> <<>>; _ -> Body end,
+            Stream = gun:request(
+                       Connection, developer_method(Method),
+                       maps:get(path, Endpoint), Headers, RequestBody,
+                       #{flow => 1}),
+            await_developer_response(Connection, Stream, Deadline);
+        {ok, _OtherProtocol} -> {error, unsupported_protocol};
+        {error, timeout} -> {error, timeout};
+        {error, Reason} -> {error, Reason}
+    end.
+
+developer_method(get) -> <<"GET">>;
+developer_method(delete) -> <<"DELETE">>;
+developer_method(post) -> <<"POST">>.
+
+await_developer_response(Connection, Stream, Deadline) ->
+    case gun:await(Connection, Stream, developer_remaining(Deadline)) of
+        {inform, _Status, _Headers} ->
+            await_developer_response(Connection, Stream, Deadline);
+        {response, fin, Status, _Headers} ->
+            {ok, Status, <<>>};
+        {response, nofin, Status, Headers} ->
+            case declared_body_too_large(Headers) of
+                true ->
+                    cancel_developer_stream(Connection, Stream),
+                    {error, {developer_response_too_large, Status}};
+                false ->
+                    collect_developer_body(
+                      Connection, Stream, Status, Deadline, [], 0)
+            end;
+        {error, timeout} ->
+            cancel_developer_stream(Connection, Stream),
+            {error, timeout};
+        {error, Reason} -> {error, Reason};
+        _ -> {error, invalid_http_response}
+    end.
+
+collect_developer_body(Connection, Stream, Status, Deadline, Acc, Size) ->
+    case gun:await(Connection, Stream, developer_remaining(Deadline)) of
+        {data, Fin, Chunk} when is_binary(Chunk) ->
+            NewSize = Size + byte_size(Chunk),
+            case NewSize =< ?MAX_DEVELOPER_RESPONSE_BYTES of
+                false ->
+                    cancel_developer_stream(Connection, Stream),
+                    {error, {developer_response_too_large, Status}};
+                true when Fin =:= fin ->
+                    {ok, Status,
+                     iolist_to_binary(lists:reverse([Chunk | Acc]))};
+                true ->
+                    ok = gun:update_flow(Connection, Stream, 1),
+                    collect_developer_body(
+                      Connection, Stream, Status, Deadline,
+                      [Chunk | Acc], NewSize)
+            end;
+        {trailers, _Headers} ->
+            {ok, Status, iolist_to_binary(lists:reverse(Acc))};
+        {error, timeout} ->
+            cancel_developer_stream(Connection, Stream),
+            {error, timeout};
+        {error, Reason} -> {error, Reason};
+        _ -> {error, invalid_http_response}
+    end.
+
+declared_body_too_large(Headers) ->
+    lists:any(
+      fun({Name0, Value0}) ->
+              Name = string:lowercase(safe_binary(Name0)),
+              case Name of
+                  <<"content-length">> ->
+                      case parse_content_length(safe_binary(Value0)) of
+                          {ok, Length} ->
+                              Length > ?MAX_DEVELOPER_RESPONSE_BYTES;
+                          error -> false
+                      end;
+                  _ -> false
+              end;
+         (_) -> false
+      end, Headers).
+
+parse_content_length(Value) ->
+    try binary_to_integer(string:trim(Value)) of
+        Length when Length >= 0 -> {ok, Length};
+        _ -> error
+    catch
+        _:_ -> error
+    end.
+
+cancel_developer_stream(Connection, Stream) ->
+    _ = catch gun:cancel(Connection, Stream),
+    ok.
+
+developer_gun_options(#{scheme := <<"http">>}, Deadline) ->
+    {ok, #{transport => tcp,
+           protocols => [http],
+           retry => 0,
+           connect_timeout => developer_remaining(Deadline)}};
+developer_gun_options(#{scheme := <<"https">>, host := Host}, Deadline) ->
+    case developer_ca_options() of
+        {ok, CaOptions} ->
+            HostString = binary_to_list(Host),
+            {ok, #{transport => tls,
+                   protocols => [http],
+                   retry => 0,
+                   connect_timeout => developer_remaining(Deadline),
+                   tls_handshake_timeout => developer_remaining(Deadline),
+                   tls_opts =>
+                       [{verify, verify_peer} | CaOptions] ++
+                       [{server_name_indication, HostString},
+                        {customize_hostname_check,
+                         [{match_fun,
+                           public_key:
+                             pkix_verify_hostname_match_fun(https)}]}]}};
+        {error, _} = Error -> Error
+    end.
+
+developer_ca_options() ->
+    try public_key:cacerts_get() of
+        Certs when is_list(Certs), Certs =/= [] ->
+            {ok, [{cacerts, Certs}]};
+        _ -> developer_fallback_ca_file()
+    catch
+        _:_ -> developer_fallback_ca_file()
+    end.
+
+developer_fallback_ca_file() ->
+    Environment = case os:getenv("SSL_CERT_FILE") of
+        false -> [];
+        Value -> [Value]
+    end,
+    Candidates = Environment ++
+        ["/etc/ssl/cert.pem",
+         "/etc/ssl/certs/ca-certificates.crt",
+         "/opt/homebrew/etc/ca-certificates/cert.pem",
+         "/usr/local/etc/openssl@3/cert.pem",
+         "/usr/local/etc/openssl/cert.pem"],
+    case lists:dropwhile(
+           fun(File) -> not filelib:is_regular(File) end, Candidates) of
+        [File | _] -> {ok, [{cacertfile, File}]};
+        [] -> {error, ca_certificates_unavailable}
+    end.
+
+developer_deadline() ->
+    erlang:monotonic_time(millisecond) + ?DEVELOPER_HTTP_TIMEOUT.
+
+developer_remaining(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 load_agent_file(Path) ->
     case read_json_file(Path) of
@@ -1708,6 +2393,11 @@ write_result(Result) ->
         {ok, Json} -> io:put_chars([jsx:encode(Json), "\n"]);
         {error, _} -> io:put_chars(["{\"status\":\"ok\"}\n"])
     end.
+
+write_eval_run_result(#{delivery := stdout, report := Report}) ->
+    io:put_chars(Report);
+write_eval_run_result(#{delivery := file}) ->
+    ok.
 
 write_error(Reason) ->
     Error = #{<<"status">> => <<"error">>,

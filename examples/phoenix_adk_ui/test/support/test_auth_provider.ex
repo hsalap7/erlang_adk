@@ -6,7 +6,11 @@ defmodule ErlangAdkUi.TestAuthProvider do
     "adk.agents.read",
     "adk.run.start",
     "adk.run.read",
-    "adk.run.control"
+    "adk.run.control",
+    "adk.live.read",
+    "adk.live.control",
+    "adk.observability.read",
+    "adk.evaluation.read"
   ]
 
   @impl true

@@ -187,20 +187,19 @@ public hit projection is persisted in the tool event. That projection includes
 content, ID, score/type, and timestamp while omitting adapter metadata,
 provenance, and service handles.
 
-The checked-in live gate
+The checked-in paid REST provider gate
 `readme_live_gemini_SUITE:artifact_and_memory_tools/1` asks
 `gemini-3.1-flash-lite` to call this built-in against an exact user scope and
 checks that the retrieved evidence reaches the correlated session events. The
-targeted live case passed on 2026-07-14. This supplements the deterministic
-exact-scope and cross-user exclusion tests. The subsequent full live run also
-passed this case; 14 of 16
-live cases passed overall, with the two failures caused by HTTP 429 in Search
-grounding and cached-content creation.
+targeted REST case passed on 2026-07-14. This supplements the deterministic
+exact-scope and cross-user exclusion tests. The final v0.7 full REST run also
+passed this case; 15 of 17 REST cases passed overall, with the two failures
+caused by HTTP 429 in Search grounding and cached-content creation.
 
 The built-in declaration contains strict JSON Schema constraints, including
 `additionalProperties`. At the Gemini boundary it is therefore emitted as
 `parametersJsonSchema`, while Erlang ADK retains the same compiled schema for
-local argument validation. The targeted live pass exercises that projection.
+local argument validation. The targeted REST pass exercises that projection.
 
 `memory_ingestion => on_success` returns the final answer without waiting for
 indexing. The application supervisor runs ingestion in bounded workers, splits

@@ -44,6 +44,18 @@ route_list(Config) ->
         {"/dev/v1/agents", adk_dev_handler, Config#{endpoint => agents}},
         {"/dev/v1/diagnostics", adk_dev_handler,
          Config#{endpoint => diagnostics}},
+        {"/dev/v1/observability", adk_dev_handler,
+         Config#{endpoint => observability}},
+        {"/dev/v1/evaluation/render", adk_dev_handler,
+         Config#{endpoint => evaluation_render}},
+        {"/dev/v1/evaluation/compare", adk_dev_handler,
+         Config#{endpoint => evaluation_compare}},
+        {"/dev/v1/live/sessions/:session_id/events", adk_dev_handler,
+         Config#{endpoint => live_session_events}},
+        {"/dev/v1/live/sessions/:session_id/text", adk_dev_handler,
+         Config#{endpoint => live_session_text}},
+        {"/dev/v1/live/sessions", adk_dev_handler,
+         Config#{endpoint => live_sessions}},
         {"/dev/v1/context/:app_name/:user_id/:session_id/lifecycle",
          adk_dev_handler, Config#{endpoint => context_lifecycle}},
         {"/dev/v1/context/:app_name/:user_id/:session_id/cache/invalidate",
@@ -91,6 +103,8 @@ valid_sanitized_config(Config) when is_map(Config) ->
     DiagnosticPolicy = maps:get(diagnostic_context_policy, Config, undefined),
     ResourceProvider = maps:get(resource_provider, Config, undefined),
     SessionService = maps:get(session_service, Config, undefined),
+    LivePrincipal = maps:get(live_principal, Config, undefined),
+    LiveCredit = maps:get(live_credit, Config, undefined),
     is_binary(Digest) andalso byte_size(Digest) =:= 32 andalso
     is_integer(MaxBody) andalso MaxBody > 0 andalso
     is_integer(MaxField) andalso MaxField > 0 andalso MaxField =< MaxBody andalso
@@ -109,6 +123,8 @@ valid_sanitized_config(Config) when is_map(Config) ->
     DiagnosticTimeout =< ?MAX_DIAGNOSTIC_TIMEOUT_MS andalso
     is_map(DiagnosticPolicy) andalso
     valid_resource_provider(ResourceProvider) andalso
+    valid_live_principal(LivePrincipal, MaxField) andalso
+    valid_live_credit(LiveCredit) andalso
     is_atom(SessionService) andalso
     is_map(maps:get(runner_options, Config, undefined)) andalso
     is_map(maps:get(run_options, Config, undefined)) andalso
@@ -141,6 +157,9 @@ validate_config(Config) when is_map(Config) ->
     ResourceProvider = maps:get(resource_provider, Config, undefined),
     SessionService = maps:get(session_service, Config,
                               erlang_adk_session),
+    LivePrincipal = maps:get(live_principal, Config, undefined),
+    LiveCredit = maps:get(live_credit, Config,
+                          #{messages => 16, bytes => 4194304}),
     RunnerOptions = maps:get(runner_options, Config, #{}),
     RunOptions = maps:get(run_options, Config, #{}),
     case is_binary(Token) andalso byte_size(Token) >= 16 andalso
@@ -162,6 +181,8 @@ validate_config(Config) when is_map(Config) ->
          DiagnosticTimeout =< ?MAX_DIAGNOSTIC_TIMEOUT_MS andalso
          valid_diagnostic_policy(DiagnosticPolicy) andalso
          valid_resource_provider(ResourceProvider) andalso
+         valid_live_principal(LivePrincipal, MaxField) andalso
+         valid_live_credit(LiveCredit) andalso
          is_atom(SessionService) andalso
          is_map(RunnerOptions) andalso is_map(RunOptions) of
         true ->
@@ -182,6 +203,8 @@ validate_config(Config) when is_map(Config) ->
                          diagnostic_timeout_ms => DiagnosticTimeout,
                          diagnostic_context_policy => DiagnosticPolicy,
                          resource_provider => ResourceProvider,
+                         live_principal => LivePrincipal,
+                         live_credit => LiveCredit,
                          session_service => SessionService,
                          runner_options => RunnerOptions,
                          run_options => RunOptions}};
@@ -212,3 +235,20 @@ valid_resource_provider({Module, Handle})
     end;
 valid_resource_provider(_) ->
     false.
+
+%% A developer bearer may inspect/control only Live sessions owned by this
+%% exact principal.  There is no administrator bypass in the Live process.
+valid_live_principal(undefined, _MaxField) -> true;
+valid_live_principal(Principal, MaxField) ->
+    is_binary(Principal) andalso byte_size(Principal) > 0 andalso
+    byte_size(Principal) =< MaxField andalso
+    case unicode:characters_to_binary(Principal, utf8, utf8) of
+        Principal -> true;
+        _ -> false
+    end.
+
+valid_live_credit(#{messages := Messages, bytes := Bytes} = Credit) ->
+    lists:sort(maps:keys(Credit)) =:= [bytes, messages] andalso
+    is_integer(Messages) andalso Messages > 0 andalso Messages =< 256 andalso
+    is_integer(Bytes) andalso Bytes > 0 andalso Bytes =< 8388608;
+valid_live_credit(_) -> false.

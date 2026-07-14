@@ -5,6 +5,9 @@ config :erlang_adk_ui,
   gateway_provider: ErlangAdkUi.AgentCatalog.Gemini,
   gateway_server: ErlangAdkUi.Gateway,
   start_gateway: true,
+  live_gateway: ErlangAdkUi.LiveGateway.Local,
+  live_credit: %{messages: 8, bytes: 262_144},
+  evaluation_reports: %{},
   auth_provider_call: [timeout_ms: 15_000, max_heap_words: 1_000_000],
   login_flow_store: [ttl_ms: :timer.minutes(10), max_entries: 1_000],
   session_store: [ttl_ms: :timer.hours(8), max_entries: 10_000],
@@ -12,7 +15,12 @@ config :erlang_adk_ui,
     max_message_bytes: 16_384,
     max_events: 100,
     max_event_bytes: 262_144,
-    max_output_bytes: 32_768
+    max_output_bytes: 32_768,
+    max_live_text_bytes: 16_384,
+    max_live_events: 100,
+    max_live_event_bytes: 262_144,
+    max_observability_bytes: 262_144,
+    max_evaluation_bytes: 1_048_576
   ]
 
 config :erlang_adk_ui, ErlangAdkUiWeb.Endpoint,

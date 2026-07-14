@@ -10,9 +10,12 @@ plugin_runner_integration_test_() ->
      fun setup/0,
      fun cleanup/1,
      [fun global_plugins_precede_local_callbacks/0,
+      fun before_model_amendment_is_validated_and_executed/0,
       fun before_model_intervention_skips_local_and_provider/0,
       fun after_model_intervention_skips_local_after_callback/0,
+      fun before_tool_amendment_is_validated_and_executed/0,
       fun tool_intervention_skips_local_before_and_execution/0,
+      fun plugin_runtime_is_inherited_by_sub_agents/0,
       fun final_event_replacement_cannot_bypass_schema_boundary/0,
       fun connected_export_metadata_is_correlated_and_redacted/0]}.
 
@@ -26,6 +29,46 @@ cleanup(_) ->
     case ets:whereis(adk_sessions) of
         undefined -> ok;
         _ -> ets:delete_all_objects(adk_sessions)
+    end.
+
+before_model_amendment_is_validated_and_executed() ->
+    install_callback_target(),
+    Amend = fun(Request) ->
+        Memory = maps:get(memory, Request),
+        AmendedMemory =
+            [case Message of
+                 #{role := user} ->
+                     Message#{content => <<"amended prompt">>};
+                 _ -> Message
+             end || Message <- Memory],
+        Request#{memory => AmendedMemory}
+    end,
+    Plugin = integration_plugin(
+               #{before_model => {amend_fun, Amend}}),
+    {ok, Agent} = spawn_probe_agent(
+                    #{response => <<"amendment complete">>,
+                      test_pid => self()}),
+    Runner = runner(Agent, Plugin, #{}),
+    try
+        ?assertEqual(
+           {ok, <<"amendment complete">>},
+           adk_runner:run(
+             Runner, ?USER, <<"model-amendment">>, <<"original prompt">>)),
+        Events = drain_messages([]),
+        [History | _] = [H || {probe_generate, H, _} <- Events],
+        ?assert(lists:any(
+                  fun(#{role := user,
+                        content := <<"amended prompt">>}) -> true;
+                     (_) -> false
+                  end, History)),
+        ?assertNot(lists:any(
+                     fun(#{role := user,
+                           content := <<"original prompt">>}) -> true;
+                        (_) -> false
+                     end, History))
+    after
+        stop_agent(Agent),
+        clear_callback_target()
     end.
 
 global_plugins_precede_local_callbacks() ->
@@ -131,6 +174,74 @@ tool_intervention_skips_local_before_and_execution() ->
         clear_callback_target()
     end.
 
+before_tool_amendment_is_validated_and_executed() ->
+    install_callback_target(),
+    persistent_term:put({adk_plugin_integration_tool, target}, self()),
+    Amend = fun(Request) ->
+        Request#{args => #{<<"value">> => 7}}
+    end,
+    Plugin = integration_plugin(
+               #{before_tool => {amend_fun, Amend}}),
+    {ok, Agent} = erlang_adk:spawn_agent(
+                    <<"PluginToolAmendAgent">>,
+                    #{provider => adk_llm_probe, mode => tool_call,
+                      call_name => <<"integration_tool">>,
+                      call_args => #{<<"value">> => 1},
+                      call_id => <<"call-amendment">>,
+                      response => <<"tool amendment complete">>,
+                      callbacks => [adk_plugin_integration_callback]},
+                    [adk_plugin_integration_tool]),
+    Runner = runner(Agent, Plugin, #{}),
+    try
+        ?assertEqual(
+           {ok, <<"tool amendment complete">>},
+           adk_runner:run(
+             Runner, ?USER, <<"tool-amendment">>, <<"use tool">>)),
+        Events = drain_messages([]),
+        ?assert(lists:member(
+                  {integration_tool_executed,
+                   #{<<"value">> => 7}}, Events)),
+        ?assertNot(lists:member(
+                     {integration_tool_executed,
+                      #{<<"value">> => 1}}, Events))
+    after
+        stop_agent(Agent),
+        persistent_term:erase({adk_plugin_integration_tool, target}),
+        clear_callback_target()
+    end.
+
+plugin_runtime_is_inherited_by_sub_agents() ->
+    {ok, Child} = erlang_adk:spawn_agent(
+                    <<"PluginInheritedChild">>,
+                    #{provider => adk_llm_probe,
+                      response => <<"child response">>}, []),
+    {ok, Root} = erlang_adk:spawn_agent(
+                   <<"PluginInheritedRoot">>,
+                   #{provider => adk_llm_probe,
+                     mode => sub_agent_call,
+                     call_name => <<"PluginInheritedChild">>,
+                     sub_agents =>
+                         #{<<"PluginInheritedChild">> => Child}}, []),
+    Runner = runner(Root, observe_plugin(), #{}),
+    try
+        ?assertEqual(
+           {ok, <<"delegation complete">>},
+           adk_runner:run(
+             Runner, ?USER, <<"plugin-delegation">>, <<"delegate">>)),
+        Events = drain_messages([]),
+        ?assertEqual(2, count_event(
+                          {integration_plugin, before_agent}, Events)),
+        %% The root model runs before and after its delegated tool response;
+        %% the child model contributes the third callback.
+        ?assertEqual(3, count_event(
+                          {integration_plugin, before_model}, Events)),
+        ?assertEqual(2, count_event(
+                          {integration_plugin, after_agent}, Events))
+    after
+        stop_agent(Root),
+        stop_agent(Child)
+    end.
+
 final_event_replacement_cannot_bypass_schema_boundary() ->
     Transform = fun(Event = #adk_event{is_final = true}) ->
                         Event#adk_event{content = <<"unvalidated">>};
@@ -142,11 +253,7 @@ final_event_replacement_cannot_bypass_schema_boundary() ->
     Runner = runner(Agent, Plugin, #{}),
     try
         ?assertEqual(
-           {error,
-            {adk_failure,
-             #{component => plugin, operation => on_error,
-               class => external,
-               reason => invalid_event_replacement_identity}}},
+           {error, invalid_event_replacement_identity},
            adk_runner:run(
              Runner, ?USER, <<"final-event">>, <<"hello">>))
     after
@@ -181,8 +288,11 @@ connected_export_metadata_is_correlated_and_redacted() ->
         Envelopes = [Envelope ||
                      {exported, integration, Envelope} <- Messages],
         ?assert(length(Envelopes) > 5),
+        LegacyEnvelopes =
+            [Envelope || Envelope <- Envelopes,
+                         maps:get(<<"schema_version">>, Envelope) =:= 1],
         Metadata = [maps:get(<<"metadata">>, Envelope)
-                    || Envelope <- Envelopes],
+                    || Envelope <- LegacyEnvelopes],
         ?assertEqual(1, length(lists:usort(
                                 [maps:get(<<"trace_id">>, M)
                                  || M <- Metadata]))),
@@ -210,6 +320,14 @@ connected_export_metadata_is_correlated_and_redacted() ->
         ?assert(lists:all(
                   fun(Envelope) ->
                       maps:get(<<"content_captured">>, Envelope) =:= false
+                  end, LegacyEnvelopes)),
+        ?assert(lists:any(
+                  fun(Envelope) ->
+                      maps:get(<<"schema_version">>, Envelope) =:= 2
+                  end, Envelopes)),
+        ?assert(lists:all(
+                  fun(Envelope) ->
+                      not maps:is_key(<<"content">>, Envelope)
                   end, Envelopes))
     after
         stop_agent(Agent),
@@ -264,3 +382,6 @@ position(Item, List) -> position(Item, List, 1).
 position(Item, [Item | _], Index) -> Index;
 position(Item, [_ | Rest], Index) -> position(Item, Rest, Index + 1);
 position(Item, [], _Index) -> erlang:error({missing_event, Item}).
+
+count_event(Item, Events) ->
+    length([ok || Event <- Events, Event =:= Item]).

@@ -50,6 +50,18 @@ dispatch(Req, State = #{endpoint := agents}) ->
     handle_agents(Req, State);
 dispatch(Req, State = #{endpoint := diagnostics}) ->
     handle_diagnostics(Req, State);
+dispatch(Req, State = #{endpoint := observability}) ->
+    handle_observability(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_render}) ->
+    handle_evaluation_render(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_compare}) ->
+    handle_evaluation_compare(Req, State);
+dispatch(Req, State = #{endpoint := live_sessions}) ->
+    handle_live_sessions(Req, State);
+dispatch(Req, State = #{endpoint := live_session_text}) ->
+    handle_live_session_text(Req, State);
+dispatch(Req, State = #{endpoint := live_session_events}) ->
+    handle_live_session_events(Req, State);
 dispatch(Req, State = #{endpoint := context_diagnostic}) ->
     handle_context_diagnostic(Req, State);
 dispatch(Req, State = #{endpoint := context_lifecycle}) ->
@@ -501,6 +513,570 @@ at_sse_limit(Limits) ->
 close_sse(Req) ->
     _ = safe_stream_body(<<>>, fin, Req),
     Req.
+
+%% ------------------------------------------------------------------
+%% v0.7 Live and observability diagnostics
+%% ------------------------------------------------------------------
+
+handle_observability(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            Metrics = developer_component_snapshot(
+                        adk_observability_metrics,
+                        fun adk_observability_metrics:snapshot/0),
+            Bus = developer_component_snapshot(
+                    adk_observability_bus,
+                    fun adk_observability_bus:stats/0),
+            json_reply(
+              200,
+              #{<<"schema_version">> => 2,
+                <<"content_captured">> => false,
+                <<"metrics">> => Metrics,
+                <<"export_bus">> => Bus},
+              #{}, Req0, State);
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+developer_component_snapshot(Name, Read) ->
+    case whereis(Name) of
+        undefined -> #{<<"enabled">> => false};
+        _Pid ->
+            try Read() of
+                Value when is_map(Value) ->
+                    #{<<"enabled">> => true,
+                      <<"snapshot">> => json_safe(Value)};
+                _ -> #{<<"enabled">> => true,
+                       <<"status">> => <<"unavailable">>}
+            catch
+                _:_ -> #{<<"enabled">> => true,
+                         <<"status">> => <<"unavailable">>}
+            end
+    end.
+
+handle_evaluation_render(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            case read_json_object(Req0, State) of
+                {ok, Payload, Req1} ->
+                    render_evaluation_payload(Payload, Req1, State);
+                {error, Req1} -> {ok, Req1, State}
+            end;
+        _ -> method_not_allowed(<<"POST">>, Req0, State)
+    end.
+
+render_evaluation_payload(Payload, Req, State) ->
+    Keys = lists:sort(maps:keys(Payload)),
+    Expected = [<<"format">>, <<"report">>],
+    ExpectedWithOptions = [<<"format">>, <<"options">>, <<"report">>],
+    Report = maps:get(<<"report">>, Payload, undefined),
+    Format = maps:get(<<"format">>, Payload, undefined),
+    Options = maps:get(<<"options">>, Payload, #{}),
+    case (Keys =:= Expected orelse Keys =:= ExpectedWithOptions)
+         andalso is_map(Report) andalso is_binary(Format)
+         andalso is_map(Options) of
+        false -> evaluation_request_error(Req, State);
+        true ->
+            MaxOutput = maps:get(max_body_bytes, State),
+            BoundedOptions = Options#{<<"max_output_bytes">> => MaxOutput},
+            case adk_eval_dev_view:render(
+                   Report, Format, BoundedOptions) of
+                {ok, Output} when Format =:= <<"json">> ->
+                    binary_reply(
+                      200, ?JSON, Output, #{}, Req, State);
+                {ok, Output} when Format =:= <<"markdown">> ->
+                    binary_reply(
+                      200, <<"text/markdown; charset=utf-8">>,
+                      Output, #{}, Req, State);
+                {error, {eval_dev_view, Code}} ->
+                    evaluation_view_error(Code, Req, State)
+            end
+    end.
+
+handle_evaluation_compare(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            case read_json_object(Req0, State) of
+                {ok, Payload, Req1} ->
+                    compare_evaluation_payload(Payload, Req1, State);
+                {error, Req1} -> {ok, Req1, State}
+            end;
+        _ -> method_not_allowed(<<"POST">>, Req0, State)
+    end.
+
+compare_evaluation_payload(Payload, Req, State) ->
+    Keys = lists:sort(maps:keys(Payload)),
+    Expected = [<<"baseline">>, <<"current">>],
+    ExpectedWithOptions = [<<"baseline">>, <<"current">>, <<"options">>],
+    Baseline = maps:get(<<"baseline">>, Payload, undefined),
+    Current = maps:get(<<"current">>, Payload, undefined),
+    Options = maps:get(<<"options">>, Payload, #{}),
+    case (Keys =:= Expected orelse Keys =:= ExpectedWithOptions)
+         andalso is_map(Baseline) andalso is_map(Current)
+         andalso is_map(Options) of
+        false -> evaluation_request_error(Req, State);
+        true ->
+            MaxOutput = maps:get(max_body_bytes, State),
+            BoundedOptions = Options#{<<"max_output_bytes">> => MaxOutput},
+            case adk_eval_dev_view:compare(
+                   Baseline, Current, BoundedOptions) of
+                {ok, Comparison} ->
+                    json_reply(200, Comparison, #{}, Req, State);
+                {error, {eval_dev_view, Code}} ->
+                    evaluation_view_error(Code, Req, State)
+            end
+    end.
+
+evaluation_request_error(Req, State) ->
+    error_reply(
+      400, <<"invalid_evaluation_request">>,
+      <<"Supply a checked evaluation report and format, or exact baseline/current reports and options">>,
+      #{}, Req, State).
+
+evaluation_view_error(eval_set_mismatch, Req, State) ->
+    error_reply(409, <<"evaluation_set_mismatch">>,
+                <<"Baseline and current evaluation set IDs differ">>,
+                #{}, Req, State);
+evaluation_view_error(_Code, Req, State) ->
+    error_reply(400, <<"invalid_evaluation_report">>,
+                <<"The evaluation report or rendering options are invalid">>,
+                #{}, Req, State).
+
+handle_live_sessions(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            with_live_principal(
+              State, Req0,
+              fun(Principal, Req) ->
+                  Timeout = maps:get(diagnostic_timeout_ms, State),
+                  Limit = maps:get(max_session_results, State),
+                  case live_session_statuses(Principal, Timeout, Limit) of
+                      {ok, Statuses, Truncated} ->
+                          json_reply(
+                            200,
+                            #{<<"schema_version">> => 1,
+                              <<"sessions">> =>
+                                  [public_live_status(Status)
+                                   || Status <- Statuses],
+                              <<"total">> => length(Statuses),
+                              <<"truncated">> => Truncated},
+                            #{}, Req, State);
+                      {error, unavailable} ->
+                          live_service_unavailable(Req, State)
+                  end
+              end);
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_live_session_text(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"POST">> ->
+            with_live_session(
+              Req0, State,
+              fun(Session, Principal, Req) ->
+                  case read_json_object(Req, State) of
+                      {ok, #{<<"text">> := Text} = Payload, Req1}
+                        when map_size(Payload) =:= 1 ->
+                          case valid_field(
+                                 Text, maps:get(max_body_bytes, State)) of
+                              true ->
+                                  live_text_reply(
+                                    adk_live_session:send_text(
+                                      Session, Principal, Text),
+                                    Req1, State);
+                              false ->
+                                  error_reply(
+                                    400, <<"invalid_live_text">>,
+                                    <<"text must be a non-empty UTF-8 string within the configured limit">>,
+                                    #{}, Req1, State)
+                          end;
+                      {ok, _Payload, Req1} ->
+                          error_reply(
+                            400, <<"invalid_live_text_request">>,
+                            <<"Expected a JSON object containing only text">>,
+                            #{}, Req1, State);
+                      {error, Req1} -> {ok, Req1, State}
+                  end
+              end);
+        _ -> method_not_allowed(<<"POST">>, Req0, State)
+    end.
+
+live_text_reply({ok, Sequence}, Req, State) ->
+    json_reply(202,
+               #{<<"accepted">> => true,
+                 <<"input_sequence">> => Sequence},
+               #{}, Req, State);
+live_text_reply({error, ingress_backpressure}, Req, State) ->
+    error_reply(429, <<"live_ingress_backpressure">>,
+                <<"The Live input queue is full">>, #{}, Req, State);
+live_text_reply({error, {not_ready, _}}, Req, State) ->
+    error_reply(409, <<"live_session_not_ready">>,
+                <<"The Live session is not ready for input">>,
+                #{}, Req, State);
+live_text_reply({error, not_found}, Req, State) ->
+    not_found(<<"live_session_not_found">>, Req, State);
+live_text_reply({error, _}, Req, State) ->
+    live_service_unavailable(Req, State).
+
+handle_live_session_events(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            case cowboy_req:header(<<"last-event-id">>, Req0) of
+                undefined -> open_live_event_stream(Req0, State);
+                <<>> -> open_live_event_stream(Req0, State);
+                _ ->
+                    error_reply(
+                      409, <<"live_event_replay_unsupported">>,
+                      <<"Gemini Live streams are ephemeral and do not replay disconnected media or events">>,
+                      #{}, Req0, State)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+open_live_event_stream(Req0, State) ->
+    with_live_session(
+      Req0, State,
+      fun(Session, Principal, Req) ->
+          Credit = maps:get(live_credit, State),
+          case adk_live_session:subscribe(
+                 Session, Principal, self(), Credit) of
+              {ok, Subscription} ->
+                  Headers = (security_headers())#{
+                      <<"content-type">> => ?SSE,
+                      <<"cache-control">> => <<"no-cache, no-transform">>,
+                      <<"x-accel-buffering">> => <<"no">>
+                  },
+                  Req1 = cowboy_req:stream_reply(200, Headers, Req),
+                  Limits = sse_limits(State),
+                  Attached = encode_live_sse(
+                               <<"attached">>, 0,
+                               #{<<"subscription">> =>
+                                     json_safe(Subscription),
+                                 <<"replay">> => false}),
+                  try
+                      case stream_counted(
+                             Attached, true, nofin, Limits, Req1) of
+                          {ok, Limits1} ->
+                              live_sse_loop(
+                                Session, Principal, Limits1, Req1);
+                          limit -> close_sse(Req1);
+                          closed -> Req1
+                      end
+                  after
+                      _ = catch adk_live_session:unsubscribe(
+                                  Session, Principal, self())
+                  end;
+              {error, invalid_credit} ->
+                  error_reply(
+                    409, <<"live_subscription_credit_mismatch">>,
+                    <<"Developer Live credit exceeds this session's configured window">>,
+                    #{}, Req, State);
+              {error, not_found} ->
+                  not_found(<<"live_session_not_found">>, Req, State);
+              {error, _} -> live_service_unavailable(Req, State)
+          end
+      end).
+
+live_sse_loop(Session, Principal, Limits, Req) ->
+    Remaining = maps:get(deadline, Limits) -
+                erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true -> close_sse(Req);
+        false ->
+            Wait = min(maps:get(heartbeat_ms, Limits), Remaining),
+            live_sse_receive(Session, Principal, Limits, Wait, Req)
+    end.
+
+live_sse_receive(Session, Principal, Limits, Wait, Req) ->
+    receive
+        {adk_live_event, _SessionId, Sequence, Event} ->
+            Body = encode_live_sse(
+                     <<"live_event">>, Sequence,
+                     public_live_event(Event)),
+            Fin = case adk_live_event:kind(Event) of
+                terminal -> fin;
+                _ -> nofin
+            end,
+            case stream_counted(Body, true, Fin, Limits, Req) of
+                {ok, Limits1} ->
+                    _ = adk_live_session:ack(
+                          Session, Principal, self(), Sequence),
+                    case Fin of
+                        fin -> Req;
+                        nofin ->
+                            case at_sse_limit(Limits1) of
+                                true -> close_sse(Req);
+                                false -> live_sse_loop(
+                                           Session, Principal,
+                                           Limits1, Req)
+                            end
+                    end;
+                limit -> close_sse(Req);
+                closed -> Req
+            end;
+        {adk_live_subscriber_dropped, _SessionId, Reason} ->
+            Body = encode_live_sse(
+                     <<"subscriber_dropped">>, 0,
+                     #{<<"reason">> => public_reason(Reason)}),
+            _ = stream_counted(Body, true, fin, Limits, Req),
+            Req
+    after Wait ->
+        case erlang:monotonic_time(millisecond) >=
+             maps:get(deadline, Limits) of
+            true -> close_sse(Req);
+            false ->
+                case stream_counted(
+                       <<": heartbeat\n\n">>, false, nofin,
+                       Limits, Req) of
+                    {ok, Limits1} ->
+                        live_sse_loop(
+                          Session, Principal, Limits1, Req);
+                    limit -> close_sse(Req);
+                    closed -> Req
+                end
+        end
+    end.
+
+encode_live_sse(EventName, Sequence, Data) ->
+    Json = jsx:encode(Data),
+    Id = case Sequence of
+        0 -> <<>>;
+        _ -> <<"id: ", (integer_to_binary(Sequence))/binary, "\n">>
+    end,
+    <<Id/binary, "event: ", EventName/binary,
+      "\ndata: ", Json/binary, "\n\n">>.
+
+public_live_event(Event) ->
+    Kind = adk_live_event:kind(Event),
+    Payload = case {Kind, maps:get(payload, Event)} of
+        {audio, Media} ->
+            #{<<"media_omitted">> => true,
+              <<"bytes">> => adk_live_media:bytes(Media),
+              <<"format">> => atom_binary(maps:get(format, Media)),
+              <<"sample_rate">> => maps:get(sample_rate, Media),
+              <<"channels">> => maps:get(channels, Media)};
+        {_Other, Value} ->
+            json_safe(
+              strip_live_private_fields(
+                adk_secret_redactor:redact(Value)))
+    end,
+    #{<<"schema_version">> => maps:get(schema_version, Event),
+      <<"kind">> => atom_binary(Kind),
+      <<"payload">> => Payload,
+      <<"sequence">> => maps:get(sequence, Event),
+      <<"turn_epoch">> => maps:get(turn_epoch, Event),
+      <<"generation_epoch">> => maps:get(generation_epoch, Event),
+      <<"timestamp">> => maps:get(timestamp, Event),
+      <<"durability">> => atom_binary(maps:get(durability, Event))}.
+
+%% Gemini thought signatures are opaque provider state required only when the
+%% server continues a tool/model turn.  They must never cross the developer UI
+%% boundary, even when nested below a content part or a tool payload.
+strip_live_private_fields(Value) when is_map(Value) ->
+    maps:fold(
+      fun(Key, Item, Acc) ->
+          case live_private_key(Key) of
+              true -> Acc;
+              false -> Acc#{Key => strip_live_private_fields(Item)}
+          end
+      end, #{}, Value);
+strip_live_private_fields(Value) when is_list(Value) ->
+    [strip_live_private_fields(Item) || Item <- Value];
+strip_live_private_fields(Value) -> Value.
+
+live_private_key(Key) ->
+    case live_key_binary(Key) of
+        {ok, Binary} when byte_size(Binary) =< 128 ->
+            Normalized = list_to_binary(
+                           [ascii_lower(Char)
+                            || <<Char>> <= Binary,
+                               not live_key_separator(Char)]),
+            Normalized =:= <<"thoughtsignature">>;
+        _ -> false
+    end.
+
+live_key_binary(Key) when is_binary(Key) -> {ok, Key};
+live_key_binary(Key) when is_atom(Key) ->
+    {ok, atom_to_binary(Key, utf8)};
+live_key_binary(Key) when is_list(Key) ->
+    try unicode:characters_to_binary(Key) of
+        Binary when is_binary(Binary) -> {ok, Binary};
+        _ -> error
+    catch
+        _:_ -> error
+    end;
+live_key_binary(_) -> error.
+
+ascii_lower(Char) when Char >= $A, Char =< $Z -> Char + 32;
+ascii_lower(Char) -> Char.
+
+live_key_separator($_) -> true;
+live_key_separator($-) -> true;
+live_key_separator($.) -> true;
+live_key_separator($\s) -> true;
+live_key_separator(_) -> false.
+
+with_live_session(Req0, State, Continue) ->
+    with_live_principal(
+      State, Req0,
+      fun(Principal, Req) ->
+          case validated_live_session_binding(Req, State) of
+              {error, Req1} -> {ok, Req1, State};
+              {ok, SessionId} ->
+                  Timeout = maps:get(diagnostic_timeout_ms, State),
+                  Limit = maps:get(max_session_results, State),
+                  case find_live_session(
+                         SessionId, Principal, Timeout, Limit) of
+                      {ok, Session, _Status} ->
+                          Continue(Session, Principal, Req);
+                      {error, not_found} ->
+                          not_found(
+                            <<"live_session_not_found">>, Req, State);
+                      {error, ambiguous} ->
+                          error_reply(
+                            409, <<"ambiguous_live_session">>,
+                            <<"More than one Live session has this identifier for the configured principal">>,
+                            #{}, Req, State);
+                      {error, lookup_limit} ->
+                          error_reply(
+                            503, <<"live_session_lookup_limit">>,
+                            <<"Live session lookup exceeded the configured bounded scan; increase max_session_results">>,
+                            #{}, Req, State);
+                      {error, unavailable} ->
+                          live_service_unavailable(Req, State)
+                  end
+          end
+      end).
+
+with_live_principal(State, Req, Continue) ->
+    case maps:get(live_principal, State, undefined) of
+        Principal when is_binary(Principal) -> Continue(Principal, Req);
+        undefined ->
+            error_reply(
+              503, <<"live_developer_access_unconfigured">>,
+              <<"Configure an exact live_principal for developer Live access">>,
+              #{}, Req, State)
+    end.
+
+validated_live_session_binding(Req, State) ->
+    SessionId = cowboy_req:binding(session_id, Req),
+    case valid_field(SessionId, maps:get(max_field_bytes, State)) of
+        true -> {ok, SessionId};
+        false ->
+            Req1 = error_req(
+                     400, <<"invalid_live_session_id">>,
+                     <<"Live session ID must be a non-empty UTF-8 string within configured limits">>,
+                     #{}, Req),
+            {error, Req1}
+    end.
+
+live_session_statuses(Principal, Timeout, Limit) ->
+    case live_children(Limit) of
+        {ok, Children, Truncated} ->
+            Results = parallel_live_statuses(
+                        Children, Principal, Timeout),
+            Statuses =
+                [Status || {_Pid, {ok, Status}} <- Results],
+            {ok, lists:sort(
+                   fun(A, B) -> maps:get(session_id, A) =<
+                                maps:get(session_id, B)
+                   end, Statuses), Truncated};
+        {error, _} -> {error, unavailable}
+    end.
+
+find_live_session(SessionId, Principal, Timeout, Limit) ->
+    case live_children(Limit) of
+        {ok, _Children, true} ->
+            %% A duplicate label may exist beyond the bounded window. Never
+            %% choose a process when exact uniqueness cannot be proven.
+            {error, lookup_limit};
+        {ok, Children, false} ->
+            Results = parallel_live_statuses(
+                        Children, Principal, Timeout),
+            Matches = [{Pid, Status}
+                       || {Pid, {ok, Status}} <- Results,
+                          maps:get(session_id, Status, undefined) =:=
+                              SessionId],
+            case Matches of
+                [{Pid, Status}] -> {ok, Pid, Status};
+                [] -> {error, not_found};
+                _ -> {error, ambiguous}
+            end;
+        {error, _} -> {error, unavailable}
+    end.
+
+parallel_live_statuses(Children, Principal, Timeout) ->
+    Parent = self(),
+    BatchRef = make_ref(),
+    Pending = lists:foldl(
+                fun(Pid, Acc) ->
+                    Worker = fun() ->
+                        Result = adk_live_session:status(
+                                   Pid, Principal, Timeout),
+                        Parent ! {BatchRef, self(), Pid, Result}
+                    end,
+                    Options = [monitor, {message_queue_data, off_heap},
+                               {max_heap_size,
+                                #{size => 100000, kill => true,
+                                  error_logger => false,
+                                  include_shared_binaries => true}}],
+                    {WorkerPid, Monitor} = spawn_opt(Worker, Options),
+                    Acc#{WorkerPid => #{monitor => Monitor,
+                                        target => Pid}}
+                end, #{}, Children),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    collect_live_statuses(BatchRef, Pending, Deadline, []).
+
+collect_live_statuses(_BatchRef, Pending, _Deadline, Acc)
+  when map_size(Pending) =:= 0 ->
+    lists:reverse(Acc);
+collect_live_statuses(BatchRef, Pending, Deadline, Acc) ->
+    Remaining = erlang:max(
+                  0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {BatchRef, WorkerPid, TargetPid, Result}
+          when is_map_key(WorkerPid, Pending) ->
+            Info = maps:get(WorkerPid, Pending),
+            Monitor = maps:get(monitor, Info),
+            erlang:demonitor(Monitor, [flush]),
+            collect_live_statuses(
+              BatchRef, maps:remove(WorkerPid, Pending), Deadline,
+              [{TargetPid, Result} | Acc]);
+        {'DOWN', _Monitor, process, _Pid, _Reason} ->
+            %% Monitor delivery can race the worker's ordinary result message.
+            %% Keep the bounded slot pending until that result arrives or the
+            %% single batch deadline expires.
+            collect_live_statuses(BatchRef, Pending, Deadline, Acc)
+    after Remaining ->
+        maps:foreach(
+          fun(Pid, Info) ->
+              exit(Pid, kill),
+              erlang:demonitor(maps:get(monitor, Info), [flush])
+          end, Pending),
+        lists:reverse(Acc)
+    end.
+
+live_children(Limit) ->
+    case whereis(adk_live_session_sup) of
+        undefined -> {error, unavailable};
+        _ ->
+            try supervisor:which_children(adk_live_session_sup) of
+                Children ->
+                    Pids = [Pid || {_Id, Pid, worker, _Modules} <- Children,
+                                   is_pid(Pid), is_process_alive(Pid)],
+                    Truncated = length(Pids) > Limit,
+                    {ok, lists:sublist(Pids, Limit), Truncated}
+            catch
+                _:_ -> {error, unavailable}
+            end
+    end.
+
+public_live_status(Status) ->
+    json_safe(adk_secret_redactor:redact(Status)).
+
+live_service_unavailable(Req, State) ->
+    error_reply(503, <<"live_service_unavailable">>,
+                <<"The Live session service is unavailable">>,
+                #{}, Req, State).
 
 %% ------------------------------------------------------------------
 %% v0.5 scoped resource diagnostics
@@ -2207,6 +2783,14 @@ error_req(Status, Code, Message, ExtraHeaders, Req) ->
 
 json_reply(Status, Body, ExtraHeaders, Req, State) ->
     Req1 = reply_req(Status, Body, ExtraHeaders, Req),
+    {ok, Req1, State}.
+
+binary_reply(Status, ContentType, Body, ExtraHeaders, Req, State)
+  when is_binary(ContentType), is_binary(Body) ->
+    Headers = maps:merge(
+                (security_headers())#{<<"content-type">> => ContentType},
+                ExtraHeaders),
+    Req1 = cowboy_req:reply(Status, Headers, Body, Req),
     {ok, Req1, State}.
 
 reply_req(Status, Body, ExtraHeaders, Req) ->

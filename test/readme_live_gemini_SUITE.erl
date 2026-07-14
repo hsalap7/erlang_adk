@@ -21,6 +21,7 @@
     runner_sync_async/1,
     human_approval/1,
     mnesia_runner/1,
+    llm_rubric_judge/1,
     callbacks_telemetry_and_eval/1,
     http_endpoint/1
 ]).
@@ -50,13 +51,14 @@ all() ->
      runner_sync_async,
      human_approval,
      mnesia_runner,
+     llm_rubric_judge,
      callbacks_telemetry_and_eval,
      http_endpoint].
 
 init_per_suite(Config) ->
-    case {os:getenv("ERLANG_ADK_LIVE_GEMINI"),
+    case {rest_tests_enabled(),
           os:getenv("GEMINI_API_KEY")} of
-        {"1", Key} when is_list(Key), Key =/= [] ->
+        {true, Key} when is_list(Key), Key =/= [] ->
             application:set_env(erlang_adk, a2a_enabled, false),
             application:set_env(erlang_adk, agent_call_timeout, ?TIMEOUT),
             application:set_env(erlang_adk, agent_turn_timeout, ?TIMEOUT),
@@ -68,10 +70,10 @@ init_per_suite(Config) ->
             ok = compile_example(readme_audit_callback),
             ok = start_rate_limiter(request_interval_ms()),
             [{model, ?MODEL} | Config];
-        {"1", _} ->
+        {true, _} ->
             {skip, "GEMINI_API_KEY is not available to the test process"};
         _ ->
-            {skip, "set ERLANG_ADK_LIVE_GEMINI=1 to run paid live tests"}
+            {skip, "set ERLANG_ADK_GEMINI_REST=1 to run paid REST tests"}
     end.
 
 end_per_suite(_Config) ->
@@ -156,6 +158,9 @@ google_search_grounding(_Config) ->
             ok;
         {error, Reason} ->
             ct:fail({google_search_grounding, Reason});
+        not_provider_result when element(1, Result) =:= error ->
+            {error, Reason} = Result,
+            ct:fail({google_search_grounding, Reason});
         not_provider_result ->
             ct:fail({google_search_not_used, Result})
     end.
@@ -203,8 +208,7 @@ multimodal_content(_Config) ->
                                Self ! {live_content_delta, Delta}
                            end)
                      end, 0),
-    assert(StreamResult =:= ok,
-           {unexpected_multimodal_stream_result, StreamResult}),
+    ok = expect_streamed(StreamResult, multimodal_stream),
     Deltas = collect_content_deltas([]),
     assert(Deltas =/= [], no_multimodal_stream_deltas),
     lists:foreach(
@@ -407,7 +411,7 @@ streaming(_Config) ->
                [#{role => user,
                   content => <<"Reply with a short greeting from Erlang.">>}],
                [], Callback),
-    assert(Result =:= ok, {unexpected_stream_result, Result}),
+    ok = expect_streamed(Result, text_stream),
     Chunks = collect_chunks([]),
     assert(Chunks =/= [], no_stream_chunks),
     Combined = iolist_to_binary(Chunks),
@@ -638,6 +642,39 @@ mnesia_runner(_Config) ->
         _ = erlang_adk_session_mnesia:delete_session(App, User, Session)
     end.
 
+llm_rubric_judge(_Config) ->
+    EvalInput =
+        #{<<"eval_case">> =>
+              #{<<"id">> => <<"paid-rubric-case">>,
+                <<"expected_final_response">> => <<"ERLANG">>},
+          <<"turns">> =>
+              [#{<<"turn_id">> => <<"turn-1">>,
+                 <<"actual">> => <<"ERLANG">>}],
+          <<"trajectory">> => [],
+          <<"context">> => #{}},
+    JudgeConfig =
+        #{rubric =>
+              <<"Score 1 when the actual final response is exactly ERLANG; "
+                "otherwise score 0.">>,
+          rubric_id => <<"exact-erlang">>,
+          rubric_version => <<"1">>,
+          provider => ?MODULE,
+          model => ?MODEL,
+          request_timeout_ms => 60000,
+          max_output_tokens => 256},
+    case adk_eval_llm_judge:score_case(EvalInput, JudgeConfig) of
+        {ok, Score, Metadata} when Score >= 0.8 ->
+            assert(maps:get(<<"model">>, Metadata) =:= ?MODEL,
+                   {invalid_judge_model_metadata, Metadata}),
+            assert(maps:get(<<"rubric_version">>, Metadata) =:= <<"1">>,
+                   {invalid_judge_rubric_metadata, Metadata}),
+            ok;
+        {ok, Score, Metadata} ->
+            ct:fail({llm_rubric_judge_failed, Score, Metadata});
+        {error, Reason} ->
+            ct:fail({llm_rubric_judge_error, Reason})
+    end.
+
 callbacks_telemetry_and_eval(_Config) ->
     Name = unique(<<"LiveCallbackEvalAgent">>),
     HandlerId = unique(<<"live-telemetry-handler">>),
@@ -661,7 +698,15 @@ callbacks_telemetry_and_eval(_Config) ->
         receive {before_model, _ToolCount} -> ok
         after ?TIMEOUT -> ct:fail(before_model_callback_missing)
         end,
-        receive {after_model, {ok, _ProviderText}} -> ok
+        receive
+            {after_model, CallbackResult} ->
+                case provider_outcome(CallbackResult) of
+                    {ok, _ProviderText} -> ok;
+                    OtherCallbackOutcome ->
+                        ct:fail(
+                          {unexpected_after_model_callback,
+                           OtherCallbackOutcome})
+                end
         after ?TIMEOUT -> ct:fail(after_model_callback_missing)
         end,
         receive
@@ -757,7 +802,7 @@ retryable_rate_limit(
 retryable_rate_limit(_) -> false.
 
 request_interval_ms() ->
-    case os:getenv("ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS") of
+    case rest_interval_env() of
         false ->
             ?DEFAULT_REQUEST_INTERVAL_MS;
         Value ->
@@ -768,6 +813,16 @@ request_interval_ms() ->
                       {invalid_live_gemini_interval_ms, Value,
                        "expected a non-negative integer"})
             end
+    end.
+
+rest_tests_enabled() ->
+    os:getenv("ERLANG_ADK_GEMINI_REST") =:= "1"
+    orelse os:getenv("ERLANG_ADK_LIVE_GEMINI") =:= "1".
+
+rest_interval_env() ->
+    case os:getenv("ERLANG_ADK_GEMINI_REST_INTERVAL_MS") of
+        false -> os:getenv("ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS");
+        Value -> Value
     end.
 
 start_rate_limiter(Interval) ->
@@ -828,9 +883,13 @@ constant_agent(Prefix, Token) ->
     erlang_adk:spawn_agent(
       Name, (provider_config())#{instructions => Instructions}, []).
 
-expect_text({ok, Text}, _Label) -> Text;
-expect_text({error, Reason}, Label) -> ct:fail({Label, Reason});
-expect_text(Other, Label) -> ct:fail({Label, unexpected_result, Other}).
+expect_text(Result, Label) ->
+    expect_text_outcome(provider_outcome(Result), Label).
+
+expect_text_outcome({ok, Text}, _Label) -> Text;
+expect_text_outcome({error, Reason}, Label) -> ct:fail({Label, Reason});
+expect_text_outcome(Other, Label) ->
+    ct:fail({Label, unexpected_result, Other}).
 
 nonempty_text(Text) when is_binary(Text) ->
     byte_size(string:trim(Text)) > 0;
@@ -839,9 +898,12 @@ nonempty_text(Text) when is_list(Text) ->
 nonempty_text(_) ->
     false.
 
-assert_thinking_response({ok, Text}) when is_binary(Text); is_list(Text) ->
+assert_thinking_response(Result) ->
+    assert_thinking_outcome(provider_outcome(Result)).
+
+assert_thinking_outcome({ok, Text}) when is_binary(Text); is_list(Text) ->
     assert(nonempty_text(Text), {empty_thinking_response, Text});
-assert_thinking_response({ok, Content}) when is_map(Content) ->
+assert_thinking_outcome({ok, Content}) when is_map(Content) ->
     assert(adk_content:validate(Content) =:= {ok, Content},
            {invalid_thinking_content, Content}),
     Visible = [Text || #{<<"type">> := <<"text">>,
@@ -850,10 +912,25 @@ assert_thinking_response({ok, Content}) when is_map(Content) ->
                       maps:get(<<"thought">>, Part, false) =/= true],
     assert(Visible =/= [] andalso nonempty_text(iolist_to_binary(Visible)),
            {missing_visible_thinking_answer, Content});
-assert_thinking_response({error, Reason}) ->
+assert_thinking_outcome({error, Reason}) ->
     ct:fail({thinking_configuration, Reason});
-assert_thinking_response(Other) ->
+assert_thinking_outcome(Other) ->
     ct:fail({thinking_configuration, unexpected_result, Other}).
+
+provider_outcome(Result) ->
+    case adk_provider_result:decode(Result) of
+        {ok, Outcome, _Metadata} -> Outcome;
+        {error, Reason} -> {error, Reason};
+        not_provider_result -> Result
+    end.
+
+expect_streamed(Result, _Label) when Result =:= ok -> ok;
+expect_streamed(Result, Label) ->
+    case provider_outcome(Result) of
+        streamed -> ok;
+        {error, Reason} -> ct:fail({Label, Reason});
+        Other -> ct:fail({Label, unexpected_stream_result, Other})
+    end.
 
 collect_chunks(Acc) ->
     receive

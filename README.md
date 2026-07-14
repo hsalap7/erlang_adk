@@ -1,17 +1,16 @@
-# Erlang ADK v0.6.0 (development)
+# Erlang ADK v0.7.0 (development)
 
 Erlang ADK is an experimental, Erlang-native toolkit for building Gemini-backed agents with OTP processes, supervision, tools, sessions, event streams, and concurrent multi-agent workflows.
 
-Version 0.6.0 is under active development on the `version_0.6.0` branch. The
-[v0.6.0 development contract](docs/VERSION_0_6_0.md) tracks its focus on
-authentication, interoperable protocol boundaries, and a production-capable
-Phoenix UI. It builds on the completed 0.5.0 artifact, memory, and context
-work. The final v0.6 deterministic gate passes 899 EUnit tests, six Common
-Test scenarios, and warning-free Dialyzer over 170 project files. Escript
-packaging, `adk doctor`, checked config validation, the focused README/stress
-gates, and the Phoenix production build also pass. The billable Gemini suite
-remains a separate opt-in provider gate in a shell that owns
-`GEMINI_API_KEY`.
+Version 0.7.0 is under active development on the `version_0.7.0` branch. The
+[v0.7.0 development contract](docs/VERSION_0_7_0.md) tracks its focus on
+multimodal and Gemini Live sessions, Runner-global plugins, evaluation, and
+expanded observability. It builds on the completed v0.6 authentication,
+protocol, and production-Phoenix work. The final v0.6 deterministic baseline
+passed 899 EUnit tests, six Common Test scenarios, and warning-free Dialyzer
+over 170 project files; v0.7 release evidence will be recorded separately as
+its new contracts land. Billable REST and Live Gemini suites remain explicit
+opt-in provider gates in a shell that owns `GEMINI_API_KEY`.
 
 The detailed [ADK behavior-parity matrix](docs/FEATURE_PARITY.md) maps the
 official ADK capability families to their Erlang/OTP-native implementation
@@ -28,9 +27,9 @@ BEAM concurrency without making one conversation nondeterministic.
 
 ## Current scope
 
-| Area | Status on the v0.6.0 branch |
+| Area | Status on the v0.7.0 branch |
 | --- | --- |
-| Gemini text, versioned multimodal content, function calling, Google Search grounding, thinking levels/summaries, adjustable safety settings, thought signatures, call IDs, SSE text/content streaming, structured-output settings, and provider capability discovery | Implemented on this branch; the bidirectional Gemini Live WebSocket API is not implemented |
+| Gemini REST and Live | REST text, versioned multimodal content, function calling, Google Search grounding, thinking levels/summaries, adjustable safety settings, thought signatures, call IDs, SSE text/content streaming, structured-output settings, and provider capability discovery are implemented with `gemini-3.1-flash-lite`. A separately supervised, bidirectional Gemini Live WebSocket runtime is implemented for `gemini-3.1-flash-live-preview`, including text/audio/image input, audio output, transcription, interruption, resumption, bounded backpressure, and explicitly allowlisted tools. Live sessions and media are intentionally not represented as REST SSE runs. |
 | Erlang tools and agents exposed as model tools | Compiled schemas, strict arguments, collision checks, isolated AgentTool calls, and Runner boolean confirmation are implemented; direct/workflow confirmation fails closed because those surfaces have no approval continuation |
 | Supervised sequential, bounded parallel, loop, transfer, and graph workflows with deadlines, budgets, cancellation, checkpoints, and resume | Output propagation, explicit stop, schemas, action retry/timeout, graph/fork/sequential nested resume, and legacy helpers are implemented; nested pauses in top-level parallel branches, loop bodies, and transfer members are not resumable |
 | Provider-neutral explicit planning and Gemini model-native thinking | Versioned JSON-safe plans, trusted planner/executor adapters, bounded replanning, monitored callbacks, owner-bound cancellation, and Gemini thinking levels/summaries are implemented; model-generated source is never executed |
@@ -40,28 +39,28 @@ BEAM concurrency without making one conversation nondeterministic.
 | Ambient/background invocation | Supervised local/event and fixed-delay schedule triggers use bounded concurrency, bounded queues, idempotency, deadlines, retry, stable status/await/cancel, and explicit per-event/shared/session-supplied policies; Pub/Sub/Eventarc remain application adapters |
 | Bounded supervised tasks and serial/parallel-safe tool execution | Implemented for compiled Erlang/OpenAPI/MCP catalogs in direct agents and Runner; descriptors are immutable snapshots and running agents do not support live catalog swap |
 | Admission control and runtime policy | Supervised global/per-agent limits, monitored reject/bounded-FIFO queue policies, fail-closed agent/tool allow-deny rules, byte budgets, and immutable denial audit events are implemented on this branch |
-| Agent/model/tool callbacks and Runner-global plugins | Ordered Runner plugins, bounded failure policy, intervention, and existing local callbacks are implemented on this branch; see lifecycle notes below |
-| Observability | Correlated invocation/model/tool telemetry, JSON-safe envelopes, bounded exporters, and opt-in content capture are implemented on this branch |
-| Evaluation | Legacy lightweight evaluation plus versioned multi-turn eval sets, captured tool trajectories, metric/judge adapters, thresholds, and saved-result metadata are implemented on this branch |
+| Agent/model/tool callbacks and Runner-global plugins | Ordered Runner plugins, explicit amend-versus-early-return behavior, phase-specific error notification, bounded stateful plugin actors, built-in global-instruction/context-filter/reflect-retry/metadata plugins, and existing local callbacks are implemented; see lifecycle notes below |
+| Observability | Actual model/tool/Live operation spans, strict W3C Trace Context, a pinned metadata-only GenAI semantic mapping, bounded low-cardinality metrics, synchronous or supervised asynchronous delivery, and OTLP/HTTP JSON export are implemented. Prompt, response, media, arguments, and results remain excluded by default. |
+| Evaluation | Legacy lightweight evaluation remains. Eval-set/result schema v2 adds full-case response and trajectory criteria, an explicit bounded Gemini rubric judge, repeat sampling, isolated per-case agent lifecycle, strict accounting, baseline comparison, stable JSON/Markdown reports, and `adk eval run` CI exit semantics. |
 | OpenAPI | Strict OpenAPI 3.0/3.1 compiler, production Gun transport, per-principal auth broker, and first-class agent/Runner toolsets are implemented; the supported subset is documented below |
 | MCP | Supervised stdio and MCP 2025-11-25 Streamable HTTP clients plus a bounded tool/resource/prompt server are implemented and release-gated; optional server GET/SSE and advanced capabilities remain explicit limitations |
 | A2A interoperability | A2A 1.0 Agent Card plus bounded JSON-RPC/SSE tasks, artifacts, replay, principal scoping, and outbound client are implemented; the older `/a2a/prompt` endpoint remains explicitly legacy |
 | Versioned artifacts | Partial 0.5 implementation: strict app/user/session scopes, immutable ETS/filesystem versions, quotas, paginated metadata, deadline-aware mutations, least-authority tool helpers, metadata-only event effects, one-request model-selected attachment, filesystem repair, exact-scope developer inspection/delete, and an opt-in bounded exact-scope sharded adapter are implemented; direct adapters serialize per service while sharded workers preserve same-scope ordering and let unrelated scopes overlap; durable lifetime scope/name/version admission fails explicitly before bounded scans can be exhausted; credit-based blob streaming and complete durable orphan recovery remain open |
 | Scoped long-term memory | Partial 0.5 implementation: the v2 app/user-scoped contract, bounded lexical ETS and durable local Mnesia adapters, provenance/idempotency, preload and model-selected retrieval, entry/session/user erasure, deadline-aware calls, fail-closed Mnesia-outbox admission, developer search/erase, and an opt-in bounded exact-user sharded adapter are implemented; durable delivery uses bounded resolution and a freshly revalidated ownership lease immediately before an idempotent at-least-once mutation; direct lexical adapters serialize per service while sharded workers overlap unrelated users; managed vector search, pending-job erasure coordination, and policy-driven retention remain adapters or application policy |
 | Context selection, compaction, and caching | Partial 0.5 implementation: mandatory model-boundary sanitization, complete-envelope budgets, O(n) exchange-aware selection, owner-bound compression, context fingerprints, opt-in Runner compaction with atomic ETS/Mnesia checkpoint persistence, a provider-prefix-cache lifecycle, and deterministic Gemini create/reuse/bypass/generate/stream wiring are implemented; cache installation synchronously rechecks every absolute waiter deadline and deletes an orphan provider resource when no live waiter remains; caching is request-prefix reuse rather than response caching, and billable live Gemini cache evidence remains a separate gate |
-| Auth and integrated developer tooling | Immutable provider profiles, bounded single-flight OAuth tokens, supervised authorization-code + S256 PKCE, strict OIDC/JWT policy, default-deny operation scopes, issuer-bound run ownership, and loopback-only `/dev` tooling are implemented. `/dev` remains local single-operator administration, not an end-user API; durable encrypted secret storage and IdP revocation/back-channel logout remain deployment adapters. |
-| Phoenix LiveView companion | A checked-in Phoenix 1.8/LiveView application uses OIDC code+PKCE, opaque server-side login/session state, the default-deny Erlang gateway, bounded credit/ack event rendering, reconnect/cancel, and fail-closed typed HITL. It is an optional same-BEAM production companion, not a core Erlang dependency. |
+| Auth and integrated developer tooling | Immutable provider profiles, bounded single-flight OAuth tokens, supervised authorization-code + S256 PKCE, strict OIDC/JWT policy, default-deny operation scopes, issuer-bound run ownership, and loopback-only `/dev` tooling are implemented. v0.7 adds authenticated Live status/text/SSE, evaluation render/compare, and observability snapshots; the CLI adds Live/observability controls and `eval run`. `/dev` remains local single-operator administration, not an end-user API. |
+| Phoenix LiveView companion | The checked Phoenix 1.8/LiveView application uses OIDC code+PKCE and opaque server-side state. Its server-owned, exact-scope gateways cover stable runs and v0.7 Live/evaluation/observability views with bounded projections; it is an optional same-BEAM production companion, not a core Erlang dependency. Live media is metadata-only in the checked UI and Live reconnect never claims replay. |
 
 ## Installation
 
-While 0.6.0 is being developed, depend on this branch (or use a local path in
+While 0.7.0 is being developed, depend on this branch (or use a local path in
 the same way):
 
 ```erlang
 {deps, [
     {erlang_adk,
      {git, "https://github.com/hsalap7/erlang_adk.git",
-      {branch, "version_0.6.0"}}}
+      {branch, "version_0.7.0"}}}
 ]}.
 ```
 
@@ -352,10 +351,11 @@ the root of a new tree. Resolution remains bounded and secret-scrubbed; agent
 configuration is never mutated.
 
 Google's Python ADK currently marks its direct `global_instruction` field as
-deprecated in favor of `GlobalInstructionPlugin`. Erlang ADK 0.5.0 keeps the
-explicit root field while providing the same tree-wide behavior through
-message-passed invocation context; an app-level instruction plugin can be
-added later without changing this contract.
+deprecated in favor of `GlobalInstructionPlugin`. Erlang ADK retains the
+explicit root field for tree-scoped compatibility and provides
+`adk_plugin_global_instruction` for ordered Runner-wide policy. The plugin
+amends the checked model request through the normal v0.7 plugin pipeline; it
+does not mutate agent configuration or replace the root/delegation contract.
 
 `history_policy => exclude` removes earlier turns but always retains the
 current input. A schema failure is returned before provider execution or state
@@ -411,7 +411,7 @@ runtime validation contract.
 An `adk_toolset` descriptor is an immutable catalog snapshot. `schemas/1` and
 resolution reuse its compiled contracts; `refresh/1` deliberately returns a
 replacement descriptor for a mutable MCP/OpenAPI backend. A running agent has
-no live catalog-swap API in 0.5.0, so new remote tools require a refreshed
+no live catalog-swap API, so new remote tools require a refreshed
 descriptor and replacement agent. A removed or changed operation fails closed
 as `tool_catalog_changed` instead of executing against a stale declaration.
 Trusted local Erlang tool contexts carry private bounded agent ancestry so an
@@ -1478,7 +1478,7 @@ is a digest and contains no raw arguments. Non-Runner agent execution
 and typed workflow tool actions have no durable approval channel, so a required
 confirmation fails closed as `tool_confirmation_requires_runner`; they never
 silently execute. Structured “modify arguments” confirmation responses are
-not supported in 0.5.0.
+not supported.
 
 `adk_long_running_tool` uses the distinct long-running suspension contract. A
 pause is not an error; resume records a matching function response with the
@@ -1793,8 +1793,203 @@ ok = adk_llm_gemini:stream_content(
 `stream_content/4` invokes the callback once per decoded provider frame; it
 does not append a second buffered final content value. Gemini Live's
 bidirectional WebSocket lifecycle (audio/video input, interruption, session
-resumption, and backpressure) is a separate protocol and is explicitly
-unsupported in v0.5.0 rather than being simulated through REST SSE.
+resumption, and backpressure) is a separate protocol; use the Live runtime
+below rather than treating REST SSE as a bidirectional session.
+
+## Gemini Live
+
+Gemini Live sessions run as independent, server-owned `gen_statem` processes
+under `adk_live_session_sup`. The process that starts a session does not own
+its lifetime. Every operation must present the exact opaque `Principal` used
+at startup; only its SHA-256 digest enters long-lived session state.
+
+Live deliberately uses the explicit preview model
+`gemini-3.1-flash-live-preview`. The REST default remains
+`gemini-3.1-flash-lite`; a REST model is rejected by the Live provider instead
+of silently falling back. The Gemini 3.1 Live model produces native AUDIO, so
+the setup requests `[audio]` and `output_audio_transcription => true` supplies
+displayable text alongside the audio stream.
+
+The checked Live config also supports bounded system instructions, voice
+selection, input transcription, thinking configuration, media resolution,
+context-window compression, session resumption, function declarations, and
+the provider `google_search` declaration. Usage, grounding, GoAway, and
+resumption updates arrive as structural events. Proactive/affective audio,
+structured output, REST context caching, and arbitrary older Live options are
+rejected rather than silently ignored.
+
+From `./rebar3 shell`, start a future-only subscription before waiting for the
+ready event:
+
+```erlang
+ApiKeyString = os:getenv("GEMINI_API_KEY"),
+true = is_list(ApiKeyString),
+ApiKey = unicode:characters_to_binary(ApiKeyString),
+LivePrincipal = <<"readme-live-user">>,
+LiveSessionId = <<"readme-live-session">>,
+LiveConfig =
+    #{provider => adk_live_gemini,
+      provider_config =>
+          #{model => <<"gemini-3.1-flash-live-preview">>,
+            response_modalities => [audio],
+            output_audio_transcription => true,
+            automatic_activity_detection => true,
+            session_resumption => true},
+      transport => adk_live_gun_transport,
+      transport_opts => #{api_key => ApiKey},
+      max_ingress_messages => 64,
+      max_ingress_bytes => 4194304,
+      max_subscribers => 64,
+      max_subscriber_messages => 128,
+      max_subscriber_bytes => 8388608},
+{ok, LiveSession} = erlang_adk:start_live_session(
+    LiveSessionId, LivePrincipal, LiveConfig),
+{ok, _LiveSubscription} = erlang_adk:live_subscribe(
+    LiveSession, LivePrincipal, #{messages => 16, bytes => 4194304}),
+ReceiveLive =
+    fun Loop(Matches) ->
+        receive
+            {adk_live_event, LiveSessionId, Sequence, Event} ->
+                ok = erlang_adk:live_ack(
+                    LiveSession, LivePrincipal, Sequence),
+                case Matches(Event) of
+                    true -> {ok, Event};
+                    false -> Loop(Matches)
+                end;
+            {adk_live_subscriber_dropped, LiveSessionId, DropReason} ->
+                {error, {subscriber_dropped, DropReason}}
+        after 30000 ->
+            {error, live_event_timeout}
+        end
+    end,
+{ok, _ReadyEvent} = ReceiveLive(
+    fun(Event) -> adk_live_event:kind(Event) =:= ready end),
+{ok, _InputSequence} = erlang_adk:live_send_text(
+    LiveSession, LivePrincipal, <<"Explain OTP in one sentence.">>),
+CollectTranscript =
+    fun Loop(Acc) ->
+        receive
+            {adk_live_event, LiveSessionId, Sequence, Event} ->
+                ok = erlang_adk:live_ack(
+                    LiveSession, LivePrincipal, Sequence),
+                case adk_live_event:kind(Event) of
+                    output_transcription ->
+                        #{text := Chunk} = maps:get(payload, Event),
+                        Loop(<<Acc/binary, Chunk/binary>>);
+                    turn_complete ->
+                        {ok, Acc};
+                    error ->
+                        {error, {live_error, maps:get(payload, Event)}};
+                    terminal ->
+                        {error, {live_terminal, maps:get(payload, Event)}};
+                    _ ->
+                        Loop(Acc)
+                end;
+            {adk_live_subscriber_dropped, LiveSessionId, DropReason} ->
+                {error, {subscriber_dropped, DropReason}}
+        after 120000 ->
+            {error, live_turn_timeout}
+        end
+    end,
+{ok, Transcript} = CollectTranscript(<<>>),
+true = byte_size(string:trim(Transcript)) > 0,
+io:format("~ts~n", [Transcript]),
+ok = erlang_adk:live_unsubscribe(LiveSession, LivePrincipal),
+ok = erlang_adk:close_live_session(
+    LiveSession, LivePrincipal, normal).
+```
+
+`max_subscribers` defaults to 64 and has a hard implementation maximum of
+4096. Admission beyond the configured per-session limit returns
+`{error, subscriber_limit}`. Explicit unsubscribe, slow-subscriber removal,
+or subscriber-process death releases the slot; each admitted subscriber still
+has its own independent message/byte credit window and acknowledgement state.
+The supervisor-wide application environment setting `live_session_limit`
+defaults to 1024 and accepts values only from 1 through 16384. Concurrent
+session creation is serialized around a constant-time supervisor count, so an
+over-cap start returns `{error, live_session_limit}` without first enumerating
+an unbounded child set. Change this setting before application startup.
+
+The production transport is intentionally fixed to
+`wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`;
+only the API-key query value is added at runtime. TLS peer and hostname
+verification cannot be disabled. If the host runtime cannot discover an OS CA
+store, point it at a trusted bundle with
+`transport_opts => #{api_key => ApiKey, cacertfile => <<"/path/to/ca-bundle.pem">>}`.
+The transport never falls back to `verify_none`.
+
+Live PCM input is signed 16-bit little-endian mono at 16 kHz. Gemini audio
+events are signed 16-bit little-endian mono at 24 kHz. Keep those raw binaries
+off ordinary session/event persistence; Live audio events are explicitly
+ephemeral. JPEG and PNG video frames use the same bounded input queue. The
+v1beta codec emits the current `realtimeInput.audio` and
+`realtimeInput.video` fields, not the superseded `mediaChunks` shape:
+
+```erlang
+{ok, AudioChunk} = adk_live_media:audio_pcm(Pcm16KhzS16le, 16000, 1),
+{ok, _} = erlang_adk:live_send_audio(
+    LiveSession, LivePrincipal, AudioChunk),
+{ok, VideoFrame} = adk_live_media:video_frame(jpeg, JpegBytes),
+{ok, _} = erlang_adk:live_send_video_frame(
+    LiveSession, LivePrincipal, VideoFrame).
+```
+
+With automatic activity detection disabled, bracket audio with
+`live_activity_start/2` and `live_activity_end/2`; use
+`live_audio_stream_end/2` only when the input stream itself has ended.
+Interruption, generation completion, and turn completion are distinct events.
+An interruption purges queued output audio from that generation.
+
+Function calling is opt-in. Declaring a provider tool does not authorize its
+execution. To run it automatically, configure a trusted
+`adk_live_tool_executor` module, an exact non-empty allowlist, and either a
+sequential or bounded concurrent policy. The repository example delegates
+only `get_weather` to the already checked weather tool:
+
+```erlang
+{ok, readme_weather_tool} =
+    c("examples/readme_weather_tool.erl"),
+{ok, readme_live_weather_executor} =
+    c("examples/readme_live_weather_executor.erl"),
+WeatherDeclaration =
+    #{type => function,
+      name => <<"get_weather">>,
+      description => <<"Return weather for one city">>,
+      parameters =>
+          #{<<"type">> => <<"object">>,
+            <<"properties">> =>
+                #{<<"city">> => #{<<"type">> => <<"string">>}},
+            <<"required">> => [<<"city">>],
+            <<"additionalProperties">> => false}},
+LiveToolConfig =
+    LiveConfig#{
+      provider_config =>
+          (maps:get(provider_config, LiveConfig))#{
+            tools => [WeatherDeclaration]},
+      tool_execution =>
+          #{enabled => true,
+            executor => readme_live_weather_executor,
+            policy => sequential,
+            allowed_tools => [<<"get_weather">>],
+            options => #{}}}.
+```
+
+Without `tool_execution`, the application receives a `tool_call` event and
+must explicitly return the correlated result with
+`live_send_tool_response/5`. Tool calls are never discovered from an ordinary
+agent catalog and are never executed merely because the model named them.
+
+Resumption uses only the newest provider handle. On disconnect, unsent text,
+audio, video, and tool responses are dropped and reported; they are never
+replayed because the remote side might already have applied them. Subscriber
+delivery is also future-only: credit/ack bounds memory while connected, but a
+new subscriber or `Last-Event-ID` does not replay prior Live media/events.
+GoAway initiates a bounded proactive resume when the provider supplied a
+usable handle. Applications must tolerate a terminal session when no safe
+resume is available. Deterministic tests cover the codec, session state
+machine, transport validation, and endpoint construction, while the paid
+suite covers the real verified-TLS Google connection. A separate local,
+CA-controlled WebSocket TLS integration harness is not included yet.
 
 To put that structured stream through sessions, plugins, stable run replay,
 and cancellation, select content streaming on the Runner:
@@ -2031,7 +2226,8 @@ failure isolation.
 Plugins are ordered, Runner-global lifecycle policy. They follow the same
 observable ordering as [Google ADK plugins](https://adk.dev/plugins/) while
 using a bounded BEAM worker for every hook: global plugin hooks run before the
-corresponding agent callback, and an intervention skips that local callback.
+corresponding agent callback; an amendment flows into it, while an early
+return or halt skips it.
 Direct `erlang_adk:prompt/2` calls continue to use agent-local callbacks only.
 
 The repository includes the observer and exporter used below. From
@@ -2088,78 +2284,337 @@ ok = erlang_adk:stop_agent(ObservedAgent).
 ```
 
 A plugin implements any subset of `adk_plugin`'s `on_user_message`,
-run/agent/model/tool before/after/error, `on_event`, and `on_error` hooks.
-`mode => observe` may only return `observe`; `mode => intervene` may return
-`{replace, Value}` or `{halt, Reason}`. Descriptors are compiled once in list
-order. Duplicate IDs, unavailable modules, invalid limits, and unknown modes
-are rejected by `adk_runner:new/4`. Each callback has a monitored timeout and
-heap limit; `failure_policy => open` records a structural failure and proceeds,
-while `closed` stops the run. Hook contexts are immutable, secret-pruned maps
-with binary keys. Event interventions cannot alter identity, state/actions,
-continuations, finality, or already-validated final content.
+run/agent/model/tool before/after hooks, `on_event`, `on_model_error`,
+`on_tool_error`, `on_agent_error`, and `on_run_error`. The older `on_error`
+hook remains a compatibility fallback for phase-specific notifications.
+
+Descriptors are compiled once in list order. An observation plugin may return
+only `observe`, `continue`, or `ok`. An intervention plugin has three distinct
+control results:
+
+- `{amend, Value}` validates the amended value and continues with later
+  plugins and the local callback;
+- `{return, Value}` returns immediately, skips later plugins and the local
+  callback, and is the behavior of the compatibility alias `{replace, Value}`;
+- `{halt, Reason}` stops with a redacted structural failure.
+
+An early return is therefore not an amendment. `on_model_error` and
+`on_tool_error` can recover their phase through the normal intervention
+results. `on_agent_error`, `on_run_error`, and success-only `after_run` are
+best-effort notifications, so their intervention results are ignored.
+Duplicate IDs, unavailable modules, invalid limits, and unknown modes are
+rejected by `adk_runner:new/4`. Every callback has a
+monitored timeout, heap limit, result-byte limit, owner monitor, and late-reply
+suppression. `failure_policy => open` records a structural failure and
+proceeds; `closed` stops the run. Hook contexts are immutable, secret-pruned
+maps. Event amendments cannot alter identity, state/actions, continuations,
+finality, or already-validated final content.
+
+A compiled pipeline accepts at most 128 plugins; IDs are non-empty binaries of
+at most 256 bytes. Descriptor timeouts are capped at 120 seconds, callback
+heaps at 10,000,000 words, and callback results/configuration at 1 MiB each.
+These are hard validation bounds, not suggested operational defaults.
+
+The built-in plugins are ordinary descriptors and remain explicit policy:
+
+- `adk_plugin_global_instruction` amends the model request with a bounded
+  global instruction;
+- `adk_plugin_context_filter` applies deterministic role/message filtering;
+- `adk_plugin_reflect_retry` converts a bounded tool failure into model-visible
+  retry guidance without exposing the raw failure;
+- `adk_plugin_metadata_logger` emits content-free lifecycle metadata.
+
+Use `mode => intervene` for the first three because they can amend or return a
+phase value, and `mode => observe` for the metadata logger. For example, a
+global-instruction descriptor uses
+`#{id => <<"global-policy">>, module => adk_plugin_global_instruction, mode => intervene, failure_policy => closed, config => #{instruction => <<"Answer concisely.">>, position => prepend}}`.
+
+Stateful plugins use one supervised actor per configured instance. Calls are
+serialized, queued under a fixed cap, and executed in deadline/heap-bounded
+workers against an immutable state snapshot. State commits only when the
+owner remains alive and the callback completed before its deadline:
+
+```erlang
+{ok, readme_stateful_counter_plugin} =
+    c("examples/readme_stateful_counter_plugin.erl"),
+{ok, CounterInstance} = adk_plugin_runtime_sup:start_instance(
+    #{id => <<"readme-counter">>,
+      module => readme_stateful_counter_plugin,
+      config => #{notify => self()},
+      max_queue => 32,
+      max_heap_words => 100000,
+      max_state_bytes => 4096}),
+StatefulPlugin =
+    #{id => <<"stateful-counter">>,
+      module => adk_plugin_stateful_adapter,
+      mode => observe,
+      failure_policy => closed,
+      timeout_ms => 1000,
+      max_heap_words => 100000,
+      config => #{instance => CounterInstance, timeout_ms => 800}},
+{ok, StatefulPipeline} = adk_plugin_pipeline:compile([StatefulPlugin]),
+{continue, #{}, _StatefulTrace} = adk_plugin_pipeline:run(
+    StatefulPipeline, before_run, #{}, #{}),
+receive
+    {stateful_before_run, 1} -> ok
+after 1000 ->
+    erlang:error(stateful_plugin_timeout)
+end,
+ok = adk_plugin_runtime_sup:stop_instance(CounterInstance).
+```
+
+The returned PID is the instance identity. Its supervisor child is deliberately
+`temporary`: an unexpected crash makes that identity unavailable instead of
+silently restarting with empty state behind a stale PID. Initialization itself
+runs in a separately monitored timeout/heap-bounded worker. Applications that
+need restart or durable state must recreate the instance explicitly or supply a
+persistent plugin-state adapter.
+
+Stateful instance IDs/configuration are capped at 256 bytes/1 MiB; queue,
+worker-heap, state, initialization-timeout, and invocation-timeout values have
+hard maxima of 4096 entries, 10,000,000 words, 64 MiB, 30 seconds, and 120
+seconds respectively. A callback completion queued before an owner-monitor
+`DOWN` is still discarded when that owner has already died; owner liveness is
+part of the state-commit condition, not only a condition for sending a reply.
 
 Runner observability is metadata-only by default. Set `observability =>
-disabled` to turn it off. Envelopes and `telemetry` events share trace, span,
-run, invocation, session, agent, model, tool, and call IDs. Prompt, response,
-tool argument, and tool result content is excluded unless
-`capture_content => true`; secret-bearing fields are still pruned. Opaque BEAM
-terms degrade to a metadata-only `capture_error` diagnostic instead of
-breaking the invocation. Exporters implement `adk_observability_exporter` and
-receive JSON-safe, schema-versioned maps in bounded workers.
+disabled` to turn it off. Legacy lifecycle envelopes and `telemetry` events
+share trace, span, run, invocation, session, agent, model, tool, and call IDs;
+schema-v2 operation spans add Unix-nanosecond timestamps and monotonic
+durations at the actual model/tool/Live boundary. The pinned
+`adk_genai_semconv:mapping_version/0` identifies the Development GenAI mapping
+used by this release.
+
+Prompt, response, media, tool arguments, and tool results are excluded by
+default. `capture_content => true` applies only to the legacy envelope path;
+the v2 GenAI mapper and low-cardinality metrics never accept content. Opaque
+BEAM terms degrade to metadata-only diagnostics instead of breaking an
+invocation.
+
+For synchronous delivery, put bounded exporter descriptors in the Runner.
+For asynchronous delivery, start the supervised central bus and configure the
+Runner with `delivery => async`; per-Runner exporters are rejected in that
+mode because retry, queue, and drop policy belong to the bus. This example
+sends completed spans and v1 lifecycle logs to an OTLP/HTTP JSON collector:
+
+```erlang
+_ = application:stop(erlang_adk),
+OtlpExporter =
+    #{id => <<"local-otlp">>,
+      module => adk_otlp_http_json_exporter,
+      failure_policy => open,
+      timeout_ms => 5000,
+      max_heap_words => 250000,
+      config =>
+          #{endpoint => <<"http://127.0.0.1:4318">>,
+            allow_private_hosts => true,
+            timeout_ms => 3000}},
+ok = application:set_env(erlang_adk, observability_bus_enabled, true),
+ok = application:set_env(
+    erlang_adk, observability_bus_options,
+    #{exporters => [OtlpExporter],
+      max_queue_events => 4096,
+      max_queue_bytes => 16777216,
+      max_event_bytes => 262144,
+      batch_size => 32,
+      max_inflight_batches => 2,
+      max_attempts => 3,
+      drop_policy => reject}),
+{ok, _} = application:ensure_all_started(erlang_adk),
+AsyncObservability =
+    #{delivery => async,
+      bus => adk_observability_bus,
+      failure_policy => open,
+      capture_content => false,
+      attributes => #{environment => <<"development">>}}.
+```
+
+Pass that map as `#{observability => AsyncObservability}` (alongside any other
+Runner options) in `adk_runner:new/4`; do not also put exporter descriptors in
+the per-Runner asynchronous configuration.
+
+The exporter never follows redirects and does not retry by itself. It labels
+failures transient or permanent; the bus owns bounded delayed retries only for
+eligible transient failures. Delivery is bounded best effort, not a durable
+queue: a retry may duplicate a batch and exhausted retries are explicitly
+dropped and counted. A collector should deduplicate by trace/span/event
+identity. HTTP is appropriate only for a loopback collector;
+use verified HTTPS for a remote OTLP endpoint. Do not put bearer credentials
+in README/config files.
+
+Inbound and outbound HTTP adapters can continue strict W3C `traceparent` and
+bounded `tracestate` without adding an OpenTelemetry SDK dependency:
+
+```erlang
+{ok, InboundTrace} = adk_observability:from_headers(
+    #{<<"traceparent">> =>
+          <<"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01">>},
+    #{agent => <<"WeatherAgent">>}),
+{ok, OutboundHeaders} = adk_observability:inject_headers(
+    InboundTrace, #{<<"accept">> => <<"application/json">>}).
+```
+
+Trace identifiers are correlation, never authorization. The built-in metrics
+registry bounds both instruments and label series and folds overflow into an
+explicit overflow series. `adk_observability_metrics:snapshot/0` and
+`adk_observability_bus:stats/0` are operational snapshots, not billing-grade
+durable counters.
 
 See [plugins, observability, and evaluation](docs/PLUGINS_OBSERVABILITY_EVALUATION.md)
 for lifecycle precedence, intervention boundaries, and adapter contracts.
 
 ## Evaluation
 
-`adk_eval_set` provides versioned, JSON-safe, multi-turn evaluation with
-bounded case concurrency, ordered turns, metric and judge adapters, pass
-thresholds, captured events/tool trajectories, and saved result metadata. The
-repository includes a direct-agent adapter and exact-match metric for this
-executable example:
+`adk_eval_set` provides versioned, JSON-safe, multi-turn evaluation. Schema v2
+evaluates a complete case, supports repeated independent samples, and records
+strict success/error/not-evaluated accounting. Cases and samples overlap only
+up to their configured bounds; turns inside one sample stay ordered.
+
+The production `adk_eval_agent_adapter` creates a fresh supervised agent,
+Runner session, and cleanup guardian for every case/sample, so one evaluation
+does not leak conversation state into another. The built-in full-case criteria
+are `exact_response`, `trajectory_exact`, `trajectory_in_order`,
+`trajectory_any_order`, and `trajectory_subset`; trajectory arguments may be
+matched exactly, as a subset, or ignored. Custom per-turn metrics and
+full-case metric/judge adapters remain supported.
+
+This paid example uses the REST model and two isolated samples:
 
 ```erlang
-{ok, readme_agent_eval_adapter} =
-    c("examples/readme_agent_eval_adapter.erl"),
-{ok, readme_exact_metric} = c("examples/readme_exact_metric.erl"),
-{ok, EvalSetAgent} = erlang_adk:spawn_agent(
-    <<"EvalSetAgent">>,
-    #{provider => adk_llm_gemini,
-      model => <<"gemini-3.1-flash-lite">>,
-      instructions => <<"Follow the requested output format exactly.">>}, []),
-{ok, EvalSet} = adk_eval_set:new(
-    <<"exact-dialogue">>, <<"1">>,
-    [#{id => <<"two-turn-case">>,
-       turns =>
-           [#{id => <<"first">>,
-              input => <<"Reply with exactly: ERLANG">>,
-              expected => <<"ERLANG">>},
-            #{id => <<"second">>,
-              input => <<"Again reply with exactly: ERLANG">>,
-              expected => <<"ERLANG">>}]}]),
-EvalAdapter = #{module => readme_agent_eval_adapter,
-                target => EvalSetAgent, config => #{}},
-EvalMetrics = [#{id => <<"exact">>,
-                 module => readme_exact_metric,
-                 kind => metric, threshold => 1.0, config => #{}}],
+{ok, EvalSet} = adk_eval_set:validate(
+    #{schema_version => 2,
+      id => <<"exact-dialogue">>,
+      version => <<"1">>,
+      cases =>
+          [#{id => <<"two-turn-case">>,
+             turns =>
+                 [#{id => <<"first">>,
+                    input => <<"Reply with exactly: ERLANG">>,
+                    expected_response => <<"ERLANG">>},
+                  #{id => <<"second">>,
+                    input => <<"Again reply with exactly: ERLANG">>,
+                    expected_response => <<"ERLANG">>}]}]}),
+EvalTarget =
+    #{name => <<"EvalSetAgent">>,
+      config =>
+          #{provider => adk_llm_gemini,
+            model => <<"gemini-3.1-flash-lite">>,
+            instructions =>
+                <<"Follow the requested output format exactly.">>},
+      tools => [],
+      runner_options => #{}},
+EvalAdapter = #{module => adk_eval_agent_adapter,
+                target => EvalTarget, config => #{}},
+EvalMetrics = [#{id => <<"exact-response">>,
+                 criterion => exact_response,
+                 threshold => 1.0,
+                 config => #{normalization => exact}}],
 {ok, EvalSetResult} = adk_eval_set:run(
     EvalAdapter, EvalSet, EvalMetrics,
-    #{concurrency => 1, pass_rate_threshold => 1.0,
-      capture_events => true, capture_tool_content => false}),
+    #{sample_count => 2,
+      concurrency => 1,
+      sample_concurrency => 2,
+      pass_rate_threshold => 1.0,
+      sample_pass_rate_threshold => 1.0,
+      min_successful_samples => 2,
+      capture_events => true,
+      capture_tool_content => false}),
 true = maps:get(<<"passed">>, EvalSetResult),
 {ok, SavedEvalResult} = adk_eval_set:encode_result(EvalSetResult),
-SavedEvalResult = jsx:decode(jsx:encode(SavedEvalResult), [return_maps]),
-ok = erlang_adk:stop_agent(EvalSetAgent).
+SavedEvalResult = jsx:decode(jsx:encode(SavedEvalResult), [return_maps]).
 ```
 
-An evaluation adapter implements `adk_eval_adapter:run_turn/5` and may return
-canonical ADK events, allowing tool-call and tool-response trajectories to be
-captured without exposing their content by default. Metrics and LLM-backed
-judges share `adk_eval_metric:score/4`; `kind => judge` records the distinction
-without coupling the core evaluator to a provider. Cases run in monitored,
-heap-limited workers up to `concurrency`; turns within one case remain ordered
-and thread adapter state. Use a target that provides isolated sessions when
-cases must not share agent history.
+An evaluation adapter implements `adk_eval_adapter:run_turn/5`; optional
+`init_case/4` and `terminate_case/3` callbacks own per-sample lifecycle. It may
+return canonical ADK events, allowing tool-call and tool-response trajectories
+to be captured without exposing their content by default. Metrics and
+LLM-backed judges share the same checked result accounting; `kind => judge`
+records the distinction without coupling the core evaluator to a provider.
+`adk_eval_llm_judge` is the explicit first-party rubric adapter. It defaults
+to `adk_llm_gemini` and `gemini-3.1-flash-lite`, requires a rubric identity and
+version, requests structured JSON, and turns provider, timeout, schema, or
+out-of-range-score failures into a failing judge result rather than a pass.
+It is never selected implicitly.
+
+This paid continuation uses the `EvalAdapter` and `EvalSet` above:
+
+```erlang
+RubricJudge =
+    #{id => <<"rubric-quality">>,
+      kind => judge,
+      module => adk_eval_llm_judge,
+      scope => 'case',
+      threshold => 0.8,
+      config =>
+          #{rubric_id => <<"concise-correct-answer">>,
+            rubric_version => <<"1">>,
+            rubric =>
+                <<"Score 1 for a correct, direct answer that follows the "
+                  "requested format; score 0 otherwise.">>,
+            provider => adk_llm_gemini,
+            model => <<"gemini-3.1-flash-lite">>,
+            request_timeout_ms => 30000}},
+{ok, RubricResult} = adk_eval_set:run(
+    EvalAdapter, EvalSet, [RubricJudge],
+    #{sample_count => 1, concurrency => 1, sample_concurrency => 1}),
+[RubricSummary] = maps:get(<<"metrics">>, RubricResult),
+<<"rubric-quality">> = maps:get(<<"metric_id">>, RubricSummary).
+```
+
+Each judge request is monitored, deadline- and heap-bounded, and remains
+concurrent with other bounded sample workers; there is no global judge
+process. Provider-module injection and `provider_config` are trusted Erlang
+configuration for applications and deterministic tests, not browser, dataset,
+or CLI input. The successful metadata records judge schema, provider, requested
+model, rubric ID/version, and a bounded rationale. Provider credentials and
+raw provider errors are excluded and secret-bearing input keys are pruned.
+The rationale is still evaluation content stored in reports and may summarize
+other case data, so protect reports according to the evaluated data's policy.
+User/environment simulation and managed evaluation services remain explicit
+adapters with their own credentials and cost policy.
+
+Empty criteria fail by default; use `empty_criteria => pass` only when an
+intentional execution-only evaluation should pass without scoring. Overall
+timeouts, per-case timeouts, heap bounds, input depth/size, sample count,
+concurrency, captured data, and final report bytes are all bounded. A timed-out
+or killed sample cannot orphan its adapter-owned agent.
+
+Saved v2 results can be compared with per-metric tolerances and a maximum pass
+rate drop, then rendered deterministically:
+
+```erlang
+{ok, Comparison} = adk_eval_set:compare(
+    BaselineEvalResult, EvalSetResult,
+    #{max_pass_rate_drop => 0.05,
+      metric_tolerances => #{<<"exact-response">> => 0.0}}),
+{ok, MarkdownReport} = adk_eval_set:report(Comparison, markdown),
+io:format("~ts", [MarkdownReport]).
+```
+
+The packaged CLI runs the same v2 engine. It defaults to built-in exact
+response scoring when `--criteria` is omitted, emits JSON to stdout by
+default, exits `0` on a passing gate, `2` on a completed failing gate, and `1`
+for invalid input/runtime errors:
+
+```bash
+./rebar3 escriptize
+_build/default/bin/adk eval run \
+  --config examples/agent.json \
+  --eval-set /path/to/eval-set-v2.json \
+  --criteria /path/to/eval-criteria-v2.json \
+  --samples 2 \
+  --concurrency 2 \
+  --sample-concurrency 2 \
+  --baseline previous-eval-result.json \
+  --max-pass-rate-drop 0.05 \
+  --format markdown \
+  --output eval-report.md
+```
+
+`--baseline` expects a saved `adk_eval_set` result, not a Markdown report.
+`--metric-tolerances` accepts a JSON object file keyed by metric ID. Never put
+an API key in agent/evaluation JSON; provider credentials come from the
+process environment or a trusted provider profile.
 
 The compatibility API remains available for small, single-turn datasets.
 
@@ -2605,10 +3060,11 @@ above.
 ## Integrated developer tooling
 
 The Erlang-hosted developer console uses the same independently supervised run
-runtime as applications. It provides chat, event traces, bounded replay,
-reconnect, cancellation, session inspection, and approval/resume without adding
-an Elixir or Node.js dependency. It is disabled by default and binds to
-loopback by default.
+and Live runtimes as applications. It provides chat, event traces, bounded run
+replay, reconnect, cancellation, session inspection, approval/resume, Live
+status/text/future-only SSE, evaluation render/compare, and content-free
+observability snapshots without adding an Elixir or Node.js dependency. It is
+disabled by default and binds to loopback by default.
 
 Set a dedicated local bearer token before starting the VM:
 
@@ -2622,6 +3078,7 @@ exact-scope resource provider in the following two fences is also configured:
 
 ```erlang
 _ = application:stop(erlang_adk),
+DevLivePrincipal = <<"readme-live-user">>,
 ok = application:set_env(erlang_adk, dev_enabled, true),
 ok = application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
 ok = application:set_env(erlang_adk, a2a_port, 8080),
@@ -2634,6 +3091,11 @@ ok = application:set_env(
     erlang_adk, dev_run_options,
     #{retention_ms => 60000, max_buffered_events => 256}),
 ok = application:set_env(erlang_adk, dev_max_session_results, 100),
+ok = application:set_env(
+    erlang_adk, dev_live_principal, DevLivePrincipal),
+ok = application:set_env(
+    erlang_adk, dev_live_credit,
+    #{messages => 16, bytes => 4194304}),
 ok = application:set_env(erlang_adk, dev_max_resource_results, 100),
 ok = application:set_env(erlang_adk, dev_diagnostic_timeout_ms, 5000),
 ok = application:set_env(
@@ -2652,6 +3114,12 @@ The authenticated local API is:
 | --- | --- | --- |
 | `GET` | `/dev/v1/agents` | Discover live registered agents by stable name |
 | `GET` | `/dev/v1/diagnostics` | Inspect context capabilities and configured artifact/memory sources without content or handles |
+| `GET` | `/dev/v1/observability` | Inspect bounded metric/export-bus snapshots; content is never returned |
+| `POST` | `/dev/v1/evaluation/render` | Validate and render one supplied v1/v2 evaluation result as bounded JSON or Markdown |
+| `POST` | `/dev/v1/evaluation/compare` | Compare exact supplied baseline/current results and return a bounded checked comparison |
+| `GET` | `/dev/v1/live/sessions` | List bounded status for server-owned Live sessions matching the configured exact principal |
+| `POST` | `/dev/v1/live/sessions/:session/text` | Send one bounded text input to that principal's Live session |
+| `GET` | `/dev/v1/live/sessions/:session/events` | Attach future-only bounded Live SSE; `Last-Event-ID` is rejected because Live is not replayed |
 | `GET` | `/dev/v1/context/:app/:user/:session` | Explain bounded context counts and fingerprint for one exact session; events/state are omitted |
 | `GET` | `/dev/v1/context/:app/:user/:session/lifecycle?model=MODEL` | Inspect the latest whitelisted compaction checkpoint fields and content-free cache counts |
 | `POST` | `/dev/v1/context/:app/:user/:session/cache/invalidate` | Invalidate one confirmed provider/app/user/model/policy cache scope across sessions |
@@ -2744,6 +3212,16 @@ panel. The token remains in page memory, is sent only in the `Authorization`
 header, and is never accepted in a query string. Cowboy route state keeps only
 its SHA-256 digest. Browser requests with an `Origin` header must be
 same-origin.
+
+`dev_live_principal` is mandatory for developer Live access and must exactly
+match the `Principal` supplied to `start_live_session/3`. It is an ownership
+capability, not a display name or wildcard. The developer bearer does not
+bypass the Live session's principal check. The console discovers and controls
+only sessions already supervised in the same VM; it does not accept a model,
+API key, transport, tool executor, or principal from the browser and does not
+create a Live session. Start the Live session from trusted application code as
+shown in the Gemini Live section and leave it open while testing this panel.
+The browser projection omits audio/media bytes and provider signatures.
 
 For a simple single-tenant local server, putting `artifact_svc` and
 `memory_svc` in `dev_runner_options` remains a compatibility fallback. A
@@ -2843,10 +3321,23 @@ The command must print `"status":"listening"` and then remain running. Open
 second terminal for developer API commands; environment exports are
 terminal-local, so export the same bearer token there as well:
 
+Plain `adk serve` intentionally has no browser/CLI option that invents a Live
+principal or creates a Live session. Its agent/run and observability panels
+work directly. For the Live commands below, target the OTP VM started after
+the trusted `dev_live_principal` configuration above and keep a matching Live
+session open.
+
 ```bash
 export ERLANG_ADK_DEV_TOKEN="replace-with-the-same-local-token"
 _build/default/bin/adk inspect agents --url http://127.0.0.1:8080
 _build/default/bin/adk inspect diagnostics --url http://127.0.0.1:8080
+_build/default/bin/adk inspect observability --url http://127.0.0.1:8080
+
+# These two commands require the trusted dev_live_principal configuration and
+# an already-supervised matching Live session; plain `adk serve` supplies neither.
+_build/default/bin/adk inspect live --url http://127.0.0.1:8080
+_build/default/bin/adk live send readme-live-session \
+  --text "Explain supervision" --url http://127.0.0.1:8080
 _build/default/bin/adk inspect run RUN_ID
 _build/default/bin/adk session create adk-cli local scratch
 _build/default/bin/adk inspect sessions adk-cli local
@@ -3108,7 +3599,7 @@ credential.
 ## Phoenix LiveView companion
 
 Phoenix is compatible with Erlang ADK and remains an optional companion rather
-than a core dependency. Version 0.6 checks in a complete Phoenix 1.8/LiveView
+than a core dependency. Version 0.7 checks in a complete Phoenix 1.8/LiveView
 application at `examples/phoenix_adk_ui`. It runs in the same BEAM release and
 calls `adk_web_gateway` directly; it does not proxy the local `/dev/v1`
 administrator API.
@@ -3120,7 +3611,11 @@ admit 64 concurrent checks with a one-second callback deadline and a
 `gateway_options/0`. Callback crash, timeout, oversized input/result, caller
 death, or heap exhaustion fails closed without terminating the gateway.
 
-The companion uses `gemini-3.1-flash-lite` and a server-owned agent catalog.
+The ordinary agent-run surface uses `gemini-3.1-flash-lite` and a server-owned
+agent catalog. The `/live` operations surface uses the separately configured
+`ErlangAdkUi.LiveGateway`; it discovers already-supervised Live sessions and
+never accepts a model, provider, transport, API key, principal, module, file
+path, or evaluation catalog from browser input.
 For local development, configure an OIDC client whose callback exactly matches
 the value below:
 
@@ -3131,7 +3626,7 @@ export OIDC_ISSUER="https://identity.example.com"
 export OIDC_CLIENT_ID="erlang-adk-ui"
 export OIDC_CLIENT_SECRET="load-this-from-your-secret-manager"
 export OIDC_REDIRECT_URI="http://127.0.0.1:4000/auth/callback"
-export OIDC_SCOPES="openid adk.agents.read adk.run.start adk.run.read adk.run.control"
+export OIDC_SCOPES="openid adk.agents.read adk.run.start adk.run.read adk.run.control adk.live.read adk.live.control adk.observability.read adk.evaluation.read"
 mix setup
 mix phx.server
 ```
@@ -3172,6 +3667,26 @@ encoded bytes, prompts, outputs, login flows, sessions, and reconnect state are
 bounded. Confirmation and human-approval responses are typed; an unknown pause
 type remains paused and displays no action buttons.
 
+The Live operations view uses a different future-only subscription contract.
+The Live session remains server-owned, but browser disconnect deliberately
+does not store a cursor or request replay. Each mount/action/event re-fetches
+the server-side OIDC session and requires one exact scope:
+
+- `adk.live.read` for discovery, attach/detach, and credit acknowledgements;
+- `adk.live.control` for realtime text input;
+- `adk.observability.read` for the bounded metadata-only metrics/delivery
+  snapshot;
+- `adk.evaluation.read` for server-configured report rendering/comparison.
+
+Audio/video bytes and thought signatures are removed before an event enters
+LiveView assigns; audio is shown as format/rate/channel/byte-count metadata.
+Reports come from the trusted `:erlang_adk_ui, :evaluation_reports` release
+catalog as already decoded maps. The browser can select only an ID returned by
+that catalog; it cannot provide a filesystem path or evaluator module. The
+node-local reference gateway is suitable for a same-BEAM release. A clustered
+deployment needs an authenticated distributed session router rather than a
+client-selected node or PID.
+
 Run the companion's deterministic and release gates from its directory:
 
 ```bash
@@ -3191,10 +3706,14 @@ TLS verification or the audit. As of 2026-07-14, Cowlib 2.18.0 is still the
 latest official release and neither EEF advisory has a fixed-version event, so
 there is no safe official dependency bump yet.
 
-The final companion gate passes all 46 tests, production asset compilation,
-and release assembly. The packaged release also boots with test-only
-trusted-proxy and direct-TLS configurations, returns HTTP 200 from `/health`
-on loopback in both modes, and stops cleanly.
+The v0.6 companion baseline passed all 46 tests, production asset compilation,
+and release assembly. Its packaged release also booted with test-only
+trusted-proxy and direct-TLS configurations, returned HTTP 200 from `/health`
+on loopback in both modes, and stopped cleanly. The expanded v0.7 companion
+gate passes 61 tests with format, warnings-as-errors compilation, production
+assets, and release assembly. Its packaged release boots in both trusted-proxy
+and direct-TLS modes, returns HTTP 200 from `/health` on loopback with
+certificate verification enabled, and stops cleanly.
 
 The lock file pins the official Phoenix LiveView fix commit for
 CVE-2026-58228 until a fixed Hex release at or above 1.2.7 is available. Do not
@@ -3226,13 +3745,17 @@ arbitrary clients are not a TLS boundary. Production configuration enforces
 secure/HttpOnly/SameSite cookies, connection-exact LiveView scheme/host/port,
 CSRF, CSP, HSTS, body limits, and a bounded channel implementation.
 
-The production companion currently covers authenticated agent execution and
-typed decisions. Artifact, memory, context, approver, operator, or admin panels
-must be added as separately authorized server-side gateway operations; never
-give the browser a service PID, credential reference, filesystem root, cache
-lease, provider resource name, or caller-selected app/user scope. The Erlang
-`/dev` console remains loopback-only single-operator tooling and must not be
-mounted behind this public endpoint.
+The production companion covers authenticated agent execution, typed
+decisions, future-only Live text/metadata, content-free operational snapshots,
+and read-only evaluation reports. It intentionally does not stream audio bytes
+to the browser, start/configure Live sessions, run evaluations from browser
+input, or mutate observability configuration. Artifact, memory, context,
+approver, operator, or admin panels require separate exact-scope server-side
+gateway operations; never give the browser a service PID, credential
+reference, filesystem root, cache lease, provider resource name, evaluator
+module/path, or caller-selected app/user scope. The Erlang `/dev` console
+remains loopback-only single-operator tooling and must not be mounted behind
+this public endpoint.
 
 See `examples/phoenix_adk_ui/README.md` for configuration, topology, test, and
 release details.
@@ -3249,22 +3772,36 @@ _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
 ```
 
-After a successful v0.6 packaging gate, `adk doctor` must report version
-`0.6.0`, OTP 27, `gemini-3.1-flash-lite`, all required dependencies, and a
+For v0.7, `adk doctor` must report version `0.7.0`, OTP 27,
+`gemini-3.1-flash-lite` as the REST default, all required dependencies, and a
 configured Gemini key without exposing it; checked validation must accept
-`examples/agent.json` with the same model.
+`examples/agent.json` with the same REST model. Live examples select
+`gemini-3.1-flash-live-preview` explicitly and do not change that default.
 
-The final 2026-07-14 clean run passed 899 EUnit tests and six deterministic
-Common Test cases, and Dialyzer completed without warnings over 170 project
-files. The separate packaging commands passed; `adk doctor` reported v0.6.0,
-OTP 27, the expected default model and dependency availability while exposing
-only that the Gemini key was configured.
+The final v0.6 2026-07-14 clean run passed 899 EUnit tests and six
+deterministic Common Test cases, and Dialyzer completed without warnings over
+170 project files. The separate packaging commands passed; `adk doctor`
+reported v0.6.0, OTP 27, the expected default model and dependency
+availability while exposing only that the Gemini key was configured. This is
+historical inherited evidence, not a claim that the larger v0.7 gate has
+already passed; record the v0.7 totals only after the final clean run.
+
+The final v0.7 clean Erlang gate completed 1,040 EUnit tests with no failures,
+six deterministic Common Test cases, and warning-free Dialyzer analysis over
+206 project files. Escript packaging, `adk doctor`, checked agent-config
+validation, and the focused README/runtime gates also pass.
 
 Run the focused deterministic README smoke suite with:
 
 ```bash
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
+erlc -Werror -pa _build/default/lib/erlang_adk/ebin -o /tmp \
+  examples/readme_weather_tool.erl \
+  examples/readme_live_weather_executor.erl \
+  examples/readme_stateful_counter_plugin.erl
+./rebar3 eunit \
+  --module=adk_live_media_test,adk_live_gemini_codec_test,adk_live_gun_transport_test,adk_live_public_api_test,adk_live_session_test,adk_live_tool_execution_test,adk_live_observability_test,adk_plugin_pipeline_test,adk_plugin_runner_integration_test,adk_plugin_builtin_test,adk_plugin_stateful_test,adk_trace_context_test,adk_observability_v2_test,adk_observability_runner_test,adk_otlp_json_test,adk_otlp_http_json_exporter_test,adk_eval_criteria_test,adk_eval_v2_test,adk_eval_llm_judge_test,adk_eval_dev_view_test,adk_dev_v07_http_test,adk_cli_test
 ./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
 ./rebar3 ct --suite test/adk_v05_stress_SUITE.erl
 ```
@@ -3280,15 +3817,23 @@ four exact scopes; the latter collapse to four provider creates/deletes.
 The focused v0.6 run passed all 29 README examples, all four workflow examples,
 the 1,000-run concurrency scenario, and both v0.5 resource/context stress
 scenarios.
+On v0.7, the 29 README tests, four workflow tests, all three new example-module
+compile/runtime checks, and 156 focused Live/plugin/observability/evaluation/
+developer-tooling tests pass. Both 1,000-run stress suites also pass in the
+final clean Common Test gate.
 
-Run the opt-in live Gemini suite after exporting `GEMINI_API_KEY` with:
+Run the opt-in billable REST provider suite after exporting `GEMINI_API_KEY`
+with:
 
 ```bash
-ERLANG_ADK_LIVE_GEMINI=1 ./rebar3 ct \
+ERLANG_ADK_GEMINI_REST=1 ./rebar3 ct \
   --suite test/readme_live_gemini_SUITE.erl
 ```
 
-The live suite uses `gemini-3.1-flash-lite` and exercises text generation,
+Despite its historical filename,
+`readme_live_gemini_SUITE` uses REST GenerateContent/SSE with
+`gemini-3.1-flash-lite`; it is not a Gemini Live WebSocket test. It exercises
+text generation,
 Google Search grounding metadata, thinking configuration, multimodal
 one-shot/content streaming, explicit context-cache creation and reuse,
 exact-scope model-selected memory and one-request artifact attachment,
@@ -3299,14 +3844,15 @@ Mnesia Runner storage, callbacks, telemetry, evaluation, and the HTTP
 endpoint. It is skipped unless explicitly enabled because it uses network
 access, quota, and billable API calls.
 
-The full 2026-07-14 live run passed 14 of 16 cases with no skips.
+The final v0.7 2026-07-14 REST run passed 15 of 17 cases with no skips.
 `google_search_grounding` and `context_cache` each received HTTP 429 after the
 single bounded ten-second retry. They are recorded as quota/rate-limit
 failures, not implementation passes; the exact-scope artifact/memory case and
-its strict `parametersJsonSchema` tool projection passed.
+its strict `parametersJsonSchema` tool projection passed. The first-party
+bounded LLM rubric judge also passed against `gemini-3.1-flash-lite`.
 
-Some scenarios require multiple model turns, so the complete live suite makes
-roughly 38 Gemini API requests, including Search grounding, cached-content
+Some scenarios require multiple model turns, so the complete REST suite makes
+roughly 39 Gemini API requests, including Search grounding, cached-content
 creation and reuse, model-selected memory/artifact tool rounds, and one-shot
 and SSE multimodal requests. By default, its
 test-only provider wrapper spaces request
@@ -3320,12 +3866,38 @@ Erlang concurrency model. API limits are project-specific; accounts with a
 higher limit can shorten or disable the test pacing, for example:
 
 ```bash
-ERLANG_ADK_LIVE_GEMINI=1 \
-ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS=0 \
+ERLANG_ADK_GEMINI_REST=1 \
+ERLANG_ADK_GEMINI_REST_INTERVAL_MS=0 \
 ./rebar3 ct --suite test/readme_live_gemini_SUITE.erl
 ```
 
-Keep the default interval on free-tier projects. Exhausted daily quota, project traffic outside this suite, or persistent account-level limits still fail explicitly instead of looping indefinitely.
+Keep the default interval on free-tier projects. Exhausted daily quota,
+project traffic outside this suite, or persistent account-level limits still
+fail explicitly instead of looping indefinitely.
+
+`ERLANG_ADK_LIVE_GEMINI=1` and
+`ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS` remain accepted as historical aliases;
+new scripts should use the unambiguous `ERLANG_ADK_GEMINI_REST` names above.
+
+The actual Gemini Live WebSocket gate is a separate opt-in paid suite using
+the explicit Live preview model:
+
+```bash
+ERLANG_ADK_GEMINI_LIVE=1 ./rebar3 ct \
+  --suite test/gemini_live_SUITE.erl
+```
+
+`gemini_live_SUITE` covers text-to-audio plus output transcription, 16 kHz
+PCM audio input, PNG image input, and a correlated synchronous function-call
+round trip. It requires network/quota access and is skipped unless both the
+flag and `GEMINI_API_KEY` reach the Common Test process. Deterministic Live
+media/codec/session/transport/tool/observability tests remain the release
+contract even when this paid provider gate is skipped; a provider or quota
+failure is never counted as an implementation pass.
+
+During v0.7 development, the complete paid Live suite passed all four cases
+against `gemini-3.1-flash-live-preview`. This is provider-integration evidence,
+not a substitute for the clean deterministic release gate.
 
 The focused suites compile the example modules and directly exercise
 deterministic versions of the core agent, delegation, legacy orchestration,

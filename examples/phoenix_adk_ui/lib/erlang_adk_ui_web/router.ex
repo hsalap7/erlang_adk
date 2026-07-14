@@ -40,6 +40,7 @@ defmodule ErlangAdkUiWeb.Router do
     live_session :authenticated, on_mount: [{ErlangAdkUiWeb.AuthHooks, :required}] do
       live "/", AgentLive, :index
       live "/agent", AgentLive, :index
+      live "/live", LiveSessionLive, :index
     end
   end
 end

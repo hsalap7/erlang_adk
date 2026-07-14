@@ -232,7 +232,16 @@ add_dev_config(Config) ->
                           max_session_results => application:get_env(
                                                    erlang_adk,
                                                    dev_max_session_results,
-                                                   100)},
+                                                   100),
+                          live_principal => application:get_env(
+                                              erlang_adk,
+                                              dev_live_principal,
+                                              undefined),
+                          live_credit => application:get_env(
+                                           erlang_adk,
+                                           dev_live_credit,
+                                           #{messages => 16,
+                                             bytes => 4194304})},
             case adk_dev_router:validate_config(DevConfig) of
                 {ok, SafeDevConfig} ->
                     {ok, Config#{dev_config => SafeDevConfig}};
