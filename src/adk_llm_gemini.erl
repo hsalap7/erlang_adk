@@ -1,8 +1,27 @@
+%% Gemini GenerateContent provider, including opt-in explicit prefix caching.
+%%
+%% `context_cache' is a strict runtime-only map:
+%%
+%%   #{cache := CachePid,
+%%     provider := adk_context_cache_gemini,
+%%     scope := #{app := App, user := User, model := Model,
+%%                policy := Policy},
+%%     ttl_ms := PositiveMilliseconds,
+%%     deadline_ms := AbsoluteMonotonicMilliseconds}
+%%
+%% The provider builds the final wire payload before choosing its stable cache
+%% prefix. The prefix contains the system instruction, provider tools, and all
+%% chronological contents except the final request content. On a cache hit the
+%% outgoing request contains only `cachedContent', the final content, and
+%% ordinary non-prefix generation/safety options. On a registry bypass it sends
+%% the original full payload. CachedContent resource names and leases are never
+%% returned in provider metadata or `public_config/1'.
 -module(adk_llm_gemini).
 -behaviour(adk_llm).
 
 -export([generate/3, stream/4, stream_content/4,
-         capabilities/0, validate_config/1]).
+         capabilities/0, validate_config/1,
+         cache_provider/0, cache_prefix/3, public_config/1]).
 
 -define(DEFAULT_MODEL, <<"gemini-3.1-flash-lite">>).
 
@@ -38,7 +57,40 @@ capabilities() ->
                                function_call, function_response],
       content_streaming => true,
       supported_file_uri_schemes => [https, gs],
+      context_caching =>
+          #{explicit => true,
+            response_cache => false,
+            provider => adk_context_cache_gemini,
+            models => [adk_context_cache_gemini_model()],
+            minimum_prefix_tokens =>
+                adk_context_cache_gemini_minimum_tokens(),
+            prefix => [system_instruction, tools,
+                       chronological_contents_except_final]},
       live => false}.
+
+-spec cache_provider() -> module().
+cache_provider() -> adk_context_cache_gemini.
+
+-spec cache_prefix(map(), list(), list()) ->
+    {ok, map()} | {error, term()}.
+cache_prefix(Config, Memory, Tools) ->
+    case validate_config(Config) of
+        ok ->
+            case build_payload(Config, Memory, Tools) of
+                {ok, Payload} ->
+                    case context_cache_prefix(Config, Payload) of
+                        {ok, Prefix, _FinalContent} -> {ok, Prefix};
+                        {error, _} = Error -> Error
+                    end;
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error -> Error
+    end.
+
+%% @doc Secret- and handle-free projection for diagnostics.
+-spec public_config(map()) -> map().
+public_config(Config) when is_map(Config) ->
+    maps:remove(context_cache, adk_secret_redactor:redact(Config)).
 
 validate_config(Config) when is_map(Config) ->
     Validators = [validate_known_config_keys(Config)] ++
@@ -50,6 +102,7 @@ validate_config(Config) when is_map(Config) ->
         validate_builtin_tools(Config),
         validate_response_schema(Config),
         validate_content_limits(Config),
+        validate_context_cache(Config),
         request_timeout_validation(Config)
     ],
     first_error(Validators);
@@ -93,7 +146,7 @@ known_config_keys() ->
      candidate_count, seed, presence_penalty, frequency_penalty,
      stop_sequences, response_mime_type, response_schema,
      thinking_config, safety_settings, builtin_tools,
-     content_limits, request_timeout,
+     content_limits, request_timeout, context_cache,
      instructions, global_instruction, input_schema, output_schema,
      generation_config, history_policy, include_history, include_contents,
      output_key, required_capabilities, instruction_timeout_ms,
@@ -262,6 +315,123 @@ validate_content_limits(Config) ->
             end
     end.
 
+validate_context_cache(Config) ->
+    case maps:find(context_cache, Config) of
+        error -> ok;
+        {ok, CacheConfig} when is_map(CacheConfig) ->
+            Expected = [cache, deadline_ms, provider, scope, ttl_ms],
+            case lists:sort(maps:keys(CacheConfig)) =:= Expected of
+                true -> validate_context_cache_fields(Config, CacheConfig);
+                false ->
+                    {error, {invalid_gemini_option, context_cache,
+                             invalid_keys}}
+            end;
+        {ok, _Value} ->
+            {error, {invalid_gemini_option, context_cache, invalid_shape}}
+    end.
+
+validate_context_cache_fields(Config, CacheConfig) ->
+    Cache = maps:get(cache, CacheConfig),
+    Provider = maps:get(provider, CacheConfig),
+    Scope = maps:get(scope, CacheConfig),
+    Ttl = maps:get(ttl_ms, CacheConfig),
+    Deadline = maps:get(deadline_ms, CacheConfig),
+    Model = maps:get(model, Config, ?DEFAULT_MODEL),
+    case is_pid(Cache) andalso is_atom(Provider)
+         andalso is_integer(Ttl) andalso Ttl > 0
+         andalso Ttl =< 86400000 andalso is_integer(Deadline) of
+        false ->
+            {error, {invalid_gemini_option, context_cache,
+                     invalid_runtime_values}};
+        true ->
+            case {validate_context_cache_scope(Scope, Model),
+                  validate_context_cache_provider(Provider, Model)} of
+                {ok, ok} -> ok;
+                {{error, Reason}, _} ->
+                    {error, {invalid_gemini_option, context_cache, Reason}};
+                {_, {error, Reason}} ->
+                    {error, {invalid_gemini_option, context_cache, Reason}}
+            end
+    end.
+
+validate_context_cache_scope(Scope, Model) when is_map(Scope) ->
+    Expected = [app, model, policy, user],
+    case lists:sort(maps:keys(Scope)) =:= Expected of
+        true ->
+            App = maps:get(app, Scope),
+            User = maps:get(user, Scope),
+            ScopeModel = maps:get(model, Scope),
+            Policy = maps:get(policy, Scope),
+            case valid_cache_identity(App) andalso valid_cache_identity(User)
+                 andalso ScopeModel =:= Model andalso is_map(Policy)
+                 andalso cache_scope_is_json_safe(Scope) of
+                true -> ok;
+                false when ScopeModel =/= Model ->
+                    {error, scope_model_mismatch};
+                false -> {error, invalid_scope}
+            end;
+        false -> {error, invalid_scope_keys}
+    end;
+validate_context_cache_scope(_, _) -> {error, invalid_scope}.
+
+validate_context_cache_provider(Provider, Model) ->
+    case code:ensure_loaded(Provider) of
+        {module, Provider} ->
+            Required = [{create, 2}, {delete, 2},
+                        {cached_content_name, 2}, {supports_model, 1}],
+            case lists:all(
+                   fun({Name, Arity}) ->
+                       erlang:function_exported(Provider, Name, Arity)
+                   end, Required) of
+                false -> {error, invalid_provider_callbacks};
+                true -> validate_context_cache_provider_capabilities(
+                          Provider, Model)
+            end;
+        _ -> {error, provider_unavailable}
+    end.
+
+validate_context_cache_provider_capabilities(Provider, Model) ->
+    try {Provider:supports_model(Model), Provider:capabilities()} of
+        {true, #{context_cache := true,
+                 response_cache := false}} -> ok;
+        {false, _} -> {error, unsupported_model};
+        _ -> {error, invalid_provider_capabilities}
+    catch _:_ -> {error, invalid_provider_capabilities}
+    end.
+
+valid_cache_identity(Value) when is_binary(Value) ->
+    byte_size(Value) > 0 andalso byte_size(Value) =< 256
+    andalso case unicode:characters_to_binary(Value, utf8, utf8) of
+        Value -> true;
+        _ -> false
+    end;
+valid_cache_identity(_) -> false.
+
+cache_scope_is_json_safe(Scope) ->
+    case adk_json:normalize(Scope) of
+        {ok, Normalized} when is_map(Normalized) ->
+            not context_cache_scope_sensitive(Normalized);
+        _ -> false
+    end.
+
+context_cache_scope_sensitive(Map) when is_map(Map) ->
+    lists:any(
+      fun({Key, Value}) ->
+          adk_context_guard:sensitive_key(Key)
+          orelse context_cache_scope_sensitive(Value)
+      end, maps:to_list(Map));
+context_cache_scope_sensitive(List) when is_list(List) ->
+    lists:any(fun context_cache_scope_sensitive/1, List);
+context_cache_scope_sensitive(_) -> false.
+
+adk_context_cache_gemini_model() -> ?DEFAULT_MODEL.
+
+adk_context_cache_gemini_minimum_tokens() ->
+    case adk_context_cache_gemini:minimum_prefix_tokens(?DEFAULT_MODEL) of
+        {ok, Minimum} -> Minimum;
+        {error, _} -> undefined
+    end.
+
 request_timeout_validation(Config) ->
     case request_timeout(Config) of
         {ok, _} -> ok;
@@ -272,11 +442,16 @@ request_timeout_validation(Config) ->
 generate_with_key(Config, Memory, Tools, ApiKey) ->
     case build_payload(Config, Memory, Tools) of
         {ok, Payload} ->
-            generate_payload(Config, ApiKey, Payload);
+            case prepare_context_cache(Config, Payload) of
+                {ok, RequestPayload, CacheContext} ->
+                    generate_payload(
+                      Config, ApiKey, RequestPayload, CacheContext);
+                {error, _} = Error -> Error
+            end;
         {error, _} = Error -> Error
     end.
 
-generate_payload(Config, ApiKey, Payload) ->
+generate_payload(Config, ApiKey, Payload, CacheContext) ->
     Model = maps:get(model, Config, ?DEFAULT_MODEL),
     BaseUrl = maps:get(base_url, Config,
                        <<"https://generativelanguage.googleapis.com">>),
@@ -294,15 +469,133 @@ generate_payload(Config, ApiKey, Payload) ->
             case httpc:request(post, Request, HttpOptions, Options) of
                 {ok, {{_Version, StatusCode, _ReasonPhrase}, _Headers, Body}}
                         when StatusCode >= 200, StatusCode < 300 ->
-                    decode_response(Body, content_limits(Config));
+                    decode_response(
+                      Body, content_limits(Config), CacheContext);
                 {ok, {{_Version, StatusCode, _ReasonPhrase}, _Headers, Body}} ->
-                    {error, {http_status, StatusCode, Body}};
+                    cache_safe_http_error(
+                      StatusCode, Body, CacheContext);
                 {error, Reason} ->
                     {error, Reason}
             end;
         {{error, _} = Error, _} -> Error;
         {_, {error, _} = Error} -> Error
     end.
+
+prepare_context_cache(Config, Payload) ->
+    case maps:find(context_cache, Config) of
+        error -> {ok, Payload, disabled};
+        {ok, CacheConfig} ->
+            case context_cache_prefix(Config, Payload) of
+                {ok, Prefix, FinalContent} ->
+                    acquire_context_cache(
+                      Config, CacheConfig, Prefix, FinalContent, Payload);
+                {error, _} = Error -> Error
+            end
+    end.
+
+context_cache_prefix(Config, Payload) ->
+    case maps:get(<<"contents">>, Payload, invalid) of
+        Contents when is_list(Contents), Contents =/= [] ->
+            PrefixCount = length(Contents) - 1,
+            {HistoryPrefix, [FinalContent]} =
+                lists:split(PrefixCount, Contents),
+            Model = maps:get(model, Config, ?DEFAULT_MODEL),
+            Prefix =
+                #{<<"model">> => Model,
+                  <<"system_instruction">> =>
+                      maps:get(<<"system_instruction">>, Payload, null),
+                  <<"history_prefix">> => HistoryPrefix,
+                  <<"tools">> => maps:get(<<"tools">>, Payload, [])},
+            {ok, Prefix, FinalContent};
+        _ -> {error, context_cache_requires_final_content}
+    end.
+
+acquire_context_cache(Config, CacheConfig, Prefix, FinalContent, Payload) ->
+    Cache = maps:get(cache, CacheConfig),
+    Provider = maps:get(provider, CacheConfig),
+    Scope = maps:get(scope, CacheConfig),
+    AcquireOptions =
+        #{ttl_ms => maps:get(ttl_ms, CacheConfig),
+          deadline_ms => maps:get(deadline_ms, CacheConfig)},
+    case safe_context_cache_acquire(
+           Cache, Provider, Scope, Prefix, AcquireOptions) of
+        {ok, Lease, PublicMetadata} ->
+            resolve_context_cache(
+              Config, Cache, Provider, Lease, PublicMetadata,
+              FinalContent, Payload);
+        {bypass, PublicMetadata} ->
+            {ok, Payload,
+             #{status => bypass, public_metadata => PublicMetadata}};
+        {error, {context_cache_unavailable, _Tag}} = Error -> Error;
+        {error, Reason} ->
+            {error, {gemini_context_cache_unavailable,
+                     context_cache_error_tag(Reason)}}
+    end.
+
+safe_context_cache_acquire(Cache, Provider, Scope, Prefix, Options) ->
+    try adk_context_cache:acquire(
+          Cache, Provider, Scope, Prefix, Options) of
+        Result -> Result
+    catch
+        exit:_ -> {error, context_cache_registry_unavailable};
+        error:_ -> {error, context_cache_registry_failed}
+    end.
+
+resolve_context_cache(Config, Cache, Provider, Lease, PublicMetadata,
+                      FinalContent, Payload) ->
+    case safe_context_cache_resolve(Cache, Lease) of
+        {ok, PrivateResource} ->
+            Model = maps:get(model, Config, ?DEFAULT_MODEL),
+            case safe_cached_content_name(
+                   Provider, PrivateResource, Model) of
+                {ok, CachedContentName} ->
+                    BasePayload = maps:without(
+                                    [<<"system_instruction">>, <<"tools">>],
+                                    Payload),
+                    RequestPayload =
+                        BasePayload#{<<"contents">> => [FinalContent],
+                                     <<"cachedContent">> =>
+                                         CachedContentName},
+                    {ok, RequestPayload,
+                     #{status => active,
+                       public_metadata => PublicMetadata}};
+                {error, Reason} ->
+                    {error, {gemini_context_cache_unavailable,
+                             context_cache_error_tag(Reason)}}
+            end;
+        {error, Reason} ->
+            {error, {gemini_context_cache_unavailable,
+                     context_cache_error_tag(Reason)}}
+    end.
+
+safe_context_cache_resolve(Cache, Lease) ->
+    try adk_context_cache:resolve(Cache, Lease) of
+        Result -> Result
+    catch
+        exit:_ -> {error, context_cache_registry_unavailable};
+        error:_ -> {error, context_cache_registry_failed}
+    end.
+
+safe_cached_content_name(Provider, PrivateResource, Model) ->
+    try Provider:cached_content_name(PrivateResource, Model) of
+        {ok, Name} when is_binary(Name) -> {ok, Name};
+        {error, _} = Error -> Error;
+        _ -> {error, invalid_context_cache_provider_resource}
+    catch _:_ -> {error, invalid_context_cache_provider_resource}
+    end.
+
+context_cache_error_tag(Reason) when is_atom(Reason) -> Reason;
+context_cache_error_tag(Reason) when is_tuple(Reason), tuple_size(Reason) > 0,
+                                     is_atom(element(1, Reason)) ->
+    element(1, Reason);
+context_cache_error_tag(_) -> context_cache_failed.
+
+cache_safe_http_error(StatusCode, Body, disabled) ->
+    %% Preserve the established provider error shape when no private cache
+    %% resource participated in the request.
+    {error, {http_status, StatusCode, Body}};
+cache_safe_http_error(StatusCode, _Body, _CacheContext) ->
+    {error, {http_status, StatusCode, context_cache_request_failed}}.
 
 stream(Config, Memory, Tools, Callback) when is_function(Callback, 1) ->
     stream_mode(Config, Memory, Tools, Callback, text);
@@ -329,9 +622,19 @@ stream_mode(Config, Memory, Tools, Callback, Mode) ->
 stream_with_key(Config, Memory, Tools, Callback, ApiKey, Mode) ->
     Model = maps:get(model, Config, ?DEFAULT_MODEL),
     BaseUrl = maps:get(base_url, Config, <<"https://generativelanguage.googleapis.com">>),
-    case {build_payload(Config, Memory, Tools),
+    case build_payload(Config, Memory, Tools) of
+        {ok, FullPayload} ->
+            stream_prepared_payload(
+              Config, BaseUrl, Model, FullPayload, Callback,
+              ApiKey, Mode);
+        {error, _} = Error -> Error
+    end.
+
+stream_prepared_payload(Config, BaseUrl, Model, FullPayload, Callback,
+                        ApiKey, Mode) ->
+    case {prepare_context_cache(Config, FullPayload),
           stream_destination(BaseUrl, Model), request_timeout(Config)} of
-        {{ok, Payload}, {ok, Scheme, Host, Port, Path},
+        {{ok, Payload, CacheContext}, {ok, Scheme, Host, Port, Path},
          {ok, RequestTimeout}} ->
             case open_connection(Scheme, Host, Port) of
                 {ok, ConnPid} ->
@@ -344,7 +647,8 @@ stream_with_key(Config, Memory, Tools, Callback, ApiKey, Mode) ->
                             ApiKey,
                             gun_request_timeout(RequestTimeout),
                             Mode,
-                            content_limits(Config)
+                            content_limits(Config),
+                            CacheContext
                         )
                     catch
                         Class:Reason ->
@@ -415,44 +719,49 @@ open_connection(<<"http">>, Host, Port) ->
     gun:open(binary_to_list(Host), Port, #{transport => tcp}).
 
 perform_stream_request(ConnPid, Path, JsonBody, Callback, ApiKey,
-                       RequestTimeout, Mode, Limits) ->
+                       RequestTimeout, Mode, Limits, CacheContext) ->
     case gun:await_up(ConnPid, RequestTimeout) of
         {ok, _Protocol} ->
             Headers = [{<<"content-type">>, <<"application/json">>},
                        {<<"x-goog-api-key">>, ApiKey}],
             StreamRef = gun:post(ConnPid, Path, Headers, JsonBody),
             await_stream_response(
-              ConnPid, StreamRef, Callback, RequestTimeout, Mode, Limits);
+              ConnPid, StreamRef, Callback, RequestTimeout, Mode, Limits,
+              CacheContext);
         {error, Reason} ->
             {error, Reason}
     end.
 
 await_stream_response(ConnPid, StreamRef, Callback, RequestTimeout,
-                      Mode, Limits) ->
+                      Mode, Limits, CacheContext) ->
     case gun:await(ConnPid, StreamRef, RequestTimeout) of
         {inform, _Status, _Headers} ->
             await_stream_response(
-              ConnPid, StreamRef, Callback, RequestTimeout, Mode, Limits);
+              ConnPid, StreamRef, Callback, RequestTimeout, Mode, Limits,
+              CacheContext);
         {response, fin, Status, _Headers} when Status >= 200, Status < 300 ->
             ok;
         {response, fin, Status, _Headers} ->
             {error, {http_status, Status, <<>>}};
         {response, nofin, Status, _Headers} when Status >= 200, Status < 300 ->
             consume_stream_data(
-              ConnPid, StreamRef, Callback, <<>>, new_stream_result_acc(),
+              ConnPid, StreamRef, Callback, <<>>,
+              new_stream_result_acc(CacheContext),
               RequestTimeout,
               Mode, Limits);
         {response, nofin, Status, _Headers} ->
             read_error_response(
-              ConnPid, StreamRef, Status, RequestTimeout);
+              ConnPid, StreamRef, Status, RequestTimeout, CacheContext);
         {error, Reason} ->
             {error, Reason}
     end.
 
-read_error_response(ConnPid, StreamRef, Status, RequestTimeout) ->
+read_error_response(ConnPid, StreamRef, Status, RequestTimeout,
+                    CacheContext) ->
     case gun:await_body(ConnPid, StreamRef, RequestTimeout) of
-        {ok, Body} -> {error, {http_status, Status, Body}};
-        {ok, Body, _Trailers} -> {error, {http_status, Status, Body}};
+        {ok, Body} -> cache_safe_http_error(Status, Body, CacheContext);
+        {ok, Body, _Trailers} ->
+            cache_safe_http_error(Status, Body, CacheContext);
         {error, Reason} -> {error, {http_status, Status, {body_error, Reason}}}
     end.
 
@@ -478,8 +787,9 @@ consume_stream_data(ConnPid, StreamRef, Callback, Buffer, ResultAcc,
             {error, Reason}
     end.
 
-new_stream_result_acc() ->
-    #{tool_calls => [], grounding_metadata => undefined}.
+new_stream_result_acc(CacheContext) ->
+    #{tool_calls => [], grounding_metadata => undefined,
+      cache_context => CacheContext, cache_usage => undefined}.
 
 consume_sse_bytes(Bytes, Callback, ResultAcc, Mode, Limits) ->
     Normalized = binary:replace(Bytes, <<"\r\n">>, <<"\n">>, [global]),
@@ -494,9 +804,9 @@ consume_sse_frames([], _Callback, ResultAcc, _Mode, _Limits) ->
     {ok, ResultAcc};
 consume_sse_frames([Frame | Rest], Callback, ResultAcc, Mode, Limits) ->
     case consume_sse_frame(Frame, Callback, Mode, Limits) of
-        {ok, ToolCalls, GroundingMetadata} ->
+        {ok, ToolCalls, GroundingMetadata, CacheUsage} ->
             case merge_stream_result(
-                   ToolCalls, GroundingMetadata, ResultAcc) of
+                   ToolCalls, GroundingMetadata, CacheUsage, ResultAcc) of
                 {ok, NewAcc} ->
                     consume_sse_frames(
                       Rest, Callback, NewAcc, Mode, Limits);
@@ -513,9 +823,10 @@ finish_sse(Buffer, Callback, ResultAcc, Mode, Limits) ->
         <<>> -> final_stream_result(ResultAcc);
         FinalFrame ->
             case consume_sse_frame(FinalFrame, Callback, Mode, Limits) of
-                {ok, ToolCalls, GroundingMetadata} ->
+                {ok, ToolCalls, GroundingMetadata, CacheUsage} ->
                     case merge_stream_result(
-                           ToolCalls, GroundingMetadata, ResultAcc) of
+                           ToolCalls, GroundingMetadata, CacheUsage,
+                           ResultAcc) of
                         {ok, NewAcc} -> final_stream_result(NewAcc);
                         {error, _} = Error -> Error
                     end;
@@ -527,7 +838,9 @@ finish_sse(Buffer, Callback, ResultAcc, Mode, Limits) ->
     end.
 
 final_stream_result(#{tool_calls := ReversedToolCalls,
-                      grounding_metadata := GroundingMetadata}) ->
+                      grounding_metadata := GroundingMetadata,
+                      cache_context := CacheContext,
+                      cache_usage := CacheUsage}) ->
     Outcome = case ReversedToolCalls of
         [] -> streamed;
         _ ->
@@ -535,31 +848,116 @@ final_stream_result(#{tool_calls := ReversedToolCalls,
              normalize_tool_call_signatures(
                lists:reverse(ReversedToolCalls))}
     end,
-    case GroundingMetadata of
-        undefined ->
-            case Outcome of
-                streamed -> ok;
-                ToolCalls -> ToolCalls
-            end;
-        _ ->
-            case adk_provider_result:new(
-                   <<"gemini">>, <<"google_search_grounding">>,
-                   Outcome, GroundingMetadata) of
-                {ok, ProviderResult} -> ProviderResult;
-                {error, Reason} ->
-                    {error, {invalid_grounding_metadata, Reason}}
-            end
+    finalize_provider_metadata(
+      Outcome, GroundingMetadata, CacheContext, CacheUsage).
+
+merge_stream_result(ToolCalls, GroundingMetadata, CacheUsage,
+                    Acc = #{tool_calls := ReversedToolCalls,
+                            grounding_metadata := Existing,
+                            cache_usage := ExistingUsage}) ->
+    NewToolCalls = lists:reverse(ToolCalls, ReversedToolCalls),
+    case {merge_grounding_metadata(Existing, GroundingMetadata),
+          merge_cache_usage(ExistingUsage, CacheUsage)} of
+        {{ok, NewGrounding}, {ok, NewUsage}} ->
+            {ok, Acc#{tool_calls => NewToolCalls,
+                      grounding_metadata => NewGrounding,
+                      cache_usage => NewUsage}};
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error
     end.
 
-merge_stream_result(ToolCalls, GroundingMetadata,
-                    Acc = #{tool_calls := ReversedToolCalls,
-                            grounding_metadata := Existing}) ->
-    NewToolCalls = lists:reverse(ToolCalls, ReversedToolCalls),
-    case merge_grounding_metadata(Existing, GroundingMetadata) of
-        {ok, NewGrounding} ->
-            {ok, Acc#{tool_calls => NewToolCalls,
-                      grounding_metadata => NewGrounding}};
+merge_cache_usage(Existing, undefined) -> {ok, Existing};
+merge_cache_usage(undefined, New) -> {ok, New};
+merge_cache_usage(Existing, New) when is_map(Existing), is_map(New) ->
+    {ok, maps:merge(Existing, New)};
+merge_cache_usage(_, _) -> {error, invalid_gemini_cache_usage_metadata}.
+
+finalize_provider_metadata(Outcome, GroundingMetadata,
+                           CacheContext, CacheUsage) ->
+    case context_cache_metadata(CacheContext, CacheUsage) of
+        {ok, undefined} ->
+            finalize_grounding_only(Outcome, GroundingMetadata);
+        {ok, CacheMetadata} ->
+            case GroundingMetadata of
+                undefined ->
+                    new_cache_provider_result(Outcome, CacheMetadata);
+                Grounding when is_map(Grounding) ->
+                    case adk_provider_result:new(
+                           <<"gemini">>, <<"google_search_grounding">>,
+                           Outcome,
+                           Grounding#{<<"context_cache">> =>
+                                         CacheMetadata}) of
+                        {ok, ProviderResult} -> ProviderResult;
+                        {error, Reason} ->
+                            {error, {invalid_grounding_metadata, Reason}}
+                    end
+            end;
         {error, _} = Error -> Error
+    end.
+
+finalize_grounding_only(Outcome, undefined) -> outcome_result(Outcome);
+finalize_grounding_only(Outcome, GroundingMetadata) ->
+    case adk_provider_result:new(
+           <<"gemini">>, <<"google_search_grounding">>,
+           Outcome, GroundingMetadata) of
+        {ok, ProviderResult} -> ProviderResult;
+        {error, Reason} -> {error, {invalid_grounding_metadata, Reason}}
+    end.
+
+new_cache_provider_result(Outcome, CacheMetadata) ->
+    case adk_provider_result:new(
+           <<"gemini">>, <<"context_cache_usage">>,
+           Outcome, CacheMetadata) of
+        {ok, ProviderResult} -> ProviderResult;
+        {error, Reason} ->
+            {error, {invalid_gemini_cache_usage_metadata, Reason}}
+    end.
+
+outcome_result(streamed) -> ok;
+outcome_result(Outcome) -> Outcome.
+
+context_cache_metadata(disabled, _Usage) -> {ok, undefined};
+context_cache_metadata(#{status := bypass,
+                         public_metadata := Public}, _Usage) ->
+    {ok, #{<<"lifecycle">> => Public}};
+context_cache_metadata(#{status := active,
+                         public_metadata := Public}, Usage)
+  when is_map(Usage) ->
+    {ok, #{<<"lifecycle">> => Public,
+           <<"usage_metadata">> => Usage}};
+context_cache_metadata(#{status := active}, undefined) ->
+    {error, missing_gemini_cached_token_usage};
+context_cache_metadata(_, _) ->
+    {error, invalid_gemini_context_cache_metadata}.
+
+response_cache_usage(Response) when is_map(Response) ->
+    case maps:find(<<"usageMetadata">>, Response) of
+        error -> {ok, undefined};
+        {ok, Usage} when is_map(Usage) -> normalize_cache_usage(Usage);
+        {ok, _} -> {error, invalid_gemini_cache_usage_metadata}
+    end;
+response_cache_usage(_) -> {error, invalid_gemini_cache_usage_metadata}.
+
+normalize_cache_usage(Usage) ->
+    case maps:find(<<"cachedContentTokenCount">>, Usage) of
+        error -> {ok, undefined};
+        {ok, Cached} when is_integer(Cached), Cached >= 0 ->
+            normalize_cache_usage_fields(
+              Usage,
+              [<<"cachedContentTokenCount">>, <<"promptTokenCount">>,
+               <<"candidatesTokenCount">>, <<"totalTokenCount">>,
+               <<"thoughtsTokenCount">>,
+               <<"toolUsePromptTokenCount">>], #{});
+        {ok, _} -> {error, invalid_gemini_cache_usage_metadata}
+    end.
+
+normalize_cache_usage_fields(_Usage, [], Acc) -> {ok, Acc};
+normalize_cache_usage_fields(Usage, [Key | Rest], Acc) ->
+    case maps:find(Key, Usage) of
+        error -> normalize_cache_usage_fields(Usage, Rest, Acc);
+        {ok, Value} when is_integer(Value), Value >= 0 ->
+            normalize_cache_usage_fields(Usage, Rest, Acc#{Key => Value});
+        {ok, _} -> {error, invalid_gemini_cache_usage_metadata}
     end.
 
 merge_grounding_metadata(Existing, undefined) ->
@@ -602,7 +1000,7 @@ validate_stream_grounding(Metadata) ->
 consume_sse_frame(Frame, Callback, Mode, Limits) ->
     case sse_data(Frame) of
         none ->
-            {ok, [], undefined};
+            {ok, [], undefined, undefined};
         <<"[DONE]">> ->
             done;
         Data ->
@@ -634,19 +1032,22 @@ strip_optional_space(Value) -> Value.
 
 consume_stream_response(Response, Callback, Mode, Limits) ->
     GroundingMetadata = stream_grounding_metadata(Response),
-    case stream_response_parts(Response) of
-        {ok, []} -> {ok, [], GroundingMetadata};
-        {ok, Parts} ->
+    case {stream_response_parts(Response),
+          response_cache_usage(Response)} of
+        {{ok, []}, {ok, CacheUsage}} ->
+            {ok, [], GroundingMetadata, CacheUsage};
+        {{ok, Parts}, {ok, CacheUsage}} ->
             case adk_llm_gemini_content:decode(Parts, Limits) of
                 {ok, Content} ->
                     case emit_stream_content(Mode, Content, Callback) of
                         {ok, ToolCalls} ->
-                            {ok, ToolCalls, GroundingMetadata};
+                            {ok, ToolCalls, GroundingMetadata, CacheUsage};
                         {error, _} = Error -> Error
                     end;
                 {error, _} = Error -> Error
             end;
-        {error, _} = Error -> Error
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error
     end.
 
 stream_grounding_metadata(#{<<"candidates">> := [Candidate | _]})
@@ -687,12 +1088,51 @@ stream_response_parts(#{<<"usageMetadata">> := _}) ->
 stream_response_parts(_) ->
     {error, invalid_stream_response}.
 
-decode_response(Body, Limits) ->
+decode_response(Body, Limits, CacheContext) ->
     try jsx:decode(Body, [return_maps]) of
-        ResponseMap -> parse_response(ResponseMap, Limits)
+        ResponseMap ->
+            case {parse_response(ResponseMap, Limits),
+                  response_cache_usage(ResponseMap)} of
+                {{error, _} = Error, _} -> Error;
+                {_, {error, _} = Error} -> Error;
+                {Result, {ok, CacheUsage}} ->
+                    add_context_cache_to_result(
+                      Result, CacheContext, CacheUsage)
+            end
     catch
         error:Reason -> {error, {invalid_json, Reason}}
     end.
+
+add_context_cache_to_result(Result, disabled, _CacheUsage) -> Result;
+add_context_cache_to_result({provider_result, _} = Result,
+                            CacheContext, CacheUsage) ->
+    case {adk_provider_result:decode(Result),
+          context_cache_metadata(CacheContext, CacheUsage)} of
+        {{ok, Outcome, ProviderMetadata}, {ok, CacheMetadata}} ->
+            Existing = maps:get(<<"metadata">>, ProviderMetadata),
+            case adk_provider_result:new(
+                   maps:get(<<"provider">>, ProviderMetadata),
+                   maps:get(<<"type">>, ProviderMetadata),
+                   Outcome,
+                   Existing#{<<"context_cache">> => CacheMetadata}) of
+                {ok, ProviderResult} -> ProviderResult;
+                {error, Reason} ->
+                    {error, {invalid_gemini_cache_usage_metadata, Reason}}
+            end;
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error;
+        {not_provider_result, _} -> {error, invalid_provider_result}
+    end;
+add_context_cache_to_result(Result, CacheContext, CacheUsage) ->
+    case context_cache_metadata(CacheContext, CacheUsage) of
+        {ok, CacheMetadata} ->
+            new_cache_provider_result(
+              model_result_outcome(Result), CacheMetadata);
+        {error, _} = Error -> Error
+    end.
+
+model_result_outcome({ok, _} = Outcome) -> Outcome;
+model_result_outcome({tool_calls, _} = Outcome) -> Outcome.
 
 ssl_options(<<"http://", _/binary>>) ->
     {ok, []};
@@ -758,6 +1198,66 @@ build_payload(Config, Memory, Tools) ->
 tool_schema(Schema) when is_map(Schema) -> Schema;
 tool_schema(Module) when is_atom(Module) -> Module:schema().
 
+%% Gemini exposes two mutually-exclusive function parameter fields. The
+%% legacy `parameters` field accepts only Google's OpenAPI Schema subset,
+%% whereas `parametersJsonSchema` accepts JSON Schema. ADK tool contracts are
+%% intentionally provider-neutral and may use JSON-Schema-only constraints
+%% such as additionalProperties or oneOf, so select the correct wire field at
+%% the provider boundary instead of weakening the runtime contract.
+provider_tool_schema(Tool) ->
+    Schema = tool_schema(Tool),
+    case maps:take(<<"parameters">>, Schema) of
+        {Parameters, Declaration}
+          when is_map(Parameters) ->
+            case requires_json_schema(Parameters) of
+                true ->
+                    Declaration#{<<"parametersJsonSchema">> => Parameters};
+                false ->
+                    Schema
+            end;
+        {Parameters, Declaration} ->
+            %% Boolean roots are valid JSON Schema (`true' accepts every
+            %% object and `false' accepts none) but are not representable in
+            %% Gemini's legacy OpenAPI-subset field.
+            Declaration#{<<"parametersJsonSchema">> => Parameters};
+        error ->
+            Schema
+    end.
+
+requires_json_schema(Value) ->
+    not legacy_parameter_schema(Value).
+
+%% Keep the legacy wire field only for a deliberately small, positive subset
+%% that is known to be accepted by Gemini's FunctionDeclaration.parameters.
+%% Unknown keywords, boolean subschemas and type unions are valid JSON Schema,
+%% but must use parametersJsonSchema. A positive subset is future-safe: adding
+%% a constraint to an ADK tool cannot silently leave it in the wrong field.
+legacy_parameter_schema(Schema) when is_map(Schema) ->
+    Allowed = [<<"type">>, <<"description">>, <<"format">>,
+               <<"nullable">>, <<"enum">>, <<"properties">>,
+               <<"required">>, <<"items">>, <<"minimum">>,
+               <<"maximum">>, <<"minItems">>, <<"maxItems">>,
+               <<"minLength">>, <<"maxLength">>, <<"pattern">>],
+    Unknown = maps:keys(maps:without(Allowed, Schema)),
+    Unknown =:= []
+        andalso legacy_type(maps:get(<<"type">>, Schema, undefined))
+        andalso legacy_properties(
+                  maps:get(<<"properties">>, Schema, undefined))
+        andalso legacy_items(maps:get(<<"items">>, Schema, undefined));
+legacy_parameter_schema(_Schema) ->
+    false.
+
+legacy_type(undefined) -> true;
+legacy_type(Type) -> is_binary(Type).
+
+legacy_properties(undefined) -> true;
+legacy_properties(Properties) when is_map(Properties) ->
+    lists:all(fun legacy_parameter_schema/1, maps:values(Properties));
+legacy_properties(_Properties) -> false.
+
+legacy_items(undefined) -> true;
+legacy_items(Items) -> legacy_parameter_schema(Items).
+
 add_provider_tools(Payload, Config, Tools) ->
     Builtins = case maps:get(builtin_tools, Config, []) of
         [google_search] -> [#{<<"googleSearch">> => #{}}];
@@ -766,7 +1266,7 @@ add_provider_tools(Payload, Config, Tools) ->
     FunctionTools = case Tools of
         [] -> [];
         _ ->
-            Declarations = [tool_schema(Tool) || Tool <- Tools],
+            Declarations = [provider_tool_schema(Tool) || Tool <- Tools],
             [#{<<"functionDeclarations">> => Declarations}]
     end,
     case Builtins ++ FunctionTools of

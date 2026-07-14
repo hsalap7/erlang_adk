@@ -1,14 +1,18 @@
-# Erlang ADK v0.4.0 (development)
+# Erlang ADK v0.5.0 (development)
 
 Erlang ADK is an experimental, Erlang-native toolkit for building Gemini-backed agents with OTP processes, supervision, tools, sessions, event streams, and concurrent multi-agent workflows.
 
-Version 0.4.0 is under active development on the `version_0.4.0` branch. The
-[v0.4.0 development contract](docs/VERSION_0_4_0.md) tracks its focus on
-agent, tool, and workflow behavior and the verification gates required before
-those capabilities are claimed complete. It builds on the completed 0.3.0
-runtime and developer-tooling foundation. The billable live Gemini suite
-remains a separate opt-in provider gate in a shell that owns
-`GEMINI_API_KEY`.
+Version 0.5.0 is under active development on the `version_0.5.0` branch. The
+[v0.5.0 development contract](docs/VERSION_0_5_0.md) tracks its focus on
+artifacts, memory, and context and the verification gates required before
+those capability families are claimed complete. It builds on the completed
+0.4.0 agent, tool, and workflow release. The billable live Gemini suite
+remains a separate opt-in provider gate in a shell that owns `GEMINI_API_KEY`.
+The final 0.5 deterministic gate passes 765 EUnit tests, six Common Test
+scenarios, and warning-free Dialyzer over 160 project files. The full paid live
+run records 14 passes and two HTTP 429 rate-limit failures with no skips.
+The focused user guides are [artifacts](docs/ARTIFACTS.md),
+[memory](docs/MEMORY.md), and [context](docs/CONTEXT.md).
 
 The detailed [ADK behavior-parity matrix](docs/FEATURE_PARITY.md) maps the
 official ADK capability families to their Erlang/OTP-native implementation
@@ -25,7 +29,7 @@ BEAM concurrency without making one conversation nondeterministic.
 
 ## Current scope
 
-| Area | Status on the v0.4.0 branch |
+| Area | Status on the v0.5.0 branch |
 | --- | --- |
 | Gemini text, versioned multimodal content, function calling, Google Search grounding, thinking levels/summaries, adjustable safety settings, thought signatures, call IDs, SSE text/content streaming, structured-output settings, and provider capability discovery | Implemented on this branch; the bidirectional Gemini Live WebSocket API is not implemented |
 | Erlang tools and agents exposed as model tools | Compiled schemas, strict arguments, collision checks, isolated AgentTool calls, and Runner boolean confirmation are implemented; direct/workflow confirmation fails closed because those surfaces have no approval continuation |
@@ -43,20 +47,22 @@ BEAM concurrency without making one conversation nondeterministic.
 | OpenAPI | Strict OpenAPI 3.0/3.1 compiler, production Gun transport, per-principal auth broker, and first-class agent/Runner toolsets are implemented; the supported subset is documented below |
 | MCP | Supervised stdio and MCP 2025-11-25 Streamable HTTP clients plus a bounded tool/resource/prompt server are implemented and release-gated; optional server GET/SSE and advanced capabilities remain explicit limitations |
 | A2A interoperability | A2A 1.0 Agent Card plus bounded JSON-RPC/SSE tasks, artifacts, replay, principal scoping, and outbound client are implemented; the older `/a2a/prompt` endpoint remains explicitly legacy |
-| Versioned artifacts and Runner-integrated long-term memory | Immutable ETS and durable filesystem artifacts plus explicit memory retrieval/ingestion policies are implemented; managed adapters remain application integrations |
-| Auth and integrated developer tooling | Private scoped credentials, interactive PKCE suspension/completion, Oidcc-backed JWT/OAuth adapters, an authenticated bounded REST/SSE console, and the `adk` CLI are implemented and release-gated on this branch |
+| Versioned artifacts | Partial 0.5 implementation: strict app/user/session scopes, immutable ETS/filesystem versions, quotas, paginated metadata, deadline-aware mutations, least-authority tool helpers, metadata-only event effects, one-request model-selected attachment, filesystem repair, exact-scope developer inspection/delete, and an opt-in bounded exact-scope sharded adapter are implemented; direct adapters serialize per service while sharded workers preserve same-scope ordering and let unrelated scopes overlap; durable lifetime scope/name/version admission fails explicitly before bounded scans can be exhausted; credit-based blob streaming and complete durable orphan recovery remain open |
+| Scoped long-term memory | Partial 0.5 implementation: the v2 app/user-scoped contract, bounded lexical ETS and durable local Mnesia adapters, provenance/idempotency, preload and model-selected retrieval, entry/session/user erasure, deadline-aware calls, fail-closed Mnesia-outbox admission, developer search/erase, and an opt-in bounded exact-user sharded adapter are implemented; durable delivery uses bounded resolution and a freshly revalidated ownership lease immediately before an idempotent at-least-once mutation; direct lexical adapters serialize per service while sharded workers overlap unrelated users; managed vector search, pending-job erasure coordination, and policy-driven retention remain adapters or application policy |
+| Context selection, compaction, and caching | Partial 0.5 implementation: mandatory model-boundary sanitization, complete-envelope budgets, O(n) exchange-aware selection, owner-bound compression, context fingerprints, opt-in Runner compaction with atomic ETS/Mnesia checkpoint persistence, a provider-prefix-cache lifecycle, and deterministic Gemini create/reuse/bypass/generate/stream wiring are implemented; cache installation synchronously rechecks every absolute waiter deadline and deletes an orphan provider resource when no live waiter remains; caching is request-prefix reuse rather than response caching, and billable live Gemini cache evidence remains a separate gate |
+| Auth and integrated developer tooling | Private scoped credentials, interactive PKCE suspension/completion, Oidcc-backed JWT/OAuth adapters, an authenticated bounded REST/SSE console, and the `adk` CLI are implemented; 0.5 adds exact-scope artifact/memory operations and content-free compaction/cache lifecycle; the clean deterministic and packaged-CLI gates pass, while the live result is 14 passes plus two HTTP 429 failures |
 | Phoenix LiveView companion | A complete stable-run integration pattern is documented below with authenticated principals, credit/ack replay, reconnect gaps, bounded UI state, and HITL resume; the public Erlang contract is tested here, while companion Elixir syntax is manually reviewed because this repository has no Mix compile gate |
 
 ## Installation
 
-While 0.4.0 is being developed, depend on this branch (or use a local path in
+While 0.5.0 is being developed, depend on this branch (or use a local path in
 the same way):
 
 ```erlang
 {deps, [
     {erlang_adk,
      {git, "https://github.com/hsalap7/erlang_adk.git",
-      {branch, "version_0.4.0"}}}
+      {branch, "version_0.5.0"}}}
 ]}.
 ```
 
@@ -347,7 +353,7 @@ the root of a new tree. Resolution remains bounded and secret-scrubbed; agent
 configuration is never mutated.
 
 Google's Python ADK currently marks its direct `global_instruction` field as
-deprecated in favor of `GlobalInstructionPlugin`. Erlang ADK 0.4.0 keeps the
+deprecated in favor of `GlobalInstructionPlugin`. Erlang ADK 0.5.0 keeps the
 explicit root field while providing the same tree-wide behavior through
 message-passed invocation context; an app-level instruction plugin can be
 added later without changing this contract.
@@ -394,10 +400,19 @@ schema before runtime policy, confirmation, callbacks, credentials, or side
 effects. Invalid values are never reflected in the model-visible structural
 error.
 
+Gemini has two mutually exclusive function-parameter fields. Erlang ADK keeps
+the normalized provider-neutral contract for local validation, then emits the
+legacy `parameters` field only for a deliberately small positive subset that
+Gemini accepts there. Any schema outside that subset—including `oneOf`,
+`additionalProperties`, a type union, a boolean subschema, a top-level
+`parameters => true | false` schema, or an unknown keyword—is sent unchanged
+as `parametersJsonSchema`. The provider boundary does not weaken the tool's
+runtime validation contract.
+
 An `adk_toolset` descriptor is an immutable catalog snapshot. `schemas/1` and
 resolution reuse its compiled contracts; `refresh/1` deliberately returns a
 replacement descriptor for a mutable MCP/OpenAPI backend. A running agent has
-no live catalog-swap API in 0.4.0, so new remote tools require a refreshed
+no live catalog-swap API in 0.5.0, so new remote tools require a refreshed
 descriptor and replacement agent. A removed or changed operation fails closed
 as `tool_catalog_changed` instead of executing against a stale declaration.
 Trusted local Erlang tool contexts carry private bounded agent ancestry so an
@@ -1074,6 +1089,8 @@ Runner = adk_runner:new(
             max_content_bytes => 262144},
       context_policy => #{max_bytes => 32768,
                           max_tokens => 8192,
+                          max_request_bytes => 65536,
+                          max_request_tokens => 16384,
                           overflow => truncate}}),
 {ok, RunnerResponse} = adk_runner:run(
     Runner, <<"user-1">>, <<"session-1">>, <<"Hello">>),
@@ -1112,17 +1129,26 @@ Use one active Runner invocation per session. Independent agents and sessions ca
 default to 32 and 16 respectively and prevent an otherwise valid model/tool
 conversation from looping forever.
 
-`context_policy` filters and measures canonical, credential-scrubbed session
-events before each model call. `overflow => truncate` keeps the newest suffix;
-`error` fails explicitly, while `compress` requires a monitored compressor with
-timeout, heap, event-count, and output-size bounds. Author, invocation, content
-type, time-range, partial, and final-event filters are supported. The current
-invocation's user event may not be filtered out. Context-build telemetry is
-emitted as `[erlang_adk, context, build]` with byte/token estimates, dropped
-event count, and a secret-free cache key. The estimate covers selected events
-and retrieved memory; agent instruction bytes have their own
-`max_instruction_bytes` bound, and exact provider tokenization remains an
-adapter concern.
+Runner always canonicalizes and secret-prunes model history. `context_policy`
+adds filtering and selected-event budgets before each model call.
+`overflow => truncate` keeps the newest complete context exchanges; it never
+separates a tool call from its responses. `error` fails explicitly, while
+`compress` requires an owner-bound monitored compressor with timeout, heap,
+event-count, and output-size bounds. Author, invocation, content type,
+time-range, partial, and final-event filters are supported. The current
+invocation's user event may not be filtered out.
+
+`max_request_bytes` and `max_request_tokens` are a second fail-closed boundary
+over the complete sanitized provider envelope: effective instructions and
+generation settings, selected history, retrieved memory, current input,
+multimodal parts, tool declarations, and framing. A violation returns
+`{request_context_budget_exceeded, Details}` before provider I/O. Context-build
+telemetry is emitted as `[erlang_adk, context, build]`; complete-envelope
+telemetry uses `[erlang_adk, context, envelope]`. Both expose bounded counts,
+estimates, and deterministic context fingerprints without prompt content or
+credentials. Exact provider tokenization remains a provider adapter concern.
+See [the context guide](docs/CONTEXT.md) for compaction, provider-prefix cache,
+and least-authority tool context contracts.
 
 ### Admission control and runtime policy
 
@@ -1453,7 +1479,7 @@ is a digest and contains no raw arguments. Non-Runner agent execution
 and typed workflow tool actions have no durable approval channel, so a required
 confirmation fails closed as `tool_confirmation_requires_runner`; they never
 silently execute. Structured “modify arguments” confirmation responses are
-not supported in 0.4.0.
+not supported in 0.5.0.
 
 `adk_long_running_tool` uses the distinct long-running suspension contract. A
 pause is not an error; resume records a matching function response with the
@@ -1769,7 +1795,7 @@ ok = adk_llm_gemini:stream_content(
 does not append a second buffered final content value. Gemini Live's
 bidirectional WebSocket lifecycle (audio/video input, interruption, session
 resumption, and backpressure) is a separate protocol and is explicitly
-unsupported in v0.4.0 rather than being simulated through REST SSE.
+unsupported in v0.5.0 rather than being simulated through REST SSE.
 
 To put that structured stream through sessions, plugins, stable run replay,
 and cancellation, select content streaming on the Runner:
@@ -1937,7 +1963,7 @@ This server returns JSON for POST and intentionally returns HTTP 405 for the
 optional unsolicited GET/SSE channel. The client accepts JSON and bounded SSE
 responses to POST. SSE resumability, resource subscriptions/templates,
 notifications, roots, sampling, elicitation, completion, MCP OAuth discovery,
-and a server-side stdio transport are explicit 0.4.0 limitations. Endpoint
+and a server-side stdio transport are explicit 0.5.0 limitations. Endpoint
 URLs containing user info, query strings, or fragments are rejected so bearer
 credentials cannot accidentally become request URLs. Deprecated
 HTTP+SSE (`<<"sse">>`) fails with
@@ -1951,7 +1977,7 @@ and automatically retries only read-only protocol operations (`tools/list`,
 method whose first attempt may already have caused an effect; that call returns
 `{error, {mcp_session_lost, request_not_replayed}}`, and a later explicit
 application call uses the renewed session. Per-client HTTP request
-serialization and a separately bounded pending-request queue remain 0.4.0
+serialization and a separately bounded pending-request queue remain 0.5.0
 limitations; use independent supervised MCP clients for concurrency and
 failure isolation.
 
@@ -2119,7 +2145,7 @@ ok = erlang_adk:stop_agent(EvalPid).
 
 Rows share the supplied stateful agent and therefore share its conversation history. Evaluator worker concurrency does not make one `gen_server` process concurrent; use separate agents/sessions when cases must be isolated. The timeout is enforced by monitored evaluator workers for both sequential and parallel batches.
 
-## Retry, memory, and artifacts
+## Retry, artifacts, memory, and context lifecycle
 
 A deterministic retry example:
 
@@ -2144,45 +2170,88 @@ escaping the retry budget. For caller-detached application work, put the
 complete retry operation inside an `adk_task` or supervised run rather than
 using retry as a process-lifecycle substitute.
 
-The ETS memory service performs deterministic case-insensitive token-overlap
-ranking with exact metadata filtering; it is not a vector database. Runner integration is
-explicit so enabling a service cannot silently change a prompt:
+The version-2 memory contract requires an exact application/user scope. The
+ETS adapter performs deterministic lexical-overlap ranking with exact metadata
+filtering; use the Mnesia adapter for durable local storage. Neither is a
+vector database. Runner retrieval and ingestion are separate opt-ins, so merely
+configuring a service cannot silently change a prompt:
 
 ```erlang
-{ok, MemoryPid} = adk_memory_ets:init(#{}),
-{ok, MemoryId} = adk_memory_ets:add(
-    MemoryPid, <<"OTP supervision trees restart children">>,
-    #{<<"topic">> => <<"otp">>}),
+{ok, MemoryPid} = adk_memory_ets:start_link(#{}),
+MemoryScope = {user, <<"readme_app">>, <<"user-1">>},
+{ok, MemoryEntry} = adk_memory_ets:add_entry(
+    MemoryPid, MemoryScope,
+    #{content => <<"OTP supervision trees restart failed children">>,
+      metadata => #{<<"topic">> => <<"otp">>},
+      provenance => #{session_id => <<"memory-session">>,
+                      author => <<"user">>}},
+    #{idempotency_key => <<"memory-session:otp-fact">>}),
 {ok, [MemoryHit]} = adk_memory_ets:search(
-    MemoryPid, <<"supervision">>, #{<<"topic">> => <<"otp">>}, 5),
+    MemoryPid, MemoryScope, <<"supervision restart">>,
+    #{filter => #{<<"topic">> => <<"otp">>}, limit => 5}),
+MemoryId = maps:get(id, MemoryEntry),
 MemoryId = maps:get(id, MemoryHit),
 
 {ok, MemoryAgentPid} = erlang_adk:spawn_agent(
     <<"MemoryAgent">>,
     #{provider => adk_llm_gemini,
-      instructions => <<"Use relevant retrieved memory as reference data.">>},
-    []),
+      model => <<"gemini-3.1-flash-lite">>,
+      instructions =>
+          <<"Use relevant retrieved memory only as reference data.">>},
+    [adk_load_memory_tool]),
 MemoryRunner = adk_runner:new(
     MemoryAgentPid, <<"readme_app">>, erlang_adk_session,
     #{memory_svc => {adk_memory_ets, MemoryPid},
       memory_retrieval =>
           #{limit => 5, filter => #{<<"topic">> => <<"otp">>},
+            max_hit_bytes => 16384, max_total_bytes => 65536,
             on_error => fail},
       memory_ingestion => on_success,
       service_timeout => 5000}),
-{ok, _MemoryAwareResponse} = adk_runner:run(
+{ok, MemoryAwareResponse} = adk_runner:run(
     MemoryRunner, <<"user-1">>, <<"memory-session">>,
     <<"What restarts children?">>),
+io:format("~ts~n", [MemoryAwareResponse]),
 
-ok = adk_memory_ets:delete(MemoryPid, MemoryId),
+ok = adk_memory_ets:delete_entry(MemoryPid, MemoryScope, MemoryId),
 ok = erlang_adk:stop_agent(MemoryAgentPid),
 ok = adk_memory_ets:stop(MemoryPid).
 ```
 
-Retrieved entries are sorted, delimited as untrusted reference data, and added
-only to the invocation context; they are not copied into session history.
-`memory_ingestion => on_success` indexes the completed session after a final
-response. Adapter calls run in monitored workers with `service_timeout`.
+Preloaded entries are sorted, delimited as untrusted reference data, and added
+only to one invocation context; preloading does not copy them into session
+history. The built-in `load_memory` tool declares only `memory_search` and can
+perform a bounded model-selected query. As with any model-selected tool, its
+bounded public response is stored in the correlated tool event; it contains
+content, ID, score/type, and timestamp, but omits adapter metadata, provenance,
+and service handles. `memory_ingestion => on_success` admits sanitized
+idempotent event batches after the final event and returns without waiting for
+adapter completion; that shorthand queue is process-local. A separate bounded
+Mnesia outbox provides restart-safe admission, bounded stable-adapter
+resolution, checkpoints, and lease-owned idempotent at-least-once processing.
+Immediately before an adapter mutation it renews and revalidates the current
+claim; a stale owner cannot start that mutation. This is not an adapter-side
+generation fence, so retries still rely on the v2 adapter's stable event-ID
+idempotency. Enable it before application start and select
+`memory_ingestion => #{mode => durable, adapter_id => <<"...">>,
+max_attempts => 5}` on the Runner. Runner construction fails when that durable
+runtime is unavailable, and an admission failure is returned to the caller
+after the final session event has been persisted. See the memory guide for the
+exact boundary and operational status API.
+
+Entry, session, and user erasure are exact-scope operations. See
+[scoped long-term memory](docs/MEMORY.md) for Mnesia setup, ingestion durability,
+deadlines, provenance, and current limits.
+
+The direct ETS/Mnesia adapters serialize ranking and storage within one service
+process. Use `adk_memory_sharded` when unrelated user scopes should overlap: it
+owns one stable supervised adapter worker per exact `{user, App, User}` scope,
+bounds active scopes and router admission, and defaults to ETS or can wrap
+`adk_memory_mnesia`. Same-scope calls remain ordered. An independent guard
+releases cold-route admission when a caller dies or times out and prevents its
+queued stale request from creating an abandoned shard. Capacity reported by
+this wrapper is per shard (`global_quota => false`), so deployments needing a
+global tenant budget must enforce it in admission or a custom adapter.
 
 Artifacts are immutable binary versions scoped to an application, user, or
 session. The ETS adapter is useful for tests and one-node development:
@@ -2200,13 +2269,24 @@ ArtifactScope =
 {ok, LatestArtifact} = adk_artifact_ets:get(
     ArtifactPid, ArtifactScope, <<"reports/result.txt">>, latest),
 <<"second">> = maps:get(data, LatestArtifact),
+{ok, #{scope := ArtifactScope,
+       items := [<<"reports/result.txt">>], next_cursor := undefined}} =
+    adk_artifact_ets:list_names(ArtifactPid, ArtifactScope, #{limit => 100}),
 io:format("sha256=~ts~n", [Digest]),
 ok = adk_artifact_ets:stop(ArtifactPid).
 ```
 
-Pass `{adk_artifact_ets, ArtifactPid}` as Runner option `artifact_svc`. Tools
-then receive the opaque service reference plus their session `artifact_scope`
-in `Context`; artifact bytes are not automatically pasted into prompts.
+Pass `{adk_artifact_ets, ArtifactPid}` as Runner option `artifact_svc`. A new
+local tool declares only the operations it needs through
+`context_capabilities/0` and calls `adk_context:save_artifact/4`,
+`load_artifact/3`, `list_artifacts/2`, `list_artifact_versions/3`, or
+`delete_artifact/3`; it never receives the service PID. Successful mutations
+produce metadata-only `context_effects` in the correlated tool event.
+
+Adding `adk_load_artifacts_tool` allows model-selected attachment. Runner
+verifies the exact scoped version, MIME type, size, and digest and injects its
+bounded `adk_content` parts into only the next model request. Artifact bytes
+are not copied into ordinary history, state, events, or developer diagnostics.
 
 For durable one-node storage, use the filesystem adapter. Logical scope/name
 values are SHA-256-addressed rather than used as path components, and every
@@ -2230,10 +2310,44 @@ ok = file:del_dir_r(ArtifactRoot).
 
 Exclusive durable reservations ensure deleted or interrupted versions are
 never reused, including after restart or concurrent service instances. The
-root and generated directories must be real directories rather than symlinks.
+filesystem adapter admits at most `max_scan_entries div 3` lifetime versions
+for one scoped logical name. It also admits at most `max_scan_entries div 2`
+lifetime scopes per root and the same number of lifetime names per scope
+(`max_scan_entries` must be at least three). Exhaustion returns
+`artifact_version_capacity_reached`, `artifact_name_capacity_reached`, or
+`artifact_scope_capacity_reached` before bounded listing/repair scans fail.
+Durable slots and version reservations are non-reuse tombstones, so deletion
+does not restore any lifetime capacity. Rotate to a new name, scope, or root as
+appropriate, or configure a larger bound before deployment. The root and
+generated directories must be real directories rather than symlinks.
 The adapter does not encrypt artifacts; use least-privilege permissions and an
 encrypted volume where confidentiality requires it. See
 [Artifact services](docs/ARTIFACTS.md).
+
+For artifact workloads with many independent scopes, `adk_artifact_sharded`
+provides the same service API with one stable supervised ETS or filesystem
+worker per exact scope. Unrelated scopes execute concurrently while one scope
+retains adapter ordering. The wrapper bounds active scopes and simultaneous
+cold-route admission; resolved scopes bypass the router through a protected
+ETS route. A guard monitors each unresolved caller, releases its permit on
+death or timeout, and prevents an already queued stale request from creating
+an abandoned shard. Filesystem shards use deterministic path-safe subroots.
+Its quotas are per shard rather than globally aggregated. See the artifact guide for
+setup, status, persistence, and repair limitations.
+
+Context selection, automatic-compaction, and provider-prefix-cache lifecycle
+APIs are documented in [Context selection, compaction, and caching](docs/CONTEXT.md).
+Runner compaction requires a session backend implementing atomic
+`compact_events/5` (both bundled backends do), and the prefix cache stores
+provider request prefixes rather than model responses. Both remain explicit
+Runner options rather than default behavior.
+
+Provider cache creation is deadline-safe even at a mailbox race: immediately
+before installing a successful provider result, the registry synchronously
+rechecks every waiter's absolute deadline. Expired callers receive the
+configured deadline failure/bypass result; if all waiters have expired, the
+new provider resource is deleted through the bounded cleanup path instead of
+becoming an unreachable cache entry.
 
 ## A2A 1.0 interoperability
 
@@ -2383,7 +2497,9 @@ Set a dedicated local bearer token before starting the VM:
 export ERLANG_ADK_DEV_TOKEN="replace-with-at-least-16-random-characters"
 ```
 
-Then enable the listener before the application starts:
+Then configure the listener bounds before the application starts. If artifact
+or memory routes are needed, do not start the application until the
+exact-scope resource provider in the following two fences is also configured:
 
 ```erlang
 _ = application:stop(erlang_adk),
@@ -2399,22 +2515,33 @@ ok = application:set_env(
     erlang_adk, dev_run_options,
     #{retention_ms => 60000, max_buffered_events => 256}),
 ok = application:set_env(erlang_adk, dev_max_session_results, 100),
+ok = application:set_env(erlang_adk, dev_max_resource_results, 100),
+ok = application:set_env(erlang_adk, dev_diagnostic_timeout_ms, 5000),
+ok = application:set_env(
+    erlang_adk, dev_diagnostic_context_policy,
+    #{max_bytes => 1048576,
+      max_tokens => 262144,
+      overflow => truncate}),
 ok = application:set_env(erlang_adk, dev_sse_max_events, 128),
 ok = application:set_env(erlang_adk, dev_sse_max_bytes, 1048576),
-ok = application:set_env(erlang_adk, dev_sse_max_duration_ms, 300000),
-{ok, _} = application:ensure_all_started(erlang_adk).
+ok = application:set_env(erlang_adk, dev_sse_max_duration_ms, 300000).
 ```
-
-Open `http://127.0.0.1:8080/dev` and enter the token in the connection panel.
-The token remains in page memory, is sent only in the `Authorization` header,
-and is never accepted in a query string. Cowboy route state keeps only its
-SHA-256 digest. Browser requests with an `Origin` header must be same-origin.
 
 The authenticated local API is:
 
 | Method | Path | Behavior |
 | --- | --- | --- |
 | `GET` | `/dev/v1/agents` | Discover live registered agents by stable name |
+| `GET` | `/dev/v1/diagnostics` | Inspect context capabilities and configured artifact/memory sources without content or handles |
+| `GET` | `/dev/v1/context/:app/:user/:session` | Explain bounded context counts and fingerprint for one exact session; events/state are omitted |
+| `GET` | `/dev/v1/context/:app/:user/:session/lifecycle?model=MODEL` | Inspect the latest whitelisted compaction checkpoint fields and content-free cache counts |
+| `POST` | `/dev/v1/context/:app/:user/:session/cache/invalidate` | Invalidate one confirmed provider/app/user/model/policy cache scope across sessions |
+| `GET` | `/dev/v1/artifacts/:app/:user/:session` | List a bounded page of logical names (`limit`, optional exclusive `cursor`) |
+| `GET` | `/dev/v1/artifacts/:app/:user/:session/versions` | List metadata-only versions for required `name` with bounded pagination |
+| `POST` | `/dev/v1/artifacts/:app/:user/:session/delete` | Delete one checked selector after an exact matching confirmation object |
+| `GET` | `/dev/v1/memory/:app/:user` | Inspect the scoped adapter's public capabilities and limits |
+| `POST` | `/dev/v1/memory/:app/:user/search` | Search bounded, redacted reference memory in one exact user scope |
+| `POST` | `/dev/v1/memory/:app/:user/erase` | Erase an entry, session, or user after an exact matching confirmation object |
 | `POST` | `/dev/v1/runs` | Start a stable run for a registered agent |
 | `GET` | `/dev/v1/runs/:run_id` | Inspect status and parent/resume links |
 | `DELETE` | `/dev/v1/runs/:run_id` | Request cancellation |
@@ -2425,6 +2552,103 @@ The authenticated local API is:
 | `GET` | `/dev/v1/sessions/:app/:user/:session` | Inspect one exact session scope |
 | `DELETE` | `/dev/v1/sessions/:app/:user/:session` | Delete one exact session scope |
 | `POST` | `/dev/v1/sessions/:app/:user/:session/state` | Apply one non-secret `{"state_delta":{...}}` |
+
+Artifact and memory routes need an exact-scope resource provider. This avoids a
+global service lookup based only on path text. The callback receives the
+requested scope and returns a validated service reference or denies it. Put
+the module in the owning application's source tree and compile it before the
+startup fence below:
+
+```erlang
+-module(my_dev_resource_provider).
+-export([resolve/3]).
+
+resolve(#{app_name := App, user_id := User, session_id := Session,
+          artifact_svc := ArtifactService},
+        artifact, {session, App, User, Session}) ->
+    {ok, ArtifactService};
+resolve(#{app_name := App, user_id := User,
+          memory_svc := MemoryService},
+        memory, {user, App, User}) ->
+    {ok, MemoryService};
+resolve(_Handle, _Kind, _Scope) ->
+    {error, forbidden}.
+```
+
+For a local development VM, create fresh resource services, configure the
+provider, start the application, and then seed the data the commands below
+inspect. These processes are deliberately distinct from the short-lived
+memory/artifact examples above, which already stopped their services:
+
+```erlang
+{ok, DevArtifactPid} = adk_artifact_ets:start_link(#{}),
+{ok, DevMemoryPid} = adk_memory_ets:start_link(#{}),
+{ok, DevCachePid} = adk_context_cache:start_link(
+    #{min_prefix_tokens => 4096,
+      default_ttl_ms => 300000,
+      failure_mode => bypass}),
+{ok, DevRunnerOptions} =
+    application:get_env(erlang_adk, dev_runner_options),
+ok = application:set_env(
+    erlang_adk, dev_runner_options,
+    DevRunnerOptions#{context_cache =>
+        #{cache => DevCachePid,
+          provider => adk_context_cache_gemini,
+          ttl_ms => 300000,
+          policy => #{purpose => developer_inspection}}}),
+DevResources =
+    #{app_name => <<"readme_app">>,
+      user_id => <<"user-1">>,
+      session_id => <<"artifact-session">>,
+      artifact_svc => {adk_artifact_ets, DevArtifactPid},
+      memory_svc => {adk_memory_ets, DevMemoryPid}},
+ok = application:set_env(
+    erlang_adk, dev_resource_provider,
+    {my_dev_resource_provider, DevResources}),
+{ok, _} = application:ensure_all_started(erlang_adk),
+DevArtifactScope =
+    {session, <<"readme_app">>, <<"user-1">>, <<"artifact-session">>},
+{ok, _} = adk_artifact_ets:put(
+    DevArtifactPid, DevArtifactScope, <<"reports/result.txt">>, <<"ready">>,
+    #{mime_type => <<"text/plain">>}),
+{ok, _} = adk_memory_ets:add_entry(
+    DevMemoryPid, {user, <<"readme_app">>, <<"user-1">>},
+    #{content => <<"OTP supervision restarts failed children">>,
+      provenance => #{session_id => <<"memory-session">>}}, #{}),
+{ok, _} = erlang_adk_session:create_session(
+    <<"readme_app">>, <<"user-1">>,
+    #{session_id => <<"artifact-session">>}).
+```
+
+Now open `http://127.0.0.1:8080/dev` and enter the token in the connection
+panel. The token remains in page memory, is sent only in the `Authorization`
+header, and is never accepted in a query string. Cowboy route state keeps only
+its SHA-256 digest. Browser requests with an `Origin` header must be
+same-origin.
+
+For a simple single-tenant local server, putting `artifact_svc` and
+`memory_svc` in `dev_runner_options` remains a compatibility fallback. A
+provider is preferred whenever different paths may resolve to different
+tenants. Provider handles and returned service references never appear in
+diagnostic output. Context diagnostics work independently through
+`dev_session_service`.
+
+The developer boundary also validates every adapter result against the path
+scope. An artifact name-page envelope or version record whose embedded session
+scope differs from the requested app/user/session, or a memory hit whose
+embedded user scope differs from the requested app/user, fails closed as
+unavailable; it is never projected under the caller's scope.
+
+The lifecycle endpoint reads cache configuration only from the private
+`dev_runner_options.context_cache` map used by that listener. It returns
+whitelisted compaction checkpoint identifiers/counts and cache lifecycle
+counts; it never returns events, summaries, state, policy values, PIDs, leases,
+provider resource names, or credentials. Its session path proves that the
+caller can inspect the anchor session, but a prefix cache is deliberately
+shared across sessions within the exact configured provider, app, user, model,
+and policy scope. Confirmed invalidation removes every entry and in-flight
+create in that scope, across TTLs and prefixes. The 64-character
+`scope_fingerprint` identifies this breadth without exposing the policy.
 
 The developer SSE handler uses `adk_run` credit delivery and has at most one
 unacknowledged run message in its mailbox. Each connection also closes cleanly
@@ -2503,15 +2727,53 @@ terminal-local, so export the same bearer token there as well:
 ```bash
 export ERLANG_ADK_DEV_TOKEN="replace-with-the-same-local-token"
 _build/default/bin/adk inspect agents --url http://127.0.0.1:8080
+_build/default/bin/adk inspect diagnostics --url http://127.0.0.1:8080
 _build/default/bin/adk inspect run RUN_ID
-_build/default/bin/adk inspect sessions adk-cli local
-_build/default/bin/adk inspect session adk-cli local cli-demo
 _build/default/bin/adk session create adk-cli local scratch
+_build/default/bin/adk inspect sessions adk-cli local
+_build/default/bin/adk inspect session adk-cli local scratch
 _build/default/bin/adk session state adk-cli local scratch \
   --delta-json '{"developer:mode":"trace"}'
-_build/default/bin/adk session delete adk-cli local scratch
 _build/default/bin/adk resume RUN_ID \
   --response-json '{"confirmed":true}'
+_build/default/bin/adk session delete adk-cli local scratch
+
+# The remaining resource/context commands require an owning OTP server
+# configured by the Erlang startup example above. Plain `adk serve` has no
+# artifact or memory service PIDs; replace it with that resource-enabled VM.
+_build/default/bin/adk inspect context readme_app user-1 artifact-session
+_build/default/bin/adk inspect context-lifecycle \
+  readme_app user-1 artifact-session --model gemini-3.1-flash-lite
+_build/default/bin/adk inspect artifacts readme_app user-1 artifact-session \
+  --limit 100
+_build/default/bin/adk inspect artifact readme_app user-1 artifact-session \
+  --name reports/result.txt --limit 100
+_build/default/bin/adk inspect memory readme_app user-1
+_build/default/bin/adk memory search readme_app user-1 \
+  --query "supervision restart" --limit 5
+```
+
+Against that resource-enabled OTP server, destructive CLI commands require the
+exact JSON confirmation printed in their arguments, for example:
+
+```bash
+_build/default/bin/adk artifact delete \
+  readme_app user-1 artifact-session reports/result.txt latest \
+  --confirm-json \
+  '{"app_name":"readme_app","user_id":"user-1","session_id":"artifact-session","name":"reports/result.txt","selector":"latest"}'
+
+_build/default/bin/adk memory erase \
+  readme_app user-1 session memory-session \
+  --confirm-json \
+  '{"app_name":"readme_app","user_id":"user-1","target":"session","identifier":"memory-session"}'
+
+# Replace SCOPE_FINGERPRINT with the exact value returned by
+# `adk inspect context-lifecycle`; this invalidates the provider/app/user/
+# model/policy cache scope across sessions, not only artifact-session.
+_build/default/bin/adk context-cache invalidate \
+  readme_app user-1 artifact-session --model gemini-3.1-flash-lite \
+  --confirm-json \
+  '{"app_name":"readme_app","user_id":"user-1","session_id":"artifact-session","model":"gemini-3.1-flash-lite","scope_fingerprint":"SCOPE_FINGERPRINT"}'
 ```
 
 Plain HTTP inspection is restricted to loopback; remote URLs must use HTTPS.
@@ -2539,6 +2801,15 @@ listening at the selected URL; it is not an authentication or Gemini error.
 Check that the first terminal is still running and that the port is free. If
 8080 is occupied, choose another loopback port for `serve`, pass the matching
 `--url` to every inspection command, and open that same port in the browser.
+If diagnostics report an artifact or memory source as `"unavailable"`, the
+HTTP listener is healthy but no `dev_resource_provider` (or compatibility
+service in `dev_runner_options`) was configured for that resource. A normal
+`adk serve --config examples/agent.json` cannot manufacture storage PIDs from
+JSON; start configured services in the owning OTP application and expose them
+through the callback above. `context_cache_unavailable` on lifecycle or
+invalidation similarly means that listener did not start with a live private
+cache/provider map in `dev_runner_options.context_cache`; it does not indicate
+that Gemini text generation or the session backend failed.
 
 ## Authentication foundation
 
@@ -2669,6 +2940,12 @@ Phoenix is compatible with this Erlang application and remains an optional
 companion, not a core dependency. Put the Phoenix app beside this repository
 and let Mix build the Rebar dependency:
 
+```bash
+cd ..
+mix phx.new phoenix_app --live
+cd phoenix_app
+```
+
 ```elixir
 # phoenix_app/mix.exs
 defp deps do
@@ -2680,6 +2957,35 @@ defp deps do
   ]
 end
 ```
+
+Then fetch and compile both dependency trees before adding the LiveView below:
+
+```bash
+mix deps.get
+mix compile --warnings-as-errors
+iex -S mix phx.server
+```
+
+In that IEx shell, register the agent used by the example (the dependency
+application may already be started):
+
+```elixir
+{:ok, _started} = :application.ensure_all_started(:erlang_adk)
+{:ok, _agent_pid} =
+  :erlang_adk.spawn_agent(
+    <<"PhoenixAgent">>,
+    %{
+      provider: :adk_llm_gemini,
+      model: <<"gemini-3.1-flash-lite">>,
+      instructions: <<"Answer concisely.">>
+    },
+    []
+  )
+```
+
+Run the Erlang ADK deterministic gates independently in the `erlang_adk`
+directory. This repository does not contain the companion Mix project, so its
+CI cannot claim that manually copied Elixir code compiled in the user's app.
 
 `oidcc_plug` is needed only when Phoenix owns the browser OIDC boundary. Pin a
 patched Phoenix line and keep the companion application's lock file current;
@@ -2699,6 +3005,31 @@ defmodule MyAppWeb.AgentLive do
   @app_name <<"phoenix_app">>
   @max_rendered_events 200
 
+  def render(assigns) do
+    ~H"""
+    <main id="agent-live">
+      <h1>PhoenixAgent</h1>
+      <form phx-submit="send">
+        <input name="message" type="text" required autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+
+      <p :if={@run_id}>Run: <code><%= @run_id %></code></p>
+      <ol id="agent-events">
+        <li :for={item <- @events}>
+          <pre><%= inspect(item) %></pre>
+        </li>
+      </ol>
+
+      <div :if={@paused} id="agent-approval">
+        <button phx-click="approve" phx-value-decision="approve">Approve</button>
+        <button phx-click="approve" phx-value-decision="reject">Reject</button>
+      </div>
+      <pre :if={@outcome} id="agent-outcome"><%= inspect(@outcome) %></pre>
+    </main>
+    """
+  end
+
   def mount(_params, %{"user_id" => user_id}, socket) do
     session_id = "session-#{System.unique_integer([:positive, :monotonic])}"
 
@@ -2709,6 +3040,7 @@ defmodule MyAppWeb.AgentLive do
        run_id: nil,
        last_sequence: 0,
        events: [],
+       paused: false,
        outcome: nil
      )}
   end
@@ -2747,6 +3079,7 @@ defmodule MyAppWeb.AgentLive do
        run_id: run_id,
        last_sequence: 0,
        events: [],
+       paused: false,
        outcome: nil
      )}
   end
@@ -2755,7 +3088,12 @@ defmodule MyAppWeb.AgentLive do
                   %{assigns: %{run_id: run_id}} = socket) do
     item = %{sequence: sequence, event: :adk_event.to_map(event)}
     events = Enum.take(socket.assigns.events ++ [item], -@max_rendered_events)
-    socket = assign(socket, events: events, last_sequence: sequence)
+    socket =
+      assign(socket,
+        events: events,
+        last_sequence: sequence,
+        paused: socket.assigns.paused or pause_event?(item.event)
+      )
 
     # Return credit only after this event has been converted and retained in
     # the bounded UI history. Exactly one next run message may then arrive.
@@ -2774,7 +3112,8 @@ defmodule MyAppWeb.AgentLive do
   def handle_info({:adk_run_terminal, run_id, sequence, outcome},
                   %{assigns: %{run_id: run_id}} = socket) do
     _ = :adk_run.unsubscribe(run_id, self())
-    {:noreply, assign(socket, outcome: outcome, last_sequence: sequence)}
+    {:noreply,
+     assign(socket, outcome: outcome, last_sequence: sequence, paused: false)}
   end
 
   def handle_info({:adk_run_replay_gap, run_id, gap},
@@ -2815,6 +3154,7 @@ defmodule MyAppWeb.AgentLive do
        run_id: resumed_run_id,
        last_sequence: 0,
        events: [],
+       paused: false,
        outcome: nil
      )}
   end
@@ -2835,11 +3175,14 @@ defmodule MyAppWeb.AgentLive do
     end
   end
 
+  defp pause_event?(%{"actions" => %{"pause" => _pause}}), do: true
+  defp pause_event?(_event), do: false
+
   defp stop_subscription(socket, reason) do
     # Unsubscribe is idempotent from the UI's perspective: a terminal run or
     # monitor cleanup may already have removed this subscriber.
     _ = :adk_run.unsubscribe(socket.assigns.run_id, self())
-    assign(socket, outcome: {:stream_error, reason})
+    assign(socket, outcome: {:stream_error, reason}, paused: false)
   end
 
   def terminate(_reason, %{assigns: %{run_id: run_id}}) when is_binary(run_id) do
@@ -2853,6 +3196,14 @@ defmodule MyAppWeb.AgentLive do
 end
 ```
 
+Add `live "/agent", AgentLive, :index` inside an authenticated browser scope
+in `router.ex`. Its authenticated `live_session` hook must place the trusted
+server-side UTF-8 binary identifier in the LiveView session as
+`%{"user_id" => user_id}`; convert an integer database ID with
+`Integer.to_string/1`. Do not take it from a route parameter or form field.
+The generated `mix phx.gen.auth` flow can provide that hook from
+`current_user`.
+
 Persist the binary `run_id` and last fully handled sequence in the URL or an
 authenticated server session. After a LiveView reconnect, call
 `:adk_run.subscribe_credit(run_id, self(), last_sequence)`. Handle an initial
@@ -2865,6 +3216,26 @@ request parameters. The example distinguishes the built-in
 `tool_confirmation` response from the legacy application-defined approval
 shape; add an explicit branch for every other pause type your UI supports and
 fail closed for unknown types in production.
+
+For artifact, memory, and context panels, keep scope resolution on the server.
+A Phoenix controller or LiveView may call the Erlang services directly using
+the authenticated session's `app_name`/`user_id`, or proxy a separately
+authenticated application endpoint. Never give the browser a service PID,
+Mnesia table, filesystem root, context capability, cache lease, or provider
+resource name. The built-in `/dev/v1` API is useful for local integration
+testing, but its loopback bearer token is developer authentication and must not
+be promoted into a production end-user API. If a companion exposes cache
+invalidation, show and confirm its real provider/app/user/model/policy breadth:
+the inspected session is only the authorization anchor, and every matching
+prefix/TTL entry across that user's sessions is removed.
+
+To exercise the companion locally, export `GEMINI_API_KEY`, run the IEx startup
+above, and open `/agent` in two authenticated browser tabs. Verify that both
+tabs receive only their correlated `run_id`. Kill or reload one tab while a
+run is active: the stable run must continue, and a new LiveView must reconnect
+using its last acknowledged sequence. Also test a confirmation pause, an
+expired replay window, cancellation, and a deliberately wrong user/session
+scope; the last case must fail without exposing resource existence.
 
 For local username/password accounts, Phoenix's generated auth flow is the
 maintained starting point. For enterprise identity, the selected design is
@@ -2887,18 +3258,28 @@ _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
 ```
 
+The packaged-CLI gate passes on 2026-07-14. `adk doctor` reports version
+`0.5.0`, OTP 27, `gemini-3.1-flash-lite`, all required dependencies, and a
+configured Gemini key with no warnings; checked validation accepts
+`examples/agent.json` with the same model.
+
 Run the focused deterministic README smoke suite with:
 
 ```bash
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
 ./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
+./rebar3 ct --suite test/adk_v05_stress_SUITE.erl
 ```
 
-The stress suite executes 1,000 stable runs in bounded concurrent batches
+The concurrency stress suite executes 1,000 stable runs in bounded concurrent batches
 across lightweight agent processes. It verifies every response against its
 exact session and invocation, unique run IDs, supervisor cleanup, and a stable
 test-process mailbox.
+
+The 0.5 stress suite separately executes 1,000 bounded artifact/memory writes
+across isolated scopes and 128 concurrent context-cache acquisitions across
+four exact scopes; the latter collapse to four provider creates/deletes.
 
 Run the opt-in live Gemini suite after exporting `GEMINI_API_KEY` with:
 
@@ -2909,16 +3290,26 @@ ERLANG_ADK_LIVE_GEMINI=1 ./rebar3 ct \
 
 The live suite uses `gemini-3.1-flash-lite` and exercises text generation,
 Google Search grounding metadata, thinking configuration, multimodal
-one-shot/content streaming, function calling, SSE text streaming, correlated
-delegation, concurrent orchestration,
+one-shot/content streaming, explicit context-cache creation and reuse,
+exact-scope model-selected memory and one-request artifact attachment,
+strict JSON Schema function declarations, function calling, SSE text
+streaming, correlated delegation, concurrent orchestration,
 sub-agents, Runner provider streaming, continuation-specific human approval,
 Mnesia Runner storage, callbacks, telemetry, evaluation, and the HTTP
 endpoint. It is skipped unless explicitly enabled because it uses network
 access, quota, and billable API calls.
 
+The full 2026-07-14 live run passed 14 of 16 cases with no skips.
+`google_search_grounding` and `context_cache` each received HTTP 429 after the
+single bounded ten-second retry. They are recorded as quota/rate-limit
+failures, not implementation passes; the exact-scope artifact/memory case and
+its strict `parametersJsonSchema` tool projection passed.
+
 Some scenarios require multiple model turns, so the complete live suite makes
-roughly 31 Gemini requests, including Search grounding plus one-shot and SSE
-multimodal requests. By default, its test-only provider wrapper spaces request
+roughly 38 Gemini API requests, including Search grounding, cached-content
+creation and reuse, model-selected memory/artifact tool rounds, and one-shot
+and SSE multimodal requests. By default, its
+test-only provider wrapper spaces request
 starts by 4.2 seconds, caps each transport wait at 15 seconds, and retries one
 non-streaming transport timeout. A non-streaming HTTP 429 receives one bounded
 retry after a test-only backoff of at least 10 seconds; a second 429 fails the

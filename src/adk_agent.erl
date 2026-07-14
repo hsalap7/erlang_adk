@@ -1856,7 +1856,11 @@ prepare_effective_agent_turn(State, Prepared, Current, After, Context) ->
             EffectiveConfig = effective_model_config(
                                 State#state.llm_config,
                                 Instructions, Prepared, GlobalSource),
-            {ok, EffectiveConfig, lists:reverse(ProviderHistory), Context};
+            case adk_context_envelope:sanitize_history(ProviderHistory) of
+                {ok, SafeHistory} ->
+                    {ok, EffectiveConfig, lists:reverse(SafeHistory), Context};
+                {error, _} = Error -> Error
+            end;
         {error, _} = Error -> Error
     end.
 
@@ -1995,12 +1999,15 @@ prepare_event_model(State, HistoryEvents, Context)
     LegacyHistory0 = adk_memory:from_events(HistoryEvents),
     Input = latest_user_input(LegacyHistory0),
     PluginRuntime = model_plugin_runtime(Context),
+    RequestBudget = maps:get('$adk_request_budget', Context, disabled),
+    ContextCache = maps:get('$adk_context_cache', Context, disabled),
     MaxStreamBytes = maps:get(
                        '$adk_stream_max_bytes', Context,
                        ?DEFAULT_MAX_STREAM_OUTPUT_BYTES),
     AgentContext = maps:without(
                      ['$adk_plugin_pipeline', '$adk_plugin_context',
-                      '$adk_observability', '$adk_stream_max_bytes'], Context),
+                      '$adk_observability', '$adk_stream_max_bytes',
+                      '$adk_request_budget', '$adk_context_cache'], Context),
     case valid_max_stream_bytes(MaxStreamBytes) of
         false -> {error, {invalid_max_stream_output_bytes, MaxStreamBytes}};
         true ->
@@ -2010,13 +2017,29 @@ prepare_event_model(State, HistoryEvents, Context)
                     case model_tools(State#state.tools,
                                      State#state.sub_agents) of
                         {ok, ModelTools} ->
-                            {ok, #{config => EffectiveConfig,
-                                   memory => PreparedHistory,
-                                   model_tools => ModelTools,
-                                   plugin_runtime => PluginRuntime,
-                                   author => to_binary(State#state.name),
-                                   max_stream_output_bytes =>
-                                       MaxStreamBytes}};
+                            ProviderHistory =
+                                adk_memory:get_history(PreparedHistory),
+                            case adk_context_envelope:check(
+                                   EffectiveConfig, ProviderHistory,
+                                   ModelTools, RequestBudget) of
+                                {ok, EnvelopeMetadata} ->
+                                    emit_context_envelope_telemetry(
+                                      EnvelopeMetadata),
+                                    ProviderConfig =
+                                        maybe_put_context_cache(
+                                          EffectiveConfig, ContextCache),
+                                    {ok, #{config => ProviderConfig,
+                                           memory => PreparedHistory,
+                                           model_tools => ModelTools,
+                                           plugin_runtime => PluginRuntime,
+                                           context_envelope =>
+                                               EnvelopeMetadata,
+                                           author =>
+                                               to_binary(State#state.name),
+                                           max_stream_output_bytes =>
+                                               MaxStreamBytes}};
+                                {error, _} = Error -> Error
+                            end;
                         {error, Reason} ->
                             {error, adk_failure:external(
                                       agent, toolset_prepare, Reason)}
@@ -2026,6 +2049,24 @@ prepare_event_model(State, HistoryEvents, Context)
     end;
 prepare_event_model(_State, _HistoryEvents, _Context) ->
     {error, invalid_stream_history}.
+
+maybe_put_context_cache(Config, disabled) ->
+    maps:remove(context_cache, Config);
+maybe_put_context_cache(Config, Cache) when is_map(Cache) ->
+    Config#{context_cache => Cache};
+maybe_put_context_cache(_Config, _Invalid) ->
+    erlang:error(invalid_runtime_context_cache).
+
+emit_context_envelope_telemetry(Metadata) ->
+    telemetry:execute(
+      [erlang_adk, context, envelope],
+      #{bytes => maps:get(bytes, Metadata),
+        estimated_tokens => maps:get(estimated_tokens, Metadata),
+        framing_bytes => maps:get(framing_bytes, Metadata)},
+      #{version => maps:get(version, Metadata),
+        fingerprint => maps:get(fingerprint, Metadata),
+        fingerprint_algorithm => maps:get(fingerprint_algorithm,
+                                          Metadata)}).
 
 valid_max_stream_bytes(Value) ->
     is_integer(Value) andalso Value > 0 andalso

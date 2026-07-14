@@ -37,6 +37,8 @@ session_mnesia_test_() ->
                 {"Atomic State Take", ?_test(test_atomic_take_state())},
                 {"Atomic Compare And Append",
                  ?_test(test_compare_and_append_event())},
+                {"Atomic Event Compaction",
+                 ?_test(test_atomic_event_compaction())},
                 {"Runner Integration", ?_test(test_runner_integration())}
             ]
         end
@@ -265,6 +267,31 @@ test_compare_and_append_event() ->
     ?assertEqual(Expected, maps:get(Key, maps:get(state, Session))),
     ?assertEqual(50, maps:get(<<"progress">>, maps:get(state, Session))),
     ?assertEqual([Event], maps:get(events, Session)).
+
+test_atomic_event_compaction() ->
+    App = <<"CompactMnesiaApp">>,
+    User = <<"CompactMnesiaUser">>,
+    SessionId = <<"compact-mnesia-session">>,
+    {ok, _} = erlang_adk_session_mnesia:create_session(
+                App, User, #{session_id => SessionId}),
+    Old1 = adk_event:new(<<"user">>, <<"old-1">>),
+    Old2 = adk_event:new(<<"agent">>, <<"old-2">>),
+    Retained = adk_event:new(<<"user">>, <<"retained">>),
+    [ok = erlang_adk_session_mnesia:add_event(
+            App, User, SessionId, Event)
+     || Event <- [Old1, Old2, Retained]],
+    Summary = adk_event:new(<<"context_compactor">>, <<"summary">>),
+    ?assertEqual(
+       {error, conflict},
+       erlang_adk_session_mnesia:compact_events(
+         App, User, SessionId,
+         [Old2#adk_event.id, Old1#adk_event.id], Summary)),
+    ok = erlang_adk_session_mnesia:compact_events(
+           App, User, SessionId,
+           [Old1#adk_event.id, Old2#adk_event.id], Summary),
+    {ok, Session} = erlang_adk_session_mnesia:get_session(
+                      App, User, SessionId),
+    ?assertEqual([Summary, Retained], maps:get(events, Session)).
 
 test_runner_integration() ->
     App = <<"MnesiaRunnerApp">>,

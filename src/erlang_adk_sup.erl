@@ -60,6 +60,9 @@ init([]) ->
     TaskSup = adk_task_sup:child_spec(#{}),
     RunRegistry = adk_run_registry:child_spec(#{}),
     InvocationSup = adk_invocation_sup:child_spec(#{}),
+    ContextCapabilitySup = adk_context_capability_sup:child_spec(#{}),
+    MemoryIngestSup = adk_memory_ingest_sup:child_spec(#{}),
+    MemoryOutboxSpecs = memory_outbox_child_specs(),
     AdmissionControl = adk_admission_control:child_spec(
                          application:get_env(
                            erlang_adk, admission_control, #{})),
@@ -73,11 +76,30 @@ init([]) ->
     ChildSpecs = [SessionOwner, Registry, AgentConfigStore, AgentSup,
                   AgentTurnSup,
                   TaskRegistry, TaskSup,
-                  RunRegistry, InvocationSup,
+                  RunRegistry, InvocationSup, ContextCapabilitySup,
+                  MemoryIngestSup,
                   AdmissionControl, AmbientSup,
                   AuthSup, OidcProviderSup, McpClientSup,
-                  WorkflowSup] ++ a2a_v1_child_specs() ++ http_child_specs(),
+                  WorkflowSup] ++ MemoryOutboxSpecs ++
+                 a2a_v1_child_specs() ++ http_child_specs(),
     {ok, {SupFlags, ChildSpecs}}.
+
+memory_outbox_child_specs() ->
+    case application:get_env(erlang_adk, memory_outbox_enabled, false) of
+        false -> [];
+        true ->
+            Options = application:get_env(
+                        erlang_adk, memory_outbox_options, #{}),
+            case is_map(Options) of
+                true -> [adk_memory_outbox_sup:child_spec(Options)];
+                false ->
+                    erlang:error({invalid_application_env,
+                                  memory_outbox_options, Options})
+            end;
+        Invalid ->
+            erlang:error({invalid_application_env,
+                          memory_outbox_enabled, Invalid})
+    end.
 
 %% internal functions
 

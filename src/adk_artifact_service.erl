@@ -12,6 +12,15 @@
     | {session, binary(), binary(), binary()}.
 -type selector() :: pos_integer() | latest.
 -type delete_selector() :: selector() | all.
+-type call_options() :: #{timeout_ms => pos_integer()}.
+-type name_page_options() :: #{limit => pos_integer(), cursor => binary()}.
+-type version_page_options() :: #{limit => pos_integer(),
+                                  cursor => pos_integer()}.
+-type name_page() :: #{scope := scope(),
+                       items := [binary()],
+                       next_cursor := binary() | undefined}.
+-type version_page() :: #{items := [artifact_meta()],
+                          next_cursor := pos_integer() | undefined}.
 -type artifact_meta() :: #{
     scope := scope(),
     name := binary(),
@@ -39,11 +48,18 @@
     scope/0,
     selector/0,
     delete_selector/0,
+    call_options/0,
+    name_page_options/0,
+    version_page_options/0,
+    name_page/0,
+    version_page/0,
     artifact_meta/0,
     artifact/0
 ]).
 
 -callback start_link(Config :: map()) -> {ok, handle()} | {error, term()}.
+-callback capabilities(Handle :: handle()) ->
+    {ok, map()} | {error, term()}.
 -callback put(Handle :: handle(), Scope :: scope(), Name :: binary(),
               Data :: binary(), Options :: map()) ->
     {ok, artifact_meta()} | {error, term()}.
@@ -54,4 +70,21 @@
     {ok, [artifact_meta()]} | {error, term()}.
 -callback delete(Handle :: handle(), Scope :: scope(), Name :: binary(),
                  Selector :: delete_selector()) ->
+    ok | {error, not_found | term()}.
+-callback put(Handle :: handle(), Scope :: scope(), Name :: binary(),
+              Data :: binary(), Options :: map(),
+              CallOptions :: call_options()) ->
+    {ok, artifact_meta()} | {error, term()}.
+-callback get(Handle :: handle(), Scope :: scope(), Name :: binary(),
+              Selector :: selector(), CallOptions :: call_options()) ->
+    {ok, artifact()} | {error, not_found | term()}.
+-callback list_names(Handle :: handle(), Scope :: scope(),
+                     Options :: name_page_options()) ->
+    {ok, name_page()} | {error, term()}.
+-callback list_versions(Handle :: handle(), Scope :: scope(), Name :: binary(),
+                        Options :: version_page_options()) ->
+    {ok, version_page()} | {error, term()}.
+-callback delete(Handle :: handle(), Scope :: scope(), Name :: binary(),
+                 Selector :: delete_selector(),
+                 CallOptions :: call_options()) ->
     ok | {error, not_found | term()}.

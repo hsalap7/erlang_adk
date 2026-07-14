@@ -22,7 +22,8 @@ session_service_test_() ->
       fun test_create_get_delete/0,
       fun test_scoped_state/0,
       fun test_add_event/0,
-      fun test_compare_and_append_event/0
+      fun test_compare_and_append_event/0,
+      fun test_atomic_event_compaction/0
      ]}.
 
 test_create_get_delete() ->
@@ -87,3 +88,26 @@ test_compare_and_append_event() ->
     ?assertEqual(Expected, maps:get(Key, maps:get(state, Session))),
     ?assertEqual(50, maps:get(<<"progress">>, maps:get(state, Session))),
     ?assertEqual([Event], maps:get(events, Session)).
+
+test_atomic_event_compaction() ->
+    SessionId = <<"atomic-compaction">>,
+    {ok, _} = erlang_adk_session:create_session(
+                ?APP, ?USER, #{session_id => SessionId}),
+    Old1 = adk_event:new(<<"user">>, <<"old-1">>),
+    Old2 = adk_event:new(<<"agent">>, <<"old-2">>),
+    Retained = adk_event:new(<<"user">>, <<"retained">>),
+    [ok = erlang_adk_session:add_event(
+            ?APP, ?USER, SessionId, Event)
+     || Event <- [Old1, Old2, Retained]],
+    Summary = adk_event:new(<<"context_compactor">>, <<"summary">>),
+    ?assertEqual(
+       {error, conflict},
+       erlang_adk_session:compact_events(
+         ?APP, ?USER, SessionId,
+         [Old2#adk_event.id, Old1#adk_event.id], Summary)),
+    ok = erlang_adk_session:compact_events(
+           ?APP, ?USER, SessionId,
+           [Old1#adk_event.id, Old2#adk_event.id], Summary),
+    {ok, Session} = erlang_adk_session:get_session(
+                      ?APP, ?USER, SessionId),
+    ?assertEqual([Summary, Retained], maps:get(events, Session)).

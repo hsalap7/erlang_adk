@@ -45,6 +45,7 @@ gemini_test_() ->
                 {"Preserve parallel tool signatures", ?_test(test_generate_tool_signatures(State))},
                 {"Missing API Key error", ?_test(test_missing_api_key())},
                 {"Canonical request payload", ?_test(test_request_payload(State))},
+                {"Use JSON Schema function declarations", ?_test(test_json_schema_tool_payload(State))},
                 {"Thinking configuration payload", ?_test(test_thinking_payload(State))},
                 {"Safety settings payload", ?_test(test_safety_payload(State))},
                 {"Strict provider configuration", ?_test(test_strict_config(State))},
@@ -174,6 +175,54 @@ test_request_payload(#{config := Config, request_table := RequestTable}) ->
           <<"responseSchema">> => ResponseSchema},
         maps:get(<<"generationConfig">>, Payload)
     ).
+
+test_json_schema_tool_payload(
+  #{config := Config, request_table := RequestTable}) ->
+    ets:delete_all_objects(RequestTable),
+    Schema =
+        #{<<"name">> => <<"strict_tool">>,
+          <<"description">> => <<"A strict JSON Schema tool">>,
+          <<"parameters">> =>
+              #{<<"type">> => <<"object">>,
+                <<"properties">> =>
+                    #{<<"selector">> =>
+                          #{<<"oneOf">> =>
+                                [#{<<"type">> => <<"integer">>},
+                                 #{<<"type">> => <<"string">>}]}},
+                <<"additionalProperties">> => false}},
+    UnionSchema =
+        #{<<"name">> => <<"nullable_union_tool">>,
+          <<"parameters">> =>
+              #{<<"type">> => <<"object">>,
+                <<"properties">> =>
+                    #{<<"value">> =>
+                          #{<<"type">> => [<<"string">>, <<"null">>]}}}},
+    BooleanSubschema =
+        #{<<"name">> => <<"boolean_subschema_tool">>,
+          <<"parameters">> =>
+              #{<<"type">> => <<"object">>,
+                <<"properties">> => #{<<"anything">> => true}}},
+    BooleanTrue = #{<<"name">> => <<"accept_anything_tool">>,
+                    <<"parameters">> => true},
+    BooleanFalse = #{<<"name">> => <<"accept_nothing_tool">>,
+                     <<"parameters">> => false},
+    {ok, _} = adk_llm_gemini:generate(
+                Config, [#{role => user, content => <<"Use the tool">>}],
+                [Schema, UnionSchema, BooleanSubschema,
+                 BooleanTrue, BooleanFalse]),
+    #{body := Payload} = last_request(RequestTable),
+    [#{<<"functionDeclarations">> := Declarations}] =
+        maps:get(<<"tools">>, Payload),
+    ?assertEqual(5, length(Declarations)),
+    lists:foreach(
+      fun({InputSchema, Declaration}) ->
+          ?assertEqual(false,
+                       maps:is_key(<<"parameters">>, Declaration)),
+          ?assertEqual(maps:get(<<"parameters">>, InputSchema),
+                       maps:get(<<"parametersJsonSchema">>, Declaration))
+      end,
+      lists:zip([Schema, UnionSchema, BooleanSubschema,
+                 BooleanTrue, BooleanFalse], Declarations)).
 
 test_thinking_payload(#{config := Config, request_table := RequestTable}) ->
     ets:delete_all_objects(RequestTable),

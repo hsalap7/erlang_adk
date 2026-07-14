@@ -12,8 +12,8 @@
 validate(_Kind, undefined) ->
     {ok, undefined};
 validate(Kind, {Module, Handle}) when is_atom(Module), Handle =/= undefined ->
-    case required_callbacks(Kind) of
-        {ok, Callbacks} -> validate_module(Module, Handle, Callbacks);
+    case required_callback_sets(Kind) of
+        {ok, CallbackSets} -> validate_module(Module, Handle, CallbackSets);
         error -> {error, {unknown_service_kind, Kind}}
     end;
 validate(Kind, _Other) ->
@@ -90,23 +90,42 @@ service_call_coordinator(Caller, Ref, Module, Handle,
         Caller ! {Ref, {error, service_timeout}}
     end.
 
-required_callbacks(memory) ->
-    {ok, [{add, 3}, {search, 4}, {delete, 2},
-          {add_session_to_memory, 3}]};
-required_callbacks(artifact) ->
-    {ok, [{put, 5}, {get, 4}, {list, 2}, {delete, 4}]};
-required_callbacks(_) ->
+required_callback_sets(memory) ->
+    %% A v2-only adapter is valid. Built-in adapters retain the v1 set, but
+    %% requiring those ambient-scope wrappers would otherwise prevent a
+    %% least-authority implementation from being plugged into the Runner.
+    {ok, [[{capabilities, 1}, {add_entry, 4}, {add_events, 5},
+           {add_session_to_memory, 5}, {search, 4}, {delete_entry, 3},
+           {delete_session, 3}, {delete_user, 2}],
+          [{add, 3}, {search, 4}, {delete, 2},
+           {add_session_to_memory, 3}]]};
+required_callback_sets(artifact) ->
+    {ok, [[{put, 5}, {get, 4}, {list, 2}, {delete, 4}]]};
+required_callback_sets(_) ->
     error.
 
-validate_module(Module, Handle, Callbacks) ->
+validate_module(Module, Handle, CallbackSets) ->
     case code:ensure_loaded(Module) of
         {module, Module} ->
-            Missing = [Callback || {Function, Arity} = Callback <- Callbacks,
-                                    not erlang:function_exported(
-                                          Module, Function, Arity)],
-            case Missing of
-                [] -> {ok, {Module, Handle}};
-                _ -> {error, {missing_service_callbacks, Module, Missing}}
+            MissingSets =
+                [[Callback || {Function, Arity} = Callback <- Callbacks,
+                              not erlang:function_exported(
+                                    Module, Function, Arity)]
+                 || Callbacks <- CallbackSets],
+            case lists:any(fun(Missing) -> Missing =:= [] end,
+                           MissingSets) of
+                true -> {ok, {Module, Handle}};
+                false ->
+                    %% Preserve the public structural error. Reporting the
+                    %% closest supported contract keeps it concise while a
+                    %% v2-only adapter remains valid.
+                    Missing = lists:foldl(
+                                fun(Current, Best)
+                                      when length(Current) < length(Best) ->
+                                        Current;
+                                   (_Current, Best) -> Best
+                                end, hd(MissingSets), tl(MissingSets)),
+                    {error, {missing_service_callbacks, Module, Missing}}
             end;
         {error, Reason} ->
             {error, {service_module_unavailable, Module, Reason}}

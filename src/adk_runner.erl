@@ -19,8 +19,10 @@
     artifact_svc :: adk_service_ref:service_ref() | undefined,
     credential_store :: undefined | {module(), term()},
     memory_retrieval :: disabled | map(),
-    memory_ingestion :: disabled | on_success,
+    memory_ingestion :: disabled | on_success | map(),
     context_policy :: disabled | map(),
+    context_compaction :: disabled | map(),
+    context_cache :: disabled | map(),
     service_timeout :: pos_integer(),
     run_timeout  :: timeout(),
     max_llm_calls :: pos_integer() | infinity,
@@ -39,6 +41,12 @@
 -define(DEFAULT_MAX_TOOL_ROUNDS, 16).
 -define(DEFAULT_SERVICE_TIMEOUT, 5000).
 -define(DEFAULT_MEMORY_LIMIT, 5).
+-define(DEFAULT_MEMORY_MAX_HIT_BYTES, 65536).
+-define(DEFAULT_MEMORY_MAX_TOTAL_BYTES, 262144).
+-define(MEMORY_MAX_HIT_BYTES_CEILING, 1048576).
+-define(MEMORY_MAX_TOTAL_BYTES_CEILING, 8388608).
+-define(MAX_ARTIFACT_ATTACHMENTS, 8).
+-define(MAX_ARTIFACT_ATTACHMENT_BYTES, 10485760).
 -define(DEFAULT_TOOL_MAX_CONCURRENCY, 4).
 -define(DEFAULT_TOOL_TIMEOUT, 30000).
 -define(DEFAULT_MAX_STREAM_OUTPUT_BYTES, 16777216).
@@ -83,6 +91,10 @@ new(Agent, AppName, SessionSvc, Opts) ->
                         maps:get(memory_ingestion, Opts, disabled)),
     ContextPolicy = validate_context_policy(
                       maps:get(context_policy, Opts, disabled)),
+    ContextCompaction = validate_context_compaction(
+                          maps:get(context_compaction, Opts, disabled)),
+    ContextCache = validate_context_cache(
+                     maps:get(context_cache, Opts, disabled)),
     ToolExecution = validate_tool_execution(
                       maps:get(tool_execution, Opts, serial)),
     StreamingMode = validate_streaming_mode(
@@ -105,6 +117,9 @@ new(Agent, AppName, SessionSvc, Opts) ->
     ok = validate_service_timeout(ServiceTimeout),
     ok = validate_memory_service_policy(
            MemorySvc, MemoryRetrieval, MemoryIngestion),
+    ok = validate_memory_ingestion_runtime(MemoryIngestion),
+    ok = validate_context_compaction_service(
+           SessionSvc, ContextCompaction),
     #runner{
         agent = Agent,
         app_name = AppName,
@@ -115,6 +130,8 @@ new(Agent, AppName, SessionSvc, Opts) ->
         memory_retrieval = MemoryRetrieval,
         memory_ingestion = MemoryIngestion,
         context_policy = ContextPolicy,
+        context_compaction = ContextCompaction,
+        context_cache = ContextCache,
         service_timeout = ServiceTimeout,
         run_timeout = RunTimeout,
         max_llm_calls = MaxLlmCalls,
@@ -718,19 +735,59 @@ initialize_runtime_context(Runner, UserId, SessionId, InvId, Runtime) ->
     Runtime0 = Runtime#{plugin_pipeline => Runner#runner.plugin_pipeline,
                         plugin_context => PluginContext,
                         observability => Runner#runner.observability,
-                        runtime_policy => Runner#runner.runtime_policy},
+                        runtime_policy => Runner#runner.runtime_policy,
+                        service_timeout => Runner#runner.service_timeout},
+    Runtime1 = initialize_context_capability(
+                 Runner, UserId, SessionId, InvId, Runtime0),
     case Runner#runner.observability of
-        disabled -> Runtime0#{observation_context => undefined};
+        disabled -> Runtime1#{observation_context => undefined};
         ObservationConfig ->
             ObservationInput = maps:merge(
                                  maps:get(attributes, ObservationConfig),
                                  PluginContext),
             case adk_observability:new_context(ObservationInput) of
                 {ok, ObservationContext} ->
-                    Runtime0#{observation_context => ObservationContext};
+                    Runtime1#{observation_context => ObservationContext};
                 {error, Reason} ->
                     erlang:error({observability_context_failed, Reason})
             end
+    end.
+
+initialize_context_capability(Runner, UserId, SessionId, InvId, Runtime) ->
+    Identity = #{app_name => Runner#runner.app_name,
+                 user_id => UserId,
+                 session_id => SessionId,
+                 invocation_id => InvId},
+    Spec0 = #{identity => Identity,
+              session_service => Runner#runner.session_svc,
+              artifact_scope =>
+                  {session, Runner#runner.app_name, UserId, SessionId},
+              memory_scope =>
+                  {user, Runner#runner.app_name, UserId},
+              timeout => Runner#runner.service_timeout},
+    Spec1 = maybe_put_service(
+              memory_service, Runner#runner.memory_svc, Spec0),
+    Spec = maybe_put_service(
+             artifact_service, Runner#runner.artifact_svc, Spec1),
+    Started = case whereis(adk_context_capability_sup) of
+        undefined ->
+            case adk_context_capability:start(self(), Spec) of
+                {ok, Pid} -> {ok, Pid, standalone};
+                {error, _} = Error -> Error
+            end;
+        _ ->
+            adk_context_capability_sup:start_capability(self(), Spec)
+    end,
+    case Started of
+        {ok, CapabilityPid, _ChildRef} ->
+            case adk_context_capability:root(CapabilityPid) of
+                {ok, RootCapability} ->
+                    Runtime#{context_capability => RootCapability};
+                {error, Reason} ->
+                    erlang:error({context_capability_failed, Reason})
+            end;
+        {error, Reason} ->
+            erlang:error({context_capability_start_failed, Reason})
     end.
 
 generate_run_id() ->
@@ -920,12 +977,13 @@ prepare_memory_context(Runner, Message, Runtime) ->
     Query = runner_text(Message),
     Filter = maps:get(filter, Policy),
     Limit = maps:get(limit, Policy),
-    Reply = adk_service_ref:call(
-              Runner#runner.memory_svc, search,
-              [Query, Filter, Limit], Runner#runner.service_timeout),
+    Scope = memory_scope(Runner, Runtime),
+    Reply = scoped_memory_search(
+              Runner#runner.memory_svc, Scope, Query, Filter, Limit,
+              Runner#runner.service_timeout),
     case Reply of
         {ok, Results} when is_list(Results) ->
-            case normalize_memory_results(Results, Limit) of
+            case normalize_memory_results(Results, Policy) of
                 {ok, []} -> {ok, Runtime};
                 {ok, Normalized} ->
                     Context = memory_system_context(Runtime, Normalized),
@@ -950,33 +1008,101 @@ handle_memory_retrieval_error(#{on_error := fail}, {error, Reason}, _Runtime) ->
     {error, adk_failure:external(
               runner, memory_retrieval, Reason)}.
 
-normalize_memory_results(Results, Limit) ->
-    normalize_memory_results(Results, 1, [], Limit).
+memory_scope(Runner, Runtime) ->
+    Identity = maps:get(plugin_context, Runtime, #{}),
+    {user, Runner#runner.app_name, maps:get(user_id, Identity)}.
 
-normalize_memory_results([], _Index, Acc, Limit) ->
+scoped_memory_search({Module, _} = Service, Scope, Query, Filter, Limit,
+                     Timeout) ->
+    case memory_contract(Service, Module, Timeout) of
+        v2 ->
+            adk_service_ref:call(
+              Service, search,
+              [Scope, Query, #{filter => Filter, limit => Limit}], Timeout);
+        legacy ->
+            adk_service_ref:call(
+              Service, search, [Query, Filter, Limit], Timeout);
+        {error, _} = Error -> Error
+    end.
+
+memory_contract(Service, Module, Timeout) ->
+    case erlang:function_exported(Module, capabilities, 1) of
+        false -> legacy;
+        true ->
+            case adk_service_ref:call(Service, capabilities, [], Timeout) of
+                #{contract_version := Version} when Version >= 2 -> v2;
+                {ok, #{contract_version := Version}} when Version >= 2 -> v2;
+                #{version := Version} when Version >= 2 -> v2;
+                {ok, #{version := Version}} when Version >= 2 -> v2;
+                {error, _} = Error -> Error;
+                Other -> {error, {invalid_memory_capabilities, Other}}
+            end
+    end.
+
+normalize_memory_results(Results, Policy) ->
+    Limit = maps:get(limit, Policy),
+    MaxCandidates = erlang:min(1000, erlang:max(Limit, Limit * 4)),
+    normalize_memory_results(Results, 1, [], Policy, MaxCandidates).
+
+normalize_memory_results([], _Index, Acc, Policy, _Remaining) ->
     Sorted = lists:sort(
                fun(Left, Right) ->
                    {-maps:get(score, Left), maps:get(id, Left)} =<
                    {-maps:get(score, Right), maps:get(id, Right)}
                end, Acc),
-    {ok, lists:sublist(Sorted, Limit)};
-normalize_memory_results([Result | Rest], Index, Acc, Limit)
+    bound_memory_results(
+      lists:sublist(Sorted, maps:get(limit, Policy)), Policy, 0, []);
+normalize_memory_results([_Result | _Rest], _Index, _Acc, _Policy, 0) ->
+    {error, memory_result_count_exceeded};
+normalize_memory_results([Result | Rest], Index, Acc, Policy, Remaining)
   when is_map(Result) ->
     Content = result_field(Result, content, <<"content">>, undefined),
     Score0 = result_field(Result, score, <<"score">>, 0.0),
     Id = result_field(Result, id, <<"id">>, <<>>),
     Metadata = result_field(Result, metadata, <<"metadata">>, #{}),
+    Score = safe_memory_score(Score0),
     case is_binary(Content) andalso valid_utf8(Content) andalso
-         is_number(Score0) andalso is_binary(Id) andalso is_map(Metadata) of
+         byte_size(Content) > 0 andalso
+         Score =/= error andalso is_binary(Id) andalso
+         byte_size(Id) > 0 andalso byte_size(Id) =< 512 andalso
+         valid_utf8(Id) andalso is_map(Metadata) of
         true ->
-            Normalized = #{content => Content, score => float(Score0), id => Id},
-            normalize_memory_results(Rest, Index + 1,
-                                     [Normalized | Acc], Limit);
+            Normalized = #{content => Content, score => Score,
+                           id => Id},
+            normalize_memory_results(Rest, Index + 1, [Normalized | Acc],
+                                     Policy, Remaining - 1);
         false ->
             {error, {invalid_memory_result, Index}}
     end;
-normalize_memory_results([_Result | _Rest], Index, _Acc, _Limit) ->
+normalize_memory_results([_Result | _Rest], Index, _Acc, _Policy,
+                         _Remaining) ->
     {error, {invalid_memory_result, Index}}.
+
+safe_memory_score(Value) when is_number(Value) ->
+    try float(Value) of
+        Score when Score =:= Score,
+                   Score =< 1.0e308, Score >= -1.0e308 -> Score;
+        _ -> error
+    catch
+        _:_ -> error
+    end;
+safe_memory_score(_) -> error.
+
+bound_memory_results([], _Policy, _Bytes, Acc) ->
+    {ok, lists:reverse(Acc)};
+bound_memory_results([Result | Rest], Policy, Bytes, Acc) ->
+    ContentBytes = byte_size(maps:get(content, Result)),
+    MaxHit = maps:get(max_hit_bytes, Policy),
+    MaxTotal = maps:get(max_total_bytes, Policy),
+    case {ContentBytes =< MaxHit, Bytes + ContentBytes =< MaxTotal} of
+        {false, _} ->
+            {error, {memory_hit_size_exceeded, ContentBytes, MaxHit}};
+        {true, false} ->
+            {ok, lists:reverse(Acc)};
+        {true, true} ->
+            bound_memory_results(Rest, Policy, Bytes + ContentBytes,
+                                 [Result | Acc])
+    end.
 
 result_field(Map, AtomKey, BinaryKey, Default) ->
     case maps:find(AtomKey, Map) of
@@ -997,31 +1123,145 @@ memory_system_context(Runtime, Results) ->
         <<"[ERLANG_ADK_RETRIEVED_MEMORY_END]">>
     ]).
 
-render_memory_hit(Index, #{content := Content, score := Score}) ->
+render_memory_hit(Index, #{id := Id, content := Content, score := Score}) ->
     IndexBin = integer_to_binary(Index),
     SizeBin = integer_to_binary(byte_size(Content)),
     ScoreBin = float_to_binary(Score, [{decimals, 6}, compact]),
-    [<<"--- MEMORY_HIT ">>, IndexBin,
+    EncodedId = base64:encode(Id),
+    SafeContent = escape_memory_markers(Content),
+    [<<"--- MEMORY_HIT ">>, IndexBin, <<" id_b64=">>, EncodedId,
      <<" score=">>, ScoreBin, <<" bytes=">>, SizeBin, <<" BEGIN ---\n">>,
-     Content, <<"\n--- MEMORY_HIT ">>, IndexBin, <<" END ---\n">>].
+     SafeContent, <<"\n--- MEMORY_HIT ">>, IndexBin, <<" END ---\n">>].
+
+escape_memory_markers(Content) ->
+    binary:replace(Content, <<"[ERLANG_ADK_">>,
+                   <<"[ERLANG_ADK_ESCAPED_">>, [global]).
 
 prepare_model_context(Runner, History, Runtime, InvocationId) ->
-    {InputEvents, MemoryEventId} = context_input_events(
-                                    History, Runtime, InvocationId),
-    case apply_context_policy(Runner#runner.context_policy, InputEvents) of
-        {ok, Selected, Metadata} ->
-            case invocation_user_present(Selected, InvocationId) of
-                false ->
-                    {error, current_invocation_input_excluded};
-                true ->
-                    MemoryIncluded = case MemoryEventId of
-                        undefined -> false;
-                        _ -> event_id_present(MemoryEventId, Selected)
-                    end,
-                    {ok, Selected, Metadata, MemoryIncluded}
+    case maybe_compact_history(Runner, History, Runtime) of
+        {ok, DurableHistory, CompactionMetadata} ->
+            {InputEvents0, MemoryEventId} = context_input_events(
+                                             DurableHistory, Runtime,
+                                             InvocationId),
+            CurrentInputId = current_invocation_user_id(
+                               DurableHistory, InvocationId),
+            case add_artifact_attachment_context(
+                   Runner, InputEvents0, Runtime, InvocationId,
+                   CurrentInputId) of
+                {ok, InputEvents} ->
+                    case apply_context_policy(
+                           Runner#runner.context_policy, InputEvents) of
+                        {ok, Selected, Metadata0} ->
+                            case CurrentInputId =/= undefined andalso
+                                 event_id_present(CurrentInputId, Selected) of
+                                false ->
+                                    {error, current_invocation_input_excluded};
+                                true ->
+                                    MemoryIncluded = case MemoryEventId of
+                                        undefined -> false;
+                                        _ -> event_id_present(
+                                               MemoryEventId, Selected)
+                                    end,
+                                    Metadata = Metadata0#{
+                                      compaction => CompactionMetadata},
+                                    {ok, Selected, Metadata, MemoryIncluded}
+                            end;
+                        {error, _} = Error -> Error
+                    end;
+                {error, _} = Error -> Error
             end;
         {error, _} = Error -> Error
     end.
+
+maybe_compact_history(#runner{context_compaction = disabled}, History,
+                      _Runtime) ->
+    {ok, History, #{status => disabled}};
+maybe_compact_history(Runner, History, Runtime) ->
+    Stats = #{turns_since_compaction =>
+                  turns_since_compaction(History)},
+    case adk_context_compaction:evaluate(
+           History, Stats, Runner#runner.context_compaction) of
+        {ok, no_compaction, Decision} ->
+            {ok, History, Decision};
+        {ok, Result} ->
+            commit_context_compaction(Runner, Runtime, History, Result);
+        {error, Reason} ->
+            {error, {context_compaction_failed, Reason}}
+    end.
+
+turns_since_compaction(History) ->
+    UserTurns = length([ok || #adk_event{author = <<"user">>} <- History]),
+    Retained = lists:foldl(
+      fun(#adk_event{actions = Actions}, Acc) ->
+          case maps:find(<<"context_compaction_checkpoint">>, Actions) of
+              {ok, Checkpoint} when is_map(Checkpoint) ->
+                  maps:get(<<"retained_user_turns">>, Checkpoint, Acc);
+              _ -> Acc
+          end
+      end, 0, History),
+    erlang:max(0, UserTurns - Retained).
+
+commit_context_compaction(Runner, Runtime, History,
+                          #{<<"events">> := [SummaryMap | RetainedMaps],
+                            <<"checkpoint">> := Checkpoint0,
+                            <<"metadata">> := Metadata}) ->
+    SourceCount = maps:get(<<"source_event_count">>, Metadata, 0),
+    case {SourceCount > 0 andalso SourceCount < length(History),
+          decode_compacted_events([SummaryMap | RetainedMaps], [])} of
+        {true, {ok, [Summary0 | Retained] = Compacted}} ->
+            {Source, _ExpectedRetained} = lists:split(SourceCount, History),
+            SourceIds = [Event#adk_event.id || Event <- Source],
+            RetainedUserTurns = length(
+                                  [ok || #adk_event{author = <<"user">>}
+                                           <- Retained]),
+            Checkpoint = Checkpoint0#{
+                           <<"retained_user_turns">> => RetainedUserTurns},
+            Actions = (Summary0#adk_event.actions)#{
+                        <<"context_compaction_checkpoint">> => Checkpoint},
+            Summary = Summary0#adk_event{actions = Actions},
+            Identity = maps:get(plugin_context, Runtime),
+            SessionService = Runner#runner.session_svc,
+            Reply = SessionService:compact_events(
+                      Runner#runner.app_name,
+                      maps:get(user_id, Identity),
+                      maps:get(session, Identity), SourceIds, Summary),
+            case Reply of
+                ok ->
+                    emit_context_compaction_telemetry(Metadata),
+                    {ok, [Summary | tl(Compacted)],
+                     #{status => compacted,
+                       checkpoint => Checkpoint,
+                       metadata => Metadata}};
+                {error, Reason} ->
+                    {error, {context_compaction_commit_failed, Reason}};
+                Other ->
+                    {error, {invalid_context_compaction_commit_reply, Other}}
+            end;
+        {false, _} ->
+            {error, invalid_context_compaction_source};
+        {_, {error, _} = Error} -> Error;
+        {_, {ok, []}} -> {error, invalid_context_compaction_result}
+    end;
+commit_context_compaction(_Runner, _Runtime, _History, _Result) ->
+    {error, invalid_context_compaction_result}.
+
+decode_compacted_events([], Acc) -> {ok, lists:reverse(Acc)};
+decode_compacted_events([Map | Rest], Acc) when is_map(Map) ->
+    case adk_event:decode(Map) of
+        {ok, Event} -> decode_compacted_events(Rest, [Event | Acc]);
+        {error, Reason} ->
+            {error, {invalid_context_compaction_event, Reason}}
+    end;
+decode_compacted_events(_, _) -> {error, invalid_context_compaction_events}.
+
+emit_context_compaction_telemetry(Metadata) ->
+    telemetry:execute(
+      [erlang_adk, context, compaction],
+      #{source_events => maps:get(<<"source_event_count">>, Metadata, 0),
+        retained_events => maps:get(<<"retained_event_count">>, Metadata, 0),
+        summary_bytes => maps:get(<<"summary_bytes">>, Metadata, 0)},
+      #{version => adk_context_compaction:version(),
+        trigger => maps:get(<<"trigger">>, Metadata, undefined)}).
 
 context_input_events(History, Runtime, InvocationId) ->
     case maps:find(memory_context, Runtime) of
@@ -1038,11 +1278,20 @@ context_input_events(History, Runtime, InvocationId) ->
     end.
 
 apply_context_policy(disabled, Events) ->
-    {ok, Events, #{version => 0,
-                   input_events => length(Events),
-                   output_events => length(Events),
-                   dropped_events => 0,
-                   compressed => false}};
+    %% Safety canonicalization is mandatory even when selection and
+    %% compression are disabled. This removes secret-bearing map fields at
+    %% every Runner-to-model boundary without turning policy selection on.
+    case sanitize_context_events(Events, []) of
+        {ok, SafeEvents, Bytes} ->
+            {ok, SafeEvents, #{version => 0,
+                               bytes => Bytes,
+                               estimated_tokens => (Bytes + 3) div 4,
+                               input_events => length(Events),
+                               output_events => length(SafeEvents),
+                               dropped_events => 0,
+                               compressed => false}};
+        {error, _} = Error -> Error
+    end;
 apply_context_policy(Policy, Events) ->
     case adk_context_policy:build(Events, Policy) of
         {ok, Result} ->
@@ -1054,6 +1303,21 @@ apply_context_policy(Policy, Events) ->
                 {error, _} = Error -> Error
             end;
         {error, _} = Error -> Error
+    end.
+
+sanitize_context_events([], Acc) ->
+    Encoded = lists:reverse(Acc),
+    case decode_context_events(Encoded, []) of
+        {ok, Events} ->
+            Bytes = lists:sum([byte_size(jsx:encode(Event))
+                               || Event <- Encoded]),
+            {ok, Events, Bytes};
+        {error, _} = Error -> Error
+    end;
+sanitize_context_events([Event | Rest], Acc) ->
+    case adk_context_guard:sanitize_event(Event) of
+        {ok, Safe} -> sanitize_context_events(Rest, [Safe | Acc]);
+        {error, Reason} -> {error, {invalid_context_event, Reason}}
     end.
 
 decode_context_events([], Acc) ->
@@ -1077,13 +1341,13 @@ emit_context_telemetry(Metadata) ->
         compressed => maps:get(compressed, Metadata, false),
         cache_key => maps:get(key, Cache, undefined)}).
 
-invocation_user_present(Events, InvocationId) ->
-    lists:any(
-      fun(#adk_event{author = <<"user">>,
-                     invocation_id = SeenInvocationId}) ->
-              SeenInvocationId =:= InvocationId;
-         (_) -> false
-      end, Events).
+current_invocation_user_id(Events, InvocationId) ->
+    lists:foldl(
+      fun(#adk_event{author = <<"user">>, id = Id,
+                     invocation_id = SeenInvocationId}, _Acc)
+            when SeenInvocationId =:= InvocationId -> Id;
+         (_Event, Acc) -> Acc
+      end, undefined, Events).
 
 event_id_present(EventId, Events) ->
     lists:any(
@@ -1091,10 +1355,238 @@ event_id_present(EventId, Events) ->
          (_) -> false
       end, Events).
 
+add_artifact_attachment_context(#runner{artifact_svc = undefined}, Events,
+                                _Runtime, InvocationId, _CurrentInputId) ->
+    case artifact_attachment_refs(Events, InvocationId) of
+        [] -> {ok, Events};
+        _ -> {error, artifact_service_unavailable}
+    end;
+add_artifact_attachment_context(Runner, Events, Runtime, InvocationId,
+                                CurrentInputId) ->
+    Refs = artifact_attachment_refs(Events, InvocationId),
+    case length(Refs) =< ?MAX_ARTIFACT_ATTACHMENTS of
+        false ->
+            {error, {artifact_attachment_count_exceeded,
+                     length(Refs), ?MAX_ARTIFACT_ATTACHMENTS}};
+        true ->
+            Identity = maps:get(plugin_context, Runtime),
+            Scope = {session, Runner#runner.app_name,
+                     maps:get(user_id, Identity),
+                     maps:get(session, Identity)},
+            case load_artifact_parts(Refs, Runtime,
+                                     Runner#runner.artifact_svc,
+                                     Scope, Runner#runner.service_timeout,
+                                     0, []) of
+                {ok, []} -> {ok, Events};
+                {ok, Parts} ->
+                    case adk_content:new(
+                           Parts,
+                           #{max_parts => ?MAX_ARTIFACT_ATTACHMENTS * 2,
+                             max_inline_data_bytes =>
+                                 ?MAX_ARTIFACT_ATTACHMENT_BYTES,
+                             max_total_inline_data_bytes =>
+                                 ?MAX_ARTIFACT_ATTACHMENT_BYTES}) of
+                        {ok, Content} ->
+                            AttachmentEvent = adk_event:new(
+                              <<"user">>, Content,
+                              #{invocation_id => InvocationId,
+                                actions =>
+                                  #{<<"context_component">> =>
+                                        <<"artifact_attachments">>}}),
+                            {ok, insert_before_event(
+                                   Events, CurrentInputId,
+                                   AttachmentEvent)};
+                        {error, Reason} ->
+                            {error, {invalid_artifact_attachment_content,
+                                     Reason}}
+                    end;
+                {error, _} = Error -> Error
+            end
+    end.
+
+artifact_attachment_refs(Events, InvocationId) ->
+    Refs = lists:foldl(
+             fun(#adk_event{invocation_id = Seen,
+                            author = Author,
+                            actions = Actions}, Acc)
+                   when Seen =:= InvocationId ->
+                     case Author of
+                         <<"user">> -> Acc;
+                         <<"system">> -> Acc;
+                         <<"tool">> ->
+                             Effects = maps:get(
+                                         <<"context_effects">>, Actions, []),
+                             lists:foldl(fun maybe_add_attachment_ref/2,
+                                         Acc, Effects);
+                         _Agent ->
+                             %% Attachments selected by an earlier model round
+                             %% have already served their one next request.
+                             []
+                     end;
+                (_Event, Acc) -> Acc
+             end, [], Events),
+    unique_attachment_refs(lists:reverse(Refs), #{}, []).
+
+maybe_add_attachment_ref(
+  #{<<"kind">> := <<"artifact_attachment">>,
+    <<"name">> := Name, <<"version">> := Version} = Effect, Acc)
+  when is_binary(Name), is_integer(Version), Version > 0 ->
+    [#{name => Name, version => Version,
+       digest => maps:get(<<"digest">>, Effect, undefined),
+       size => maps:get(<<"size">>, Effect, undefined),
+       mime_type => maps:get(<<"mime_type">>, Effect, undefined)} | Acc];
+maybe_add_attachment_ref(_Effect, Acc) -> Acc.
+
+unique_attachment_refs([], _Seen, Acc) -> lists:reverse(Acc);
+unique_attachment_refs([#{name := Name, version := Version} = Ref | Rest],
+                       Seen, Acc) ->
+    Key = {Name, Version},
+    case maps:is_key(Key, Seen) of
+        true -> unique_attachment_refs(Rest, Seen, Acc);
+        false -> unique_attachment_refs(Rest, Seen#{Key => true},
+                                        [Ref | Acc])
+    end.
+
+load_artifact_parts([], _Runtime, _Service, _Scope, _Timeout, _Bytes, Acc) ->
+    {ok, lists:reverse(Acc)};
+load_artifact_parts([Ref | Rest], Runtime, Service, Scope, Timeout,
+                    Bytes, Acc) ->
+    Name = maps:get(name, Ref),
+    Version = maps:get(version, Ref),
+    case resolve_artifact_attachment(
+           Runtime, Service, Scope, Name, Version, Timeout) of
+        {ok, Artifact} when is_map(Artifact) ->
+            case attachment_artifact_parts(Ref, Artifact, Scope, Bytes) of
+                {ok, NewBytes, Parts} ->
+                    load_artifact_parts(Rest, Runtime, Service, Scope, Timeout,
+                                        NewBytes,
+                                        lists:reverse(Parts, Acc));
+                {error, _} = Error -> Error
+            end;
+        {error, Reason} ->
+            {error, {artifact_attachment_load_failed,
+                     Name, Version, Reason}};
+        Other ->
+            {error, {invalid_artifact_attachment_reply, Other}}
+    end.
+
+resolve_artifact_attachment(Runtime, Service, Scope, Name, Version,
+                            Timeout) ->
+    case adk_context:resolve_attachment(
+           Runtime, Name, Version, Timeout + 250) of
+        {ok, Artifact} -> {ok, Artifact};
+        %% A resumed invocation has a new owner-bound capability, so only its
+        %% durable attachment reference survives. Reload that exact version
+        %% and validate its digest before it crosses the provider boundary.
+        {error, artifact_attachment_not_found} ->
+            adk_service_ref:call(Service, get,
+                                 [Scope, Name, Version], Timeout);
+        {error, context_capability_unavailable} ->
+            adk_service_ref:call(Service, get,
+                                 [Scope, Name, Version], Timeout);
+        {error, _} = Error -> Error
+    end.
+
+attachment_artifact_parts(Ref, Artifact, Scope, Bytes) ->
+    Name = maps:get(name, Ref),
+    Version = maps:get(version, Ref),
+    Data = maps:get(data, Artifact, undefined),
+    MimeType = maps:get(mime_type, Artifact, undefined),
+    Size = maps:get(size, Artifact, undefined),
+    Digest = maps:get(digest, Artifact, undefined),
+    Matches = maps:get(scope, Artifact, undefined) =:= Scope andalso
+              maps:get(name, Artifact, undefined) =:= Name andalso
+              maps:get(version, Artifact, undefined) =:= Version andalso
+              is_binary(Data) andalso is_binary(MimeType) andalso
+              is_integer(Size) andalso Size =:= byte_size(Data) andalso
+              is_binary(Digest) andalso
+              Digest =:= artifact_digest(Data) andalso
+              optional_ref_match(digest, Digest, Ref) andalso
+              optional_ref_match(size, Size, Ref) andalso
+              optional_ref_match(mime_type, MimeType, Ref),
+    case {Matches, is_binary(Data),
+          is_binary(Data) andalso
+            Bytes + byte_size(Data) =< ?MAX_ARTIFACT_ATTACHMENT_BYTES} of
+        {false, _, _} -> {error, artifact_attachment_reference_mismatch};
+        {true, true, false} ->
+            {error, {artifact_attachment_bytes_exceeded,
+                     Bytes + byte_size(Data),
+                     ?MAX_ARTIFACT_ATTACHMENT_BYTES}};
+        {true, true, true} ->
+            LabelText = iolist_to_binary(
+                          [<<"Attached artifact name=">>, Name,
+                           <<" version=">>, integer_to_binary(Version),
+                           <<" mime_type=">>, MimeType]),
+            {ok, Label} = adk_content:text(LabelText),
+            case Data of
+                <<>> ->
+                    {ok, Empty} = adk_content:text(
+                                    <<"[artifact content is empty]">>),
+                    {ok, Bytes, [Label, Empty]};
+                _ ->
+                    case adk_content:inline_data(
+                           MimeType, Data,
+                           #{max_inline_data_bytes =>
+                                 ?MAX_ARTIFACT_ATTACHMENT_BYTES,
+                             max_total_inline_data_bytes =>
+                                 ?MAX_ARTIFACT_ATTACHMENT_BYTES}) of
+                        {ok, Part} ->
+                            {ok, Bytes + byte_size(Data), [Label, Part]};
+                        {error, Reason} ->
+                            {error, {invalid_artifact_attachment, Reason}}
+                    end
+            end
+    end.
+
+artifact_digest(Data) ->
+    iolist_to_binary([io_lib:format("~2.16.0b", [Byte])
+                      || <<Byte>> <= crypto:hash(sha256, Data)]).
+
+optional_ref_match(Key, Value, Ref) ->
+    case maps:get(Key, Ref, undefined) of
+        undefined -> true;
+        Expected -> Expected =:= Value
+    end.
+
+insert_before_event(Events, undefined, Attachment) ->
+    Events ++ [Attachment];
+insert_before_event([], _EventId, Attachment) -> [Attachment];
+insert_before_event([#adk_event{id = EventId} = Event | Rest],
+                    EventId, Attachment) ->
+    [Attachment, Event | Rest];
+insert_before_event([Event | Rest], EventId, Attachment) ->
+    [Event | insert_before_event(Rest, EventId, Attachment)].
+
+
 maybe_add_memory_instruction(Context, Runtime, true) ->
     Context#{additional_instructions => maps:get(memory_context, Runtime)};
 maybe_add_memory_instruction(Context, _Runtime, false) ->
     Context.
+
+maybe_add_context_cache(#runner{context_cache = disabled}, _Runtime,
+                        Context) ->
+    Context;
+maybe_add_context_cache(Runner, Runtime, Context) ->
+    Identity = maps:get(plugin_context, Runtime),
+    Model = maps:get(model, Identity, null),
+    case is_binary(Model) andalso byte_size(Model) > 0 of
+        true ->
+            Cache0 = Runner#runner.context_cache,
+            Scope = #{app => Runner#runner.app_name,
+                      user => maps:get(user_id, Identity),
+                      model => Model,
+                      policy => maps:get(policy, Cache0)},
+            Cache = #{cache => maps:get(cache, Cache0),
+                      provider => maps:get(provider, Cache0),
+                      scope => Scope,
+                      ttl_ms => maps:get(ttl_ms, Cache0),
+                      deadline_ms =>
+                          erlang:monotonic_time(millisecond)
+                          + Runner#runner.service_timeout},
+            Context#{'$adk_context_cache' => Cache};
+        false ->
+            erlang:error(context_cache_model_required)
+    end.
 
 maybe_ingest_session(#runner{memory_ingestion = disabled},
                      _UserId, _SessionId) ->
@@ -1104,25 +1596,79 @@ maybe_ingest_session(Runner, UserId, SessionId) ->
     case SessionSvc:get_session(Runner#runner.app_name, UserId, SessionId) of
         {ok, Session} ->
             Events = maps:get(events, Session, []),
-            case adk_service_ref:call(
-                   Runner#runner.memory_svc, add_session_to_memory,
-                   [SessionId, Events], Runner#runner.service_timeout) of
-                ok -> ok;
-                Error ->
-                    Failure = adk_failure:external(
-                                runner, memory_ingestion, Error),
-                    logger:warning(
-                      "Successful session memory ingestion ignored: ~p",
-                      [Failure]),
-                    ok
-            end;
+            enqueue_memory_ingestion(
+              Runner, UserId, SessionId, Events);
         Error ->
             Failure = adk_failure:external(
                         runner, memory_session_load, Error),
+            case Runner#runner.memory_ingestion of
+                #{mode := durable} -> {error, Failure};
+                _ ->
+                    logger:warning(
+                      "Successful session could not be loaded for memory ingestion: ~p",
+                      [Failure]),
+                    ok
+            end
+    end.
+
+enqueue_memory_ingestion(Runner, UserId, SessionId, Events) ->
+    case Runner#runner.memory_ingestion of
+        on_success ->
+            enqueue_transient_memory_ingestion(
+              Runner, UserId, SessionId, Events);
+        #{mode := durable} = Policy ->
+            enqueue_durable_memory_ingestion(
+              Runner, UserId, SessionId, Events, Policy)
+    end.
+
+enqueue_transient_memory_ingestion(Runner, UserId, SessionId, Events) ->
+    Spec = #{service => Runner#runner.memory_svc,
+             scope => {user, Runner#runner.app_name, UserId},
+             session_id => SessionId,
+             events => Events,
+             timeout => Runner#runner.service_timeout,
+             max_attempts => 3},
+    Reply = case whereis(adk_memory_ingest_sup) of
+        undefined -> adk_memory_ingest_worker:run(Spec);
+        _ -> adk_memory_ingest_sup:start_ingestion(Spec)
+    end,
+    case Reply of
+        ok -> ok;
+        {ok, _Pid, _Ref} -> ok;
+        Error ->
+            Failure = adk_failure:external(
+                        runner, memory_ingestion, Error),
             logger:warning(
-              "Successful session could not be loaded for memory ingestion: ~p",
+              "Successful session memory ingestion ignored: ~p",
               [Failure]),
             ok
+    end.
+
+enqueue_durable_memory_ingestion(Runner, UserId, SessionId, Events, Policy) ->
+    {Module, _Handle} = Service = Runner#runner.memory_svc,
+    Identity = {Module, maps:get(adapter_id, Policy)},
+    Request = #{scope => {user, Runner#runner.app_name, UserId},
+                session_id => SessionId,
+                adapter => Identity,
+                events => Events,
+                max_attempts => maps:get(max_attempts, Policy)},
+    Reply = case adk_memory_outbox_sup:register_adapter(Identity, Service) of
+        ok -> adk_memory_outbox_sup:submit(Request);
+        {error, _} = RegisterError -> RegisterError
+    end,
+    case Reply of
+        {ok, Metadata} ->
+            telemetry:execute(
+              [erlang_adk, memory, outbox, admitted],
+              #{event_count => maps:get(event_count, Metadata, 0),
+                batch_count => maps:get(batch_count, Metadata, 0)},
+              #{job_id => maps:get(job_id, Metadata, undefined),
+                deduplicated => maps:get(deduplicated, Metadata, false),
+                app_name => Runner#runner.app_name}),
+            ok;
+        AdmissionError ->
+            {error, adk_failure:external(
+                      runner, durable_memory_ingestion, AdmissionError)}
     end.
 
 %% @private Ensure session exists or create it.
@@ -1176,9 +1722,13 @@ run_model_round(Runner, UserId, SessionId, InvId, Caller, Runtime,
                               Runner, UserId, SessionId, InvId, undefined),
             AgentContext1 = AgentContext0#{
                               state => maps:get(state, Session, #{}),
-                              context_metadata => ContextMetadata},
+                              context_metadata => ContextMetadata,
+                              '$adk_request_budget' =>
+                                  Runner#runner.context_policy},
+            AgentContext2 = maybe_add_context_cache(
+                              Runner, Runtime, AgentContext1),
             AgentContext = maybe_add_memory_instruction(
-                             AgentContext1, Runtime, MemoryIncluded),
+                             AgentContext2, Runtime, MemoryIncluded),
             case run_agent_model(
                    Runner, UserId, SessionId, History, InvId,
                    AgentContext, Caller, Runtime) of
@@ -1342,12 +1892,22 @@ persist_final_event(Runner, UserId, SessionId, FinalEvent0,
                                       [maps:get(name_binary, Runtime), Content]);
                                 false -> ok
                             end,
-                            ok = maybe_ingest_session(
-                                   Runner, UserId, SessionId),
-                            safe_clear_temp_state(
-                              Runner, UserId, SessionId),
-                            Caller ! {adk_done, self()},
-                            ok;
+                            case maybe_ingest_session(
+                                   Runner, UserId, SessionId) of
+                                ok ->
+                                    safe_clear_temp_state(
+                                      Runner, UserId, SessionId),
+                                    Caller ! {adk_done, self()},
+                                    ok;
+                                {error, IngestionReason} ->
+                                    safe_clear_temp_state(
+                                      Runner, UserId, SessionId),
+                                    Caller ! {
+                                      adk_error, self(),
+                                      {durable_memory_ingestion_not_admitted,
+                                       IngestionReason}},
+                                    ok
+                            end;
                         {error, Reason} ->
                             finish_error(
                               Runner, UserId, SessionId,
@@ -1528,7 +2088,8 @@ execute_ready_serial_descriptor(Runner, UserId, SessionId, InvId, Caller,
     case Execution of
         {result, Result} ->
             record_tool_response(Runner, UserId, SessionId, InvId, Caller,
-                                 NameBin, Result, Sig, CallId, Runtime),
+                                 NameBin, Result, Sig, CallId,
+                                 context_effect_id(Context), Runtime),
             execute_runner_tools(Runner, UserId, SessionId, InvId, Caller,
                                  Rest, Runtime, LlmCalls, ToolRounds);
         {pause, Reason, Summary} ->
@@ -1541,7 +2102,8 @@ resolve_runner_call(Runner, UserId, SessionId, InvId, Call, Runtime) ->
     {NameBin, ArgsMap, Sig, CallId} = normalize_call(Call),
     Tools = maps:get(tools, Runtime),
     SubAgents = maps:get(sub_agents, Runtime),
-    Context = tool_context(Runner, UserId, SessionId, InvId, CallId),
+    Context = (tool_context(Runner, UserId, SessionId, InvId, CallId))#{
+                '$adk_effect_id' => make_ref()},
     Base = #{original_call => Call,
              name => NameBin,
              args => ArgsMap,
@@ -1570,12 +2132,16 @@ materialize_runner_tool(#{kind := tool_preflight,
                           context := Context} = Descriptor,
                         Runtime) ->
     Base = maps:remove(tool_target, Descriptor),
-    case adk_toolset:materialize(Target, Name, Args, Context) of
+    %% Catalog resolution may select credentials or confirmation metadata, but
+    %% it never receives local storage handles. A resolved local module gets a
+    %% separately declared least-authority capability below.
+    case adk_toolset:materialize(
+           Target, Name, Args, public_tool_identity(Context)) of
         {ok, {module, Module}} ->
-            with_runner_agent_path(
-              Base#{kind => tool, module => Module}, Runtime);
+            project_module_tool_context(
+              Base#{kind => tool, module => Module}, Module, Runtime);
         {ok, {resolved, ResolvedCall}} ->
-            with_resolved_module_agent_path(
+            project_resolved_tool_context(
               Base#{kind => resolved_tool,
                     resolved_call => ResolvedCall}, Runtime);
         {error, Reason} ->
@@ -1645,14 +2211,20 @@ with_runner_agent_path(Descriptor, Runtime) ->
     Context = maps:get(context, Descriptor),
     Descriptor#{context => with_runner_agent_path_context(Context, Runtime)}.
 
-with_resolved_module_agent_path(
+project_resolved_tool_context(
   #{resolved_call := #{module := Module}} = Descriptor, Runtime)
   when is_atom(Module) ->
     %% A module executor is trusted local code even when selected through a
-    %% dynamic catalog. Opaque execute closures remain on the minimal context.
-    with_runner_agent_path(Descriptor, Runtime);
-with_resolved_module_agent_path(Descriptor, _Runtime) ->
-    Descriptor.
+    %% dynamic catalog. Opaque execute closures never receive local handles.
+    project_module_tool_context(Descriptor, Module, Runtime);
+project_resolved_tool_context(Descriptor, _Runtime) ->
+    Context = maps:get(context, Descriptor),
+    Public = public_tool_identity(Context),
+    Descriptor#{context => Public}.
+
+public_tool_identity(Context) ->
+    maps:with([app_name, user_id, session_id,
+               invocation_id, call_id, '$adk_agent_path'], Context).
 
 with_runner_agent_path_context(Context, Runtime) ->
     case adk_agent_tree:validate_name(maps:get(name, Runtime, undefined)) of
@@ -1660,6 +2232,16 @@ with_runner_agent_path_context(Context, Runtime) ->
             Context#{'$adk_agent_path' => [Name]};
         {error, _} ->
             Context
+    end.
+
+project_module_tool_context(Descriptor, Module, Runtime) ->
+    WithPath = with_runner_agent_path(Descriptor, Runtime),
+    Context = maps:get(context, WithPath),
+    case adk_context:project_tool(Module, Context, Runtime) of
+        {ok, Projected} -> WithPath#{context => Projected};
+        {error, Reason} ->
+            (maps:without([module, resolved_call], WithPath))#{
+                kind => tool_error, reason => Reason}
     end.
 
 descriptor_parallel_safe(Descriptor) ->
@@ -1825,7 +2407,8 @@ commit_parallel_results(Runner, UserId, SessionId, InvId, Caller,
       Runner, UserId, SessionId, InvId, Caller,
       maps:get(name, Descriptor), Result,
       maps:get(thought_signature, Descriptor),
-      maps:get(call_id, Descriptor), Runtime),
+      maps:get(call_id, Descriptor),
+      context_effect_id(maps:get(context, Descriptor)), Runtime),
     commit_parallel_results(
       Runner, UserId, SessionId, InvId, Caller,
       PreparedRest, ResultRest, Runtime);
@@ -2259,7 +2842,8 @@ execute_admitted_resume(Runner, UserId, SessionId, ToolResponse,
                        NameBin, ArgsMap, Context, ToolResponse, Runtime),
             record_tool_response(
               Runner, UserId, SessionId, InvId, Caller,
-              NameBin, Result, Sig, CallId, Runtime),
+              NameBin, Result, Sig, CallId,
+              context_effect_id(Context), Runtime),
             continue_resumed_invocation(
               Runner, UserId, SessionId, InvId, Caller,
               Rest, Runtime, LlmCalls, ToolRounds)
@@ -2267,12 +2851,17 @@ execute_admitted_resume(Runner, UserId, SessionId, ToolResponse,
 
 resumed_tool_context(Runner, UserId, SessionId, InvId, CallId,
                      Name, Args, Runtime) ->
-    Context = tool_context(Runner, UserId, SessionId, InvId, CallId),
+    Context = (tool_context(Runner, UserId, SessionId, InvId, CallId))#{
+                '$adk_effect_id' => make_ref()},
     case adk_toolset:preflight(maps:get(tools, Runtime), Name, Args) of
-        {ok, {module_target, _Module}} ->
-            with_runner_agent_path_context(Context, Runtime);
+        {ok, {module_target, Module}} ->
+            WithPath = with_runner_agent_path_context(Context, Runtime),
+            case adk_context:project_tool(Module, WithPath, Runtime) of
+                {ok, Projected} -> Projected;
+                {error, _} -> public_tool_identity(WithPath)
+            end;
         _ ->
-            Context
+            public_tool_identity(Context)
     end.
 
 resume_tool_confirmation(Runner, UserId, SessionId, InvId, Caller,
@@ -2302,7 +2891,7 @@ resume_tool_confirmation(Runner, UserId, SessionId, InvId, Caller,
                  NameBin, ArgsMap, InvId, CallId),
     Result = adk_tool_confirmation:rejection_response(ActionId),
     record_tool_response(Runner, UserId, SessionId, InvId, Caller,
-                         NameBin, Result, Sig, CallId, Runtime),
+                         NameBin, Result, Sig, CallId, no_effects, Runtime),
     continue_resumed_invocation(
       Runner, UserId, SessionId, InvId, Caller,
       Rest, Runtime, LlmCalls, ToolRounds).
@@ -2325,7 +2914,7 @@ complete_resumed_tool(NameBin, ArgsMap, Context, ToolResponse, Runtime) ->
     Result.
 
 record_tool_response(Runner, UserId, SessionId, InvId, Caller,
-                     NameBin, Result, Sig, CallId, Runtime) ->
+                     NameBin, Result, Sig, CallId, EffectId, Runtime) ->
     SafeResult = case check_runtime_content_policy(
                         Runtime, <<"tool_result">>, Result) of
         allow -> Result;
@@ -2339,12 +2928,84 @@ record_tool_response(Runner, UserId, SessionId, InvId, Caller,
         undefined -> {tool_response, NameBin, SafeResult, Sig};
         _ -> {tool_response, NameBin, SafeResult, Sig, CallId}
     end,
-    ToolEvent = adk_event:new(<<"tool">>, Content, #{invocation_id => InvId}),
+    {Actions, EffectReceipt} = prepare_context_effect_actions(
+                                 Runtime, EffectId),
+    ToolEvent = adk_event:new(<<"tool">>, Content,
+                              #{invocation_id => InvId,
+                                actions => Actions}),
     case publish_event(Runner, UserId, SessionId, ToolEvent,
                        Caller, Runtime) of
-        {ok, _PublishedToolEvent} -> ok;
-        {error, Reason} -> erlang:error({tool_event_failed, Reason})
+        {ok, _PublishedToolEvent} ->
+            case adk_context:commit_effects(Runtime, EffectReceipt) of
+                ok -> ok;
+                {error, Reason} ->
+                    erlang:error({context_effect_commit_failed, Reason})
+            end;
+        {error, Reason} ->
+            _ = adk_context:abort_effects(Runtime, EffectReceipt),
+            erlang:error({tool_event_failed, Reason})
     end.
+
+context_effect_id(Context) ->
+    maps:get('$adk_effect_id', Context, no_effects).
+
+prepare_context_effect_actions(_Runtime, no_effects) -> {#{}, none};
+prepare_context_effect_actions(Runtime, EffectId) ->
+    case adk_context:prepare_effects(Runtime, EffectId) of
+        {ok, Receipt, []} -> {#{}, Receipt};
+        {ok, Receipt, Effects} ->
+            {#{<<"context_effects">> =>
+                   [encode_context_effect(Effect) || Effect <- Effects]},
+             Receipt};
+        {error, Reason} ->
+            erlang:error({context_effect_commit_failed, Reason})
+    end.
+
+encode_context_effect(#{kind := artifact_delta} = Effect) ->
+    compact_effect_map(
+      #{<<"kind">> => <<"artifact_delta">>,
+        <<"operation">> => effect_atom(maps:get(operation, Effect)),
+        <<"scope">> => encode_effect_scope(maps:get(scope, Effect)),
+        <<"name">> => maps:get(name, Effect, undefined),
+        <<"version">> => maps:get(version, Effect, undefined),
+        <<"digest">> => maps:get(digest, Effect, undefined),
+        <<"size">> => maps:get(size, Effect, undefined),
+        <<"mime_type">> => maps:get(mime_type, Effect, undefined)});
+encode_context_effect(#{kind := artifact_attachment} = Effect) ->
+    compact_effect_map(
+      #{<<"kind">> => <<"artifact_attachment">>,
+        <<"scope">> => encode_effect_scope(maps:get(scope, Effect)),
+        <<"name">> => maps:get(name, Effect, undefined),
+        <<"version">> => maps:get(version, Effect, undefined),
+        <<"digest">> => maps:get(digest, Effect, undefined),
+        <<"size">> => maps:get(size, Effect, undefined),
+        <<"mime_type">> => maps:get(mime_type, Effect, undefined)});
+encode_context_effect(#{kind := memory_delta} = Effect) ->
+    Entry = maps:get(entry, Effect, #{}),
+    compact_effect_map(
+      #{<<"kind">> => <<"memory_delta">>,
+        <<"operation">> => effect_atom(maps:get(operation, Effect)),
+        <<"scope">> => encode_effect_scope(maps:get(scope, Effect)),
+        <<"entry_id">> => maps:get(id, Entry, undefined)});
+encode_context_effect(_Effect) ->
+    #{<<"kind">> => <<"unknown">>}.
+
+compact_effect_map(Map) ->
+    maps:filter(fun(_Key, Value) -> Value =/= undefined end, Map).
+
+encode_effect_scope({session, App, User, Session}) ->
+    #{<<"type">> => <<"session">>, <<"app_name">> => App,
+      <<"user_id">> => User, <<"session_id">> => Session};
+encode_effect_scope({user, App, User}) ->
+    #{<<"type">> => <<"user">>, <<"app_name">> => App,
+      <<"user_id">> => User};
+encode_effect_scope({app, App}) ->
+    #{<<"type">> => <<"app">>, <<"app_name">> => App};
+encode_effect_scope(_) -> undefined.
+
+effect_atom(Value) when is_atom(Value) -> atom_to_binary(Value, utf8);
+effect_atom(Value) when is_binary(Value) -> Value;
+effect_atom(_) -> undefined.
 
 %% Resolve resume/4 only when exactly one continuation is observable. The
 %% invocation-specific resume/5 avoids this discovery step and should be used
@@ -2736,15 +3397,28 @@ validate_credential_store(_Value) ->
 validate_memory_retrieval(disabled) ->
     disabled;
 validate_memory_retrieval(Policy) when is_map(Policy) ->
-    Unknown = maps:without([limit, filter, on_error], Policy),
+    Unknown = maps:without(
+                [limit, filter, on_error,
+                 max_hit_bytes, max_total_bytes], Policy),
     Limit = maps:get(limit, Policy, ?DEFAULT_MEMORY_LIMIT),
     Filter = maps:get(filter, Policy, #{}),
     OnError = maps:get(on_error, Policy, ignore),
+    MaxHitBytes = maps:get(max_hit_bytes, Policy,
+                           ?DEFAULT_MEMORY_MAX_HIT_BYTES),
+    MaxTotalBytes = maps:get(max_total_bytes, Policy,
+                             ?DEFAULT_MEMORY_MAX_TOTAL_BYTES),
     case map_size(Unknown) =:= 0 andalso
          is_integer(Limit) andalso Limit > 0 andalso
          is_map(Filter) andalso
-         (OnError =:= ignore orelse OnError =:= fail) of
-        true -> #{limit => Limit, filter => Filter, on_error => OnError};
+         (OnError =:= ignore orelse OnError =:= fail) andalso
+         is_integer(MaxHitBytes) andalso MaxHitBytes > 0 andalso
+         MaxHitBytes =< ?MEMORY_MAX_HIT_BYTES_CEILING andalso
+         is_integer(MaxTotalBytes) andalso
+         MaxTotalBytes >= MaxHitBytes andalso
+         MaxTotalBytes =< ?MEMORY_MAX_TOTAL_BYTES_CEILING of
+        true -> #{limit => Limit, filter => Filter, on_error => OnError,
+                  max_hit_bytes => MaxHitBytes,
+                  max_total_bytes => MaxTotalBytes};
         false -> erlang:error({invalid_memory_retrieval, Policy})
     end;
 validate_memory_retrieval(Policy) ->
@@ -2752,6 +3426,30 @@ validate_memory_retrieval(Policy) ->
 
 validate_memory_ingestion(disabled) -> disabled;
 validate_memory_ingestion(on_success) -> on_success;
+validate_memory_ingestion(Policy) when is_map(Policy) ->
+    Unknown = maps:keys(
+                maps:without([mode, adapter_id, max_attempts], Policy)),
+    Mode = maps:get(mode, Policy, undefined),
+    AdapterId = maps:get(adapter_id, Policy, undefined),
+    MaxAttempts = maps:get(max_attempts, Policy, 5),
+    case {Unknown, Mode,
+          is_binary(AdapterId) andalso byte_size(AdapterId) > 0 andalso
+              byte_size(AdapterId) =< 256,
+          is_integer(MaxAttempts) andalso MaxAttempts > 0 andalso
+              MaxAttempts =< 10} of
+        {[], durable, true, true} ->
+            #{mode => durable, adapter_id => AdapterId,
+              max_attempts => MaxAttempts};
+        {[_ | _], _, _, _} ->
+            erlang:error({invalid_memory_ingestion,
+                          {unknown_keys, lists:sort(Unknown)}});
+        {_, InvalidMode, _, _} when InvalidMode =/= durable ->
+            erlang:error({invalid_memory_ingestion, mode});
+        {_, _, false, _} ->
+            erlang:error({invalid_memory_ingestion, adapter_id});
+        {_, _, _, false} ->
+            erlang:error({invalid_memory_ingestion, max_attempts})
+    end;
 validate_memory_ingestion(Policy) ->
     erlang:error({invalid_memory_ingestion, Policy}).
 
@@ -2766,12 +3464,89 @@ validate_context_policy(Policy) when is_map(Policy) ->
 validate_context_policy(Policy) ->
     erlang:error({invalid_context_policy, Policy}).
 
+validate_context_compaction(disabled) ->
+    disabled;
+validate_context_compaction(Options) when is_map(Options) ->
+    case adk_context_compaction:compile(Options) of
+        {ok, Policy} -> Policy;
+        {error, Reason} ->
+            erlang:error({invalid_context_compaction, Reason})
+    end;
+validate_context_compaction(Value) ->
+    erlang:error({invalid_context_compaction, Value}).
+
+validate_context_compaction_service(_SessionService, disabled) -> ok;
+validate_context_compaction_service(SessionService, _Policy) ->
+    case code:ensure_loaded(SessionService) of
+        {module, SessionService} ->
+            case erlang:function_exported(
+                   SessionService, compact_events, 5) of
+                true -> ok;
+                false ->
+                    erlang:error(
+                      context_compaction_session_service_required)
+            end;
+        _ -> erlang:error(invalid_session_service)
+    end.
+
+validate_context_cache(disabled) ->
+    disabled;
+validate_context_cache(Options) when is_map(Options) ->
+    Unknown = maps:keys(
+                maps:without([cache, provider, ttl_ms, policy], Options)),
+    Cache = maps:get(cache, Options, undefined),
+    Provider = maps:get(provider, Options, undefined),
+    Ttl = maps:get(ttl_ms, Options, 300000),
+    Policy0 = maps:get(policy, Options, #{}),
+    case {Unknown, is_pid(Cache), is_atom(Provider),
+          is_integer(Ttl) andalso Ttl > 0 andalso Ttl =< 86400000,
+          normalize_context_cache_policy(Policy0)} of
+        {[], true, true, true, {ok, Policy}} ->
+            #{cache => Cache, provider => Provider,
+              ttl_ms => Ttl, policy => Policy};
+        {[_ | _], _, _, _, _} ->
+            erlang:error({invalid_context_cache,
+                          {unknown_keys, lists:sort(Unknown)}});
+        {_, false, _, _, _} ->
+            erlang:error({invalid_context_cache, cache});
+        {_, _, false, _, _} ->
+            erlang:error({invalid_context_cache, provider});
+        {_, _, _, false, _} ->
+            erlang:error({invalid_context_cache, ttl_ms});
+        {_, _, _, _, {error, Reason}} ->
+            erlang:error({invalid_context_cache, Reason})
+    end;
+validate_context_cache(Value) ->
+    erlang:error({invalid_context_cache, Value}).
+
+normalize_context_cache_policy(Policy) when is_map(Policy) ->
+    case adk_json:normalize(Policy) of
+        {ok, Safe} when is_map(Safe) ->
+            case byte_size(jsx:encode(Safe)) =< 16384 of
+                true -> {ok, Safe};
+                false -> {error, policy_too_large}
+            end;
+        _ -> {error, policy}
+    end;
+normalize_context_cache_policy(_) -> {error, policy}.
+
 validate_memory_service_policy(undefined, disabled, disabled) ->
     ok;
 validate_memory_service_policy(undefined, _Retrieval, _Ingestion) ->
     erlang:error(memory_service_required);
 validate_memory_service_policy(_MemoryService, _Retrieval, _Ingestion) ->
     ok.
+
+validate_memory_ingestion_runtime(disabled) -> ok;
+validate_memory_ingestion_runtime(on_success) -> ok;
+validate_memory_ingestion_runtime(#{mode := durable}) ->
+    case {whereis(adk_memory_outbox_sup),
+          whereis(adk_memory_outbox_registry),
+          whereis(adk_memory_outbox_processor)} of
+        {Sup, Registry, Processor}
+          when is_pid(Sup), is_pid(Registry), is_pid(Processor) -> ok;
+        _ -> erlang:error(memory_outbox_runtime_required)
+    end.
 
 validate_service_timeout(Timeout)
   when is_integer(Timeout), Timeout > 0 -> ok;

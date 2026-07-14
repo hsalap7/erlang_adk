@@ -67,6 +67,7 @@ mailbox_stays_responsive_and_stop_cleans_worker() ->
         Parent ! {prompt_result, responsive,
                   catch erlang_adk:prompt(Agent, <<"blocked">>)}
     end),
+    CallerMonitor = erlang:monitor(process, Caller),
     {Executor, _Prompt} = await_started(<<"responsive">>),
     ExecutorMonitor = erlang:monitor(process, Executor),
     ?assertMatch({ok, [], #{}}, adk_agent:get_tools(Agent)),
@@ -75,7 +76,7 @@ mailbox_stays_responsive_and_stop_cleans_worker() ->
     ok = erlang_adk:stop_agent(Agent),
     await_down(AgentMonitor, Agent),
     await_down(ExecutorMonitor, Executor),
-    ?assertNot(is_process_alive(Caller)),
+    await_down(CallerMonitor, Caller),
     await_active_turns(Baseline).
 
 same_agent_turns_are_fifo() ->

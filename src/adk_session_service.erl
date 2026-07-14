@@ -30,4 +30,13 @@
                              Event :: adk_event:event()) ->
     ok | {error, not_found | conflict | term()}.
 
--optional_callbacks([add_event_if_state/6]).
+%% Optional atomic history compaction. The backend replaces only the exact
+%% chronological prefix identified by ExpectedEventIds; any concurrent append
+%% after that prefix is retained. A mismatch fails closed with `conflict'.
+-callback compact_events(AppName :: binary(), UserId :: binary(),
+                         SessionId :: binary(),
+                         ExpectedEventIds :: [binary()],
+                         SummaryEvent :: adk_event:event()) ->
+    ok | {error, not_found | conflict | term()}.
+
+-optional_callbacks([add_event_if_state/6, compact_events/5]).

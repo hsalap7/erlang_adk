@@ -5,7 +5,7 @@
 
 -export([init/0, create_session/3, get_session/3, list_sessions/2, delete_session/3,
          update_state/4, add_event/4, clear_temp_state/3, take_state/4,
-         add_event_if_state/6]).
+         add_event_if_state/6, compact_events/5]).
 -export([save/2, load/1, delete/1]). %% Legacy API
 
 -define(TABLE, adk_sessions).
@@ -215,6 +215,44 @@ add_event_if_state(AppName, UserId, SessionId, Key, Expected, Event)
     end);
 add_event_if_state(_AppName, _UserId, _SessionId, _Key, _Expected, _Event) ->
     {error, invalid_event}.
+
+%% @doc Atomically replace an exact chronological event prefix with a durable
+%% compaction summary. Events appended concurrently after the prefix survive.
+compact_events(AppName, UserId, SessionId, ExpectedIds, SummaryEvent)
+  when is_list(ExpectedIds), ExpectedIds =/= [],
+       is_record(SummaryEvent, adk_event) ->
+    with_session_lock(AppName, UserId, SessionId, fun() ->
+        case ets:lookup(?TABLE, {AppName, UserId, SessionId}) of
+            [{{AppName, UserId, SessionId}, StoredState, Events,
+              _Timestamp}] ->
+                Chronological = lists:reverse(Events),
+                case replace_expected_prefix(
+                       Chronological, ExpectedIds, SummaryEvent) of
+                    {ok, Compacted} ->
+                        ets:insert(
+                          ?TABLE,
+                          {{AppName, UserId, SessionId}, StoredState,
+                           lists:reverse(Compacted),
+                           erlang:system_time(millisecond)}),
+                        ok;
+                    conflict -> {error, conflict}
+                end;
+            [] -> {error, not_found}
+        end
+    end);
+compact_events(_AppName, _UserId, _SessionId, _ExpectedIds, _SummaryEvent) ->
+    {error, invalid_compaction}.
+
+replace_expected_prefix(Events, ExpectedIds, SummaryEvent) ->
+    case take_matching_prefix(Events, ExpectedIds) of
+        {ok, Rest} -> {ok, [SummaryEvent | Rest]};
+        conflict -> conflict
+    end.
+
+take_matching_prefix(Rest, []) -> {ok, Rest};
+take_matching_prefix([#adk_event{id = Id} | Events], [Id | Ids]) ->
+    take_matching_prefix(Events, Ids);
+take_matching_prefix(_, _) -> conflict.
 
 %% --- Internal functions ---
 

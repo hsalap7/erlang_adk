@@ -86,6 +86,10 @@ command_noninteractive(["inspect", "agents" | Args]) ->
     with_options(
       Args, #{"--url" => base_url},
       fun inspect_agents/1);
+command_noninteractive(["inspect", "diagnostics" | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url},
+      fun inspect_diagnostics/1);
 command_noninteractive(["inspect", "run", RunId | Args]) ->
     with_options(
       Args, #{"--url" => base_url},
@@ -98,6 +102,66 @@ command_noninteractive(["inspect", "session", App, User, Session | Args]) ->
     with_options(
       Args, #{"--url" => base_url},
       fun(Opts) -> inspect_session(App, User, Session, Opts) end);
+command_noninteractive(["inspect", "context", App, User, Session | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url},
+      fun(Opts) -> inspect_context(App, User, Session, Opts) end);
+command_noninteractive(
+  ["inspect", "context-lifecycle", App, User, Session | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--model" => model},
+      fun(Opts) -> inspect_context_lifecycle(
+                     App, User, Session, Opts) end);
+command_noninteractive(
+  ["context-cache", "invalidate", App, User, Session | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--model" => model,
+              "--confirm-json" => confirm_json},
+      fun(Opts) -> invalidate_remote_context_cache(
+                     App, User, Session, Opts) end);
+command_noninteractive(["inspect", "artifacts", App, User, Session | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--limit" => limit,
+              "--cursor" => cursor},
+      fun(Opts) -> inspect_artifacts(App, User, Session, Opts) end);
+command_noninteractive(
+  ["inspect", "artifact", App, User, Session | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--name" => name,
+              "--limit" => limit, "--cursor" => cursor},
+      fun(Opts) -> inspect_artifact_versions(
+                     App, User, Session, Opts) end);
+command_noninteractive(["inspect", "memory", App, User | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url},
+      fun(Opts) -> inspect_memory(App, User, Opts) end);
+command_noninteractive(["memory", "search", App, User | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--query" => query,
+              "--filter-json" => filter_json, "--limit" => limit},
+      fun(Opts) -> search_remote_memory(App, User, Opts) end);
+command_noninteractive(
+  ["artifact", "delete", App, User, Session, Name, Selector | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--confirm-json" => confirm_json},
+      fun(Opts) -> delete_remote_artifact(
+                     App, User, Session, Name, Selector, Opts) end);
+command_noninteractive(
+  ["memory", "erase", App, User, "entry", Id | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--confirm-json" => confirm_json},
+      fun(Opts) -> erase_remote_memory(
+                     App, User, entry, Id, Opts) end);
+command_noninteractive(
+  ["memory", "erase", App, User, "session", Session | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--confirm-json" => confirm_json},
+      fun(Opts) -> erase_remote_memory(
+                     App, User, session, Session, Opts) end);
+command_noninteractive(["memory", "erase", App, User, "user" | Args]) ->
+    with_options(
+      Args, #{"--url" => base_url, "--confirm-json" => confirm_json},
+      fun(Opts) -> erase_remote_memory(App, User, user, User, Opts) end);
 command_noninteractive(["session", "create", App, User, Session | Args]) ->
     with_options(
       Args, #{"--url" => base_url},
@@ -134,9 +198,21 @@ usage() ->
       "  adk evaluate --config AGENT.json --dataset DATASET.json\n"
       "  adk serve [--config AGENT.json] [--port 8080 --ip 127.0.0.1]\n"
       "  adk inspect agents [--url URL]\n"
+      "  adk inspect diagnostics [--url URL]\n"
       "  adk inspect run RUN_ID [--url http://127.0.0.1:8080]\n"
       "  adk inspect sessions APP USER [--url URL]\n"
       "  adk inspect session APP USER SESSION [--url URL]\n"
+      "  adk inspect context APP USER SESSION [--url URL]\n"
+      "  adk inspect context-lifecycle APP USER SESSION --model MODEL [--url URL]\n"
+      "  adk context-cache invalidate APP USER SESSION --model MODEL --confirm-json JSON\n"
+      "  adk inspect artifacts APP USER SESSION [--limit N --cursor NAME]\n"
+      "  adk inspect artifact APP USER SESSION --name NAME [--limit N --cursor VERSION]\n"
+      "  adk inspect memory APP USER [--url URL]\n"
+      "  adk memory search APP USER --query TEXT [--filter-json JSON --limit N]\n"
+      "  adk artifact delete APP USER SESSION NAME SELECTOR --confirm-json JSON\n"
+      "  adk memory erase APP USER entry ID --confirm-json JSON\n"
+      "  adk memory erase APP USER session SESSION --confirm-json JSON\n"
+      "  adk memory erase APP USER user --confirm-json JSON\n"
       "  adk session create APP USER SESSION [--url URL]\n"
       "  adk session delete APP USER SESSION [--url URL]\n"
       "  adk session state APP USER SESSION --delta-json JSON [--url URL]\n"
@@ -662,6 +738,9 @@ inspect_run(RunId0, Opts) ->
 inspect_agents(Opts) ->
     remote_json(get, <<"/dev/v1/agents">>, undefined, Opts).
 
+inspect_diagnostics(Opts) ->
+    remote_json(get, <<"/dev/v1/diagnostics">>, undefined, Opts).
+
 inspect_sessions(App0, User0, Opts) ->
     App = quote(safe_binary(App0)),
     User = quote(safe_binary(User0)),
@@ -677,6 +756,296 @@ inspect_session(App0, User0, Session0, Opts) ->
       get,
       <<"/dev/v1/sessions/", App/binary, "/", User/binary, "/",
         Session/binary>>, undefined, Opts).
+
+inspect_context(App0, User0, Session0, Opts) ->
+    App = quote(safe_binary(App0)),
+    User = quote(safe_binary(User0)),
+    Session = quote(safe_binary(Session0)),
+    remote_json(
+      get,
+      <<"/dev/v1/context/", App/binary, "/", User/binary, "/",
+        Session/binary>>, undefined, Opts).
+
+inspect_context_lifecycle(App0, User0, Session0, Opts) ->
+    with_required(Opts, [model],
+      fun() ->
+          Model = option_binary(Opts, model, <<>>),
+          case valid_nonempty_binary(Model) of
+              false -> {error, invalid_context_cache_model};
+              true ->
+                  App = quote(safe_binary(App0)),
+                  User = quote(safe_binary(User0)),
+                  Session = quote(safe_binary(Session0)),
+                  remote_json(
+                    get,
+                    <<"/dev/v1/context/", App/binary, "/", User/binary,
+                      "/", Session/binary, "/lifecycle?model=",
+                      (quote(Model))/binary>>, undefined, Opts)
+          end
+      end).
+
+invalidate_remote_context_cache(App0, User0, Session0, Opts) ->
+    with_required(Opts, [model, confirm_json],
+      fun() ->
+          AppRaw = safe_binary(App0),
+          UserRaw = safe_binary(User0),
+          SessionRaw = safe_binary(Session0),
+          Model = option_binary(Opts, model, <<>>),
+          case valid_nonempty_binary(Model) of
+              false -> {error, invalid_context_cache_model};
+              true ->
+                  case inspect_context_lifecycle(
+                         AppRaw, UserRaw, SessionRaw, Opts) of
+                      {ok, Lifecycle} ->
+                          checked_remote_context_cache_invalidation(
+                            AppRaw, UserRaw, SessionRaw, Model,
+                            Lifecycle, Opts);
+                      {error, _} = Error -> Error
+                  end
+          end
+      end).
+
+checked_remote_context_cache_invalidation(App, User, Session, Model,
+                                          Lifecycle, Opts) ->
+    Cache = maps:get(<<"cache">>, Lifecycle, #{}),
+    Fingerprint = maps:get(<<"scope_fingerprint">>, Cache, undefined),
+    Expected = #{<<"app_name">> => App,
+                 <<"user_id">> => User,
+                 <<"session_id">> => Session,
+                 <<"model">> => Model,
+                 <<"scope_fingerprint">> => Fingerprint},
+    case is_binary(Fingerprint) andalso
+         checked_confirmation(Opts, Expected) =:= ok of
+        false -> {error, confirmation_does_not_match_target};
+        true ->
+            AppPath = quote(App),
+            UserPath = quote(User),
+            SessionPath = quote(Session),
+            Payload = #{<<"model">> => Model, <<"confirm">> => Expected},
+            remote_json(
+              post,
+              <<"/dev/v1/context/", AppPath/binary, "/", UserPath/binary,
+                "/", SessionPath/binary, "/cache/invalidate">>,
+              jsx:encode(Payload), Opts)
+    end.
+
+inspect_artifacts(App0, User0, Session0, Opts) ->
+    case resource_page_query(Opts, name) of
+        {error, _} = Error -> Error;
+        {ok, Query} ->
+            App = quote(safe_binary(App0)),
+            User = quote(safe_binary(User0)),
+            Session = quote(safe_binary(Session0)),
+            remote_json(
+              get,
+              <<"/dev/v1/artifacts/", App/binary, "/", User/binary,
+                "/", Session/binary, Query/binary>>, undefined, Opts)
+    end.
+
+inspect_artifact_versions(App0, User0, Session0, Opts) ->
+    with_required(Opts, [name],
+      fun() ->
+          Name = option_binary(Opts, name, <<>>),
+          case {valid_nonempty_binary(Name),
+                resource_page_query(Opts, version)} of
+              {true, {ok, PageQuery}} ->
+                  App = quote(safe_binary(App0)),
+                  User = quote(safe_binary(User0)),
+                  Session = quote(safe_binary(Session0)),
+                  NameQuery = <<"?name=", (quote(Name))/binary>>,
+                  Query = append_query(NameQuery, PageQuery),
+                  remote_json(
+                    get,
+                    <<"/dev/v1/artifacts/", App/binary, "/", User/binary,
+                      "/", Session/binary, "/versions", Query/binary>>,
+                    undefined, Opts);
+              {false, _} -> {error, invalid_artifact_name};
+              {_, {error, _} = Error} -> Error
+          end
+      end).
+
+inspect_memory(App0, User0, Opts) ->
+    App = quote(safe_binary(App0)),
+    User = quote(safe_binary(User0)),
+    remote_json(
+      get, <<"/dev/v1/memory/", App/binary, "/", User/binary>>,
+      undefined, Opts).
+
+search_remote_memory(App0, User0, Opts) ->
+    with_required(Opts, [query],
+      fun() ->
+          Query = option_binary(Opts, query, <<>>),
+          case {valid_nonempty_binary(Query), remote_memory_options(Opts)} of
+              {true, {ok, SearchOptions}} ->
+                  App = quote(safe_binary(App0)),
+                  User = quote(safe_binary(User0)),
+                  Payload = SearchOptions#{<<"query">> => Query},
+                  remote_json(
+                    post,
+                    <<"/dev/v1/memory/", App/binary, "/", User/binary,
+                      "/search">>, jsx:encode(Payload), Opts);
+              {false, _} -> {error, invalid_memory_query};
+              {_, {error, _} = Error} -> Error
+          end
+      end).
+
+delete_remote_artifact(App0, User0, Session0, Name0, Selector0, Opts) ->
+    with_required(Opts, [confirm_json],
+      fun() ->
+          AppRaw = safe_binary(App0),
+          UserRaw = safe_binary(User0),
+          SessionRaw = safe_binary(Session0),
+          Name = safe_binary(Name0),
+          case cli_artifact_selector(Selector0) of
+              {error, _} = Error -> Error;
+              {ok, Selector} ->
+                  Expected = #{<<"app_name">> => AppRaw,
+                               <<"user_id">> => UserRaw,
+                               <<"session_id">> => SessionRaw,
+                               <<"name">> => Name,
+                               <<"selector">> => Selector},
+                  case checked_confirmation(Opts, Expected) of
+                      ok ->
+                          App = quote(AppRaw),
+                          User = quote(UserRaw),
+                          Session = quote(SessionRaw),
+                          Payload = #{<<"name">> => Name,
+                                      <<"selector">> => Selector,
+                                      <<"confirm">> => Expected},
+                          remote_json(
+                            post,
+                            <<"/dev/v1/artifacts/", App/binary, "/",
+                              User/binary, "/", Session/binary, "/delete">>,
+                            jsx:encode(Payload), Opts);
+                      {error, _} = Error -> Error
+                  end
+          end
+      end).
+
+erase_remote_memory(App0, User0, Target, Identifier0, Opts) ->
+    with_required(Opts, [confirm_json],
+      fun() ->
+          AppRaw = safe_binary(App0),
+          UserRaw = safe_binary(User0),
+          Identifier = safe_binary(Identifier0),
+          TargetBin = atom_to_binary(Target, utf8),
+          Expected = #{<<"app_name">> => AppRaw,
+                       <<"user_id">> => UserRaw,
+                       <<"target">> => TargetBin,
+                       <<"identifier">> => Identifier},
+          case checked_confirmation(Opts, Expected) of
+              ok ->
+                  App = quote(AppRaw),
+                  User = quote(UserRaw),
+                  Payload0 = #{<<"target">> => TargetBin,
+                               <<"confirm">> => Expected},
+                  Payload = case Target of
+                      entry -> Payload0#{<<"id">> => Identifier};
+                      session -> Payload0#{<<"session_id">> => Identifier};
+                      user -> Payload0
+                  end,
+                  remote_json(
+                    post,
+                    <<"/dev/v1/memory/", App/binary, "/", User/binary,
+                      "/erase">>, jsx:encode(Payload), Opts);
+              {error, _} = Error -> Error
+          end
+      end).
+
+resource_page_query(Opts, CursorType) ->
+    case cli_page_limit(Opts) of
+        {error, _} = Error -> Error;
+        {ok, LimitPart} ->
+            case maps:find(cursor, Opts) of
+                error -> {ok, query_parts(LimitPart)};
+                {ok, Cursor0} ->
+                    Cursor = safe_binary(Cursor0),
+                    case valid_cli_cursor(CursorType, Cursor) of
+                        true ->
+                            {ok, query_parts(
+                                   LimitPart ++
+                                   [{<<"cursor">>, quote(Cursor)}])};
+                        false -> {error, invalid_resource_cursor}
+                    end
+            end
+    end.
+
+cli_page_limit(Opts) ->
+    case maps:find(limit, Opts) of
+        error -> {ok, []};
+        {ok, Value} ->
+            case parse_positive_integer(Value, limit) of
+                {ok, Integer} when Integer =< 1000 ->
+                    {ok, [{<<"limit">>, integer_to_binary(Integer)}]};
+                _ -> {error, invalid_resource_limit}
+            end
+    end.
+
+valid_cli_cursor(name, Cursor) -> valid_nonempty_binary(Cursor);
+valid_cli_cursor(version, Cursor) ->
+    case positive_binary_integer(Cursor) of
+        {ok, _} -> true;
+        _ -> false
+    end.
+
+query_parts([]) -> <<>>;
+query_parts(Parts) ->
+    Encoded = [<<Key/binary, "=", Value/binary>> || {Key, Value} <- Parts],
+    <<"?", (iolist_to_binary(lists:join(<<"&">>, Encoded)))/binary>>.
+
+append_query(NameQuery, <<>>) -> NameQuery;
+append_query(NameQuery, <<"?", Rest/binary>>) ->
+    <<NameQuery/binary, "&", Rest/binary>>.
+
+remote_memory_options(Opts) ->
+    case {remote_memory_filter(Opts), cli_page_limit(Opts)} of
+        {{ok, Filter}, {ok, LimitParts}} ->
+            Base = case map_size(Filter) of
+                0 -> #{};
+                _ -> #{<<"filter">> => Filter}
+            end,
+            case LimitParts of
+                [] -> {ok, Base};
+                [{<<"limit">>, LimitBin}] ->
+                    {ok, Limit} = positive_binary_integer(LimitBin),
+                    {ok, Base#{<<"limit">> => Limit}}
+            end;
+        {{error, _} = Error, _} -> Error;
+        {_, {error, _} = Error} -> Error
+    end.
+
+remote_memory_filter(Opts) ->
+    case maps:find(filter_json, Opts) of
+        error -> {ok, #{}};
+        {ok, Json0} ->
+            case decode_json_binary(safe_binary(Json0)) of
+                {ok, Filter} when is_map(Filter) -> {ok, Filter};
+                _ -> {error, memory_filter_must_be_object}
+            end
+    end.
+
+cli_artifact_selector("all") -> {ok, <<"all">>};
+cli_artifact_selector("latest") -> {ok, <<"latest">>};
+cli_artifact_selector(Value) ->
+    case parse_positive_integer(Value, selector) of
+        {ok, Version} -> {ok, Version};
+        _ -> {error, invalid_artifact_selector}
+    end.
+
+positive_binary_integer(Value) when is_binary(Value) ->
+    try binary_to_integer(Value) of
+        Integer when Integer > 0 -> {ok, Integer};
+        _ -> {error, invalid_positive_integer}
+    catch
+        _:_ -> {error, invalid_positive_integer}
+    end.
+
+checked_confirmation(Opts, Expected) ->
+    Json = option_binary(Opts, confirm_json, <<>>),
+    case decode_json_binary(Json) of
+        {ok, Expected} -> ok;
+        _ -> {error, confirmation_does_not_match_target}
+    end.
 
 create_remote_session(App0, User0, Session0, Opts) ->
     App = quote(safe_binary(App0)),

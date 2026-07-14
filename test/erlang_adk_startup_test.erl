@@ -14,6 +14,8 @@
          dev_session_service, dev_runner_options, dev_run_options,
          dev_max_body_bytes, dev_max_field_bytes, dev_sse_heartbeat_ms,
          dev_sse_max_events, dev_sse_max_bytes, dev_sse_max_duration_ms,
+         dev_resource_provider, dev_max_resource_results,
+         dev_diagnostic_timeout_ms, dev_diagnostic_context_policy,
          a2a_port, a2a_ip, a2a_max_body_bytes,
          a2a_num_acceptors, a2a_max_connections, a2a_request_timeout,
          a2a_idle_timeout, a2a_max_keepalive]).
@@ -116,7 +118,9 @@ supervised_http_is_bounded() ->
 
 supervised_dev_listener_is_authenticated() ->
     Keys = [a2a_enabled, a2a_v1_enabled, dev_enabled,
-            dev_auth_token, a2a_port, a2a_ip],
+            dev_auth_token, dev_resource_provider,
+            dev_max_resource_results, dev_diagnostic_timeout_ms,
+            dev_diagnostic_context_policy, a2a_port, a2a_ip],
     SavedEnv = save_env(erlang_adk, Keys),
     Port = free_port(),
     App = <<"startup-dev-app">>,
@@ -125,11 +129,27 @@ supervised_dev_listener_is_authenticated() ->
     Path = "/dev/v1/sessions/" ++ binary_to_list(App) ++ "/" ++
            binary_to_list(User) ++ "/" ++ binary_to_list(Session),
     Url = "http://127.0.0.1:" ++ integer_to_list(Port) ++ Path,
+    ArtifactScope = {session, App, User, Session},
+    {ok, ArtifactPid} = adk_artifact_ets:start_link(#{}),
+    {ok, _} = adk_artifact_ets:put(
+                ArtifactPid, ArtifactScope, <<"startup.txt">>, <<"ready">>,
+                #{}),
+    ProviderConfig = #{app => App, user => User, session => Session,
+                       artifact => {adk_artifact_ets, ArtifactPid}},
     try
         application:set_env(erlang_adk, a2a_enabled, false),
         application:set_env(erlang_adk, a2a_v1_enabled, false),
         application:set_env(erlang_adk, dev_enabled, true),
         application:set_env(erlang_adk, dev_auth_token, ?DEV_TOKEN),
+        application:set_env(
+          erlang_adk, dev_resource_provider,
+          {adk_dev_v05_resource_provider, ProviderConfig}),
+        application:set_env(erlang_adk, dev_max_resource_results, 1),
+        application:set_env(erlang_adk, dev_diagnostic_timeout_ms, 2000),
+        application:set_env(
+          erlang_adk, dev_diagnostic_context_policy,
+          #{max_bytes => 65536, max_tokens => 16384,
+            overflow => truncate}),
         application:set_env(erlang_adk, a2a_port, Port),
         application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
         {ok, _} = application:ensure_all_started(erlang_adk),
@@ -151,9 +171,28 @@ supervised_dev_listener_is_authenticated() ->
         Decoded = jsx:decode(Body2, [return_maps]),
         ?assertEqual(Session, maps:get(<<"id">>, Decoded)),
         ?assertEqual(App, maps:get(<<"app_name">>, Decoded)),
-        ?assertEqual(User, maps:get(<<"user_id">>, Decoded))
+        ?assertEqual(User, maps:get(<<"user_id">>, Decoded)),
+
+        ArtifactUrl = "http://127.0.0.1:" ++ integer_to_list(Port) ++
+                      "/dev/v1/artifacts/" ++ binary_to_list(App) ++ "/" ++
+                      binary_to_list(User) ++ "/" ++
+                      binary_to_list(Session),
+        {ok, {{_HttpVersion3, 200, _Reason3}, _Headers3, Body3}} =
+            httpc:request(
+              get, {ArtifactUrl ++ "?limit=1",
+                    [{"authorization", Authorization}]}, [],
+              [{body_format, binary}]),
+        ArtifactResult = jsx:decode(Body3, [return_maps]),
+        ?assertEqual([<<"startup.txt">>],
+                     maps:get(<<"names">>, ArtifactResult)),
+        {ok, {{_HttpVersion4, 400, _Reason4}, _Headers4, _Body4}} =
+            httpc:request(
+              get, {ArtifactUrl ++ "?limit=2",
+                    [{"authorization", Authorization}]}, [],
+              [{body_format, binary}])
     after
         _ = catch erlang_adk_session:delete_session(App, User, Session),
+        _ = adk_artifact_ets:stop(ArtifactPid),
         stop_application(erlang_adk),
         ?assertEqual(undefined, whereis(erlang_adk_http)),
         restore_env(erlang_adk, SavedEnv)

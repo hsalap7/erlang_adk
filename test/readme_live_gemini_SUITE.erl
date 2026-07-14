@@ -11,6 +11,8 @@
     google_search_grounding/1,
     thinking_configuration/1,
     multimodal_content/1,
+    context_cache/1,
+    artifact_and_memory_tools/1,
     weather_tool_round_trip/1,
     streaming/1,
     async_delegation/1,
@@ -38,6 +40,8 @@ all() ->
      google_search_grounding,
      thinking_configuration,
      multimodal_content,
+     context_cache,
+     artifact_and_memory_tools,
      weather_tool_round_trip,
      streaming,
      async_delegation,
@@ -56,6 +60,9 @@ init_per_suite(Config) ->
             application:set_env(erlang_adk, a2a_enabled, false),
             application:set_env(erlang_adk, agent_call_timeout, ?TIMEOUT),
             application:set_env(erlang_adk, agent_turn_timeout, ?TIMEOUT),
+            application:set_env(
+              erlang_adk, gemini_context_cache,
+              #{request_timeout_ms => ?LIVE_REQUEST_TIMEOUT_MS}),
             {ok, _} = application:ensure_all_started(erlang_adk),
             ok = compile_example(readme_weather_tool),
             ok = compile_example(readme_audit_callback),
@@ -80,6 +87,7 @@ end_per_suite(_Config) ->
     _ = application:unset_env(erlang_adk, a2a_port),
     _ = application:unset_env(erlang_adk, agent_call_timeout),
     _ = application:unset_env(erlang_adk, agent_turn_timeout),
+    _ = application:unset_env(erlang_adk, gemini_context_cache),
     ok.
 
 %% The live suite deliberately uses itself as a thin provider wrapper. This
@@ -211,6 +219,151 @@ multimodal_content(_Config) ->
     assert(nonempty_text(StreamText),
            {empty_multimodal_stream_text, Deltas}),
     ok.
+
+context_cache(_Config) ->
+    App = unique(<<"live-cache-app">>),
+    User = <<"live-cache-user">>,
+    FirstSession = unique(<<"live-cache-first">>),
+    SecondSession = unique(<<"live-cache-second">>),
+    Name = unique(<<"LiveContextCacheAgent">>),
+    StableInstructions = binary:copy(
+        <<"Erlang OTP supervisors isolate failures while lightweight "
+          "processes communicate through immutable messages. ">>, 600),
+    {ok, Cache} = adk_context_cache:start_link(
+                    #{min_prefix_tokens => 4096,
+                      create_timeout_ms => 30000,
+                      delete_timeout_ms => 15000,
+                      default_ttl_ms => 300000,
+                      failure_mode => error}),
+    {ok, AgentPid} = erlang_adk:spawn_agent(
+                       Name,
+                       (provider_config())#{instructions => StableInstructions},
+                       []),
+    ok = seed_cache_session(App, User, FirstSession, Name),
+    ok = seed_cache_session(App, User, SecondSession, Name),
+    Runner = adk_runner:new(
+               AgentPid, App, erlang_adk_session,
+               #{run_timeout => ?TIMEOUT,
+                 service_timeout => 30000,
+                 context_cache =>
+                     #{cache => Cache,
+                       provider => adk_context_cache_gemini,
+                       ttl_ms => 300000,
+                       policy => #{purpose => live_readme_gate}}}),
+    try
+        First = expect_text(
+                  adk_runner:run(
+                    Runner, User, FirstSession,
+                    <<"Reply with one short sentence about supervisors.">>),
+                  context_cache_create),
+        assert(nonempty_text(First), {empty_cached_create_response, First}),
+        Second = expect_text(
+                   adk_runner:run(
+                     Runner, User, SecondSession,
+                     <<"Reply with one short sentence about processes.">>),
+                   context_cache_reuse),
+        assert(nonempty_text(Second), {empty_cached_reuse_response, Second}),
+        assert_cache_lifecycle(App, User, FirstSession, <<"created">>),
+        assert_cache_lifecycle(App, User, SecondSession, <<"hit">>),
+        {ok, Status} = adk_context_cache:status(Cache),
+        assert(maps:get(<<"entries">>, Status) =:= 1,
+               {unexpected_context_cache_entries, Status})
+    after
+        safe_stop_agent(AgentPid),
+        _ = adk_context_cache:stop(Cache),
+        _ = erlang_adk_session:delete_session(App, User, FirstSession),
+        _ = erlang_adk_session:delete_session(App, User, SecondSession)
+    end.
+
+artifact_and_memory_tools(_Config) ->
+    App = unique(<<"live-data-app">>),
+    User = <<"live-data-user">>,
+    MemorySession = unique(<<"live-memory-tool">>),
+    ArtifactSession = unique(<<"live-artifact-tool">>),
+    MemoryName = unique(<<"LiveMemoryToolAgent">>),
+    ArtifactName = unique(<<"LiveArtifactToolAgent">>),
+    {ok, MemoryPid} = adk_memory_ets:start_link(#{}),
+    {ok, _} = adk_memory_ets:add_entry(
+                MemoryPid, {user, App, User},
+                #{content => <<"The live release codename is kingfisher.">>,
+                  metadata => #{}}, #{}),
+    {ok, MemoryAgent} = erlang_adk:spawn_agent(
+                          MemoryName,
+                          (provider_config())#{
+                            instructions =>
+                              <<"Call load_memory exactly once before "
+                                "answering. After its result, answer briefly "
+                                "and do not call it again.">>},
+                          [adk_load_memory_tool]),
+    TinyPng = base64:decode(
+        <<"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=">>),
+    {ok, ArtifactPid} = adk_artifact_ets:start_link(#{}),
+    ArtifactScope = {session, App, User, ArtifactSession},
+    {ok, _} = adk_artifact_ets:put(
+                ArtifactPid, ArtifactScope, <<"live-dot.png">>, TinyPng,
+                #{mime_type => <<"image/png">>}),
+    {ok, ArtifactAgent} = erlang_adk:spawn_agent(
+                            ArtifactName,
+                            (provider_config())#{
+                              instructions =>
+                                <<"Call load_artifacts exactly once with "
+                                  "live-dot.png before answering. After the "
+                                  "attachment arrives, describe it briefly "
+                                  "and do not call the tool again.">>},
+                            [adk_load_artifacts_tool]),
+    MemoryRunner = adk_runner:new(
+                     MemoryAgent, App, erlang_adk_session,
+                     #{memory_svc => {adk_memory_ets, MemoryPid},
+                       run_timeout => ?TIMEOUT}),
+    ArtifactRunner = adk_runner:new(
+                       ArtifactAgent, App, erlang_adk_session,
+                       #{artifact_svc => {adk_artifact_ets, ArtifactPid},
+                         run_timeout => ?TIMEOUT}),
+    try
+        MemoryText = expect_text(
+                       adk_runner:run(
+                         MemoryRunner, User, MemorySession,
+                         <<"What is the live release codename?">>),
+                       live_memory_tool),
+        assert(nonempty_text(MemoryText),
+               {empty_memory_tool_response, MemoryText}),
+        {ok, MemoryStored} = erlang_adk_session:get_session(
+                               App, User, MemorySession),
+        MemoryEvents = maps:get(events, MemoryStored),
+        assert(binary:match(term_to_binary(MemoryEvents), <<"kingfisher">>)
+                   =/= nomatch,
+               {memory_tool_result_missing, MemoryEvents}),
+
+        ArtifactText = expect_text(
+                         adk_runner:run(
+                           ArtifactRunner, User, ArtifactSession,
+                           <<"Inspect live-dot.png.">>),
+                         live_artifact_tool),
+        assert(nonempty_text(ArtifactText),
+               {empty_artifact_tool_response, ArtifactText}),
+        {ok, ArtifactStored} = erlang_adk_session:get_session(
+                                 App, User, ArtifactSession),
+        ArtifactEvents = maps:get(events, ArtifactStored),
+        Effects = [Effect ||
+                      #adk_event{author = <<"tool">>, actions = Actions}
+                          <- ArtifactEvents,
+                      Effect <- maps:get(<<"context_effects">>, Actions, [])],
+        assert(lists:any(
+                 fun(#{<<"kind">> := <<"artifact_attachment">>}) -> true;
+                    (_) -> false
+                 end, Effects),
+               {artifact_attachment_effect_missing, ArtifactEvents}),
+        assert(binary:match(term_to_binary(ArtifactEvents), TinyPng) =:= nomatch,
+               artifact_bytes_persisted_in_session)
+    after
+        safe_stop_agent(ArtifactAgent),
+        safe_stop_agent(MemoryAgent),
+        _ = adk_artifact_ets:stop(ArtifactPid),
+        _ = adk_memory_ets:stop(MemoryPid),
+        _ = erlang_adk_session:delete_session(
+              App, User, ArtifactSession),
+        _ = erlang_adk_session:delete_session(App, User, MemorySession)
+    end.
 
 weather_tool_round_trip(_Config) ->
     Name = unique(<<"LiveWeatherAgent">>),
@@ -599,6 +752,8 @@ live_request(Fun, TransportRetriesLeft) ->
 %% Match both without inspecting or logging the response body.
 retryable_rate_limit({error, {http_status, 429, _Body}}) -> true;
 retryable_rate_limit({error, {adk_failure, #{status := 429}}}) -> true;
+retryable_rate_limit(
+  {error, {context_cache_unavailable, gemini_cache_rate_limited}}) -> true;
 retryable_rate_limit(_) -> false.
 
 request_interval_ms() ->
@@ -766,6 +921,45 @@ memory_called_tool(Memory, Name) ->
           (_) -> false
       end,
       Memory).
+
+assert_cache_lifecycle(App, User, SessionId, ExpectedStatus) ->
+    {ok, Stored} = erlang_adk_session:get_session(App, User, SessionId),
+    Metadata = [ProviderMetadata ||
+                   #adk_event{actions = Actions} <- maps:get(events, Stored),
+                   ProviderMetadata <-
+                       [maps:get(<<"provider_metadata">>, Actions, undefined)],
+                   is_map(ProviderMetadata),
+                   maps:get(<<"type">>, ProviderMetadata, undefined) =:=
+                       <<"context_cache_usage">>],
+    case Metadata of
+        [ProviderMetadata] ->
+            CacheMetadata = maps:get(<<"metadata">>, ProviderMetadata),
+            Lifecycle = maps:get(<<"lifecycle">>, CacheMetadata),
+            assert(maps:get(<<"status">>, Lifecycle) =:= ExpectedStatus,
+                   {unexpected_context_cache_lifecycle,
+                    ExpectedStatus, Lifecycle}),
+            Encoded = jsx:encode(ProviderMetadata),
+            assert(binary:match(Encoded, <<"cachedContents/">>) =:= nomatch,
+                   {private_cache_resource_exposed, ProviderMetadata});
+        Other ->
+            ct:fail({missing_context_cache_metadata, SessionId, Other})
+    end.
+
+seed_cache_session(App, User, SessionId, AgentName) ->
+    {ok, _} = erlang_adk_session:create_session(
+                App, User, #{session_id => SessionId}),
+    StableEvents =
+        [adk_event:new(
+           <<"user">>,
+           <<"Stable context: this application explains Erlang/OTP.">>),
+         adk_event:new(
+           AgentName,
+           <<"Acknowledged the stable Erlang/OTP context.">>)],
+    lists:foreach(
+      fun(Event) ->
+          ok = erlang_adk_session:add_event(App, User, SessionId, Event)
+      end, StableEvents),
+    ok.
 
 safe_stop_agent(Pid) when is_pid(Pid) ->
     _ = catch erlang_adk:stop_agent(Pid),

@@ -1271,16 +1271,18 @@ memory_and_artifacts() ->
                          response => <<"memory-aware response">>,
                          test_pid => self()}, []),
     try
-        {ok, MemoryId} = adk_memory_ets:add(
-            MemoryPid,
-            <<"OTP supervision trees restart children">>,
-            #{<<"topic">> => <<"otp">>}
+        MemoryScope = {user, AppName, UserId},
+        {ok, MemoryEntry} = adk_memory_ets:add_entry(
+            MemoryPid, MemoryScope,
+            #{content => <<"OTP supervision trees restart children">>,
+              metadata => #{<<"topic">> => <<"otp">>}},
+            #{}
         ),
+        MemoryId = maps:get(id, MemoryEntry),
         {ok, [MemoryHit]} = adk_memory_ets:search(
-            MemoryPid,
+            MemoryPid, MemoryScope,
             <<"supervision">>,
-            #{<<"topic">> => <<"otp">>},
-            5
+            #{filter => #{<<"topic">> => <<"otp">>}, limit => 5}
         ),
         ?assertEqual(MemoryId, maps:get(id, MemoryHit)),
 
@@ -1361,14 +1363,14 @@ memory_and_artifacts() ->
             _ = file:del_dir_r(ArtifactRoot)
         end,
 
-        ok = adk_memory_ets:delete(MemoryPid, MemoryId),
+        ok = adk_memory_ets:delete_entry(
+               MemoryPid, MemoryScope, MemoryId, #{}),
         ?assertEqual(
             {ok, []},
             adk_memory_ets:search(
-                MemoryPid,
+                MemoryPid, MemoryScope,
                 <<"supervision">>,
-                #{<<"topic">> => <<"otp">>},
-                5
+                #{filter => #{<<"topic">> => <<"otp">>}, limit => 5}
             )
         )
     after

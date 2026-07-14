@@ -5,7 +5,7 @@
 
 -export([init/0, create_session/3, get_session/3, list_sessions/2, delete_session/3,
          update_state/4, add_event/4, clear_temp_state/3, take_state/4,
-         add_event_if_state/6]).
+         add_event_if_state/6, compact_events/5]).
 -export([save/2, load/1, delete/1]). %% Legacy API
 
 -record(adk_sessions_mnesia, {id, memory}).
@@ -292,6 +292,42 @@ add_event_if_state(AppName, UserId, SessionId, Key, Expected, Event)
     end);
 add_event_if_state(_AppName, _UserId, _SessionId, _Key, _Expected, _Event) ->
     {error, invalid_event}.
+
+%% @doc Transactional Mnesia counterpart to compact_events/5.
+compact_events(AppName, UserId, SessionId, ExpectedIds, SummaryEvent)
+  when is_list(ExpectedIds), ExpectedIds =/= [],
+       is_record(SummaryEvent, adk_event) ->
+    transaction(fun() ->
+        SessionKey = {AppName, UserId, SessionId},
+        case mnesia:read(adk_session_v2, SessionKey, write) of
+            [Record = #adk_session_v2{events = Events}] ->
+                Chronological = lists:reverse(Events),
+                case replace_expected_prefix(
+                       Chronological, ExpectedIds, SummaryEvent) of
+                    {ok, Compacted} ->
+                        mnesia:write(
+                          Record#adk_session_v2{
+                            events = lists:reverse(Compacted),
+                            last_update = erlang:system_time(millisecond)}),
+                        ok;
+                    conflict -> {error, conflict}
+                end;
+            [] -> {error, not_found}
+        end
+    end);
+compact_events(_AppName, _UserId, _SessionId, _ExpectedIds, _SummaryEvent) ->
+    {error, invalid_compaction}.
+
+replace_expected_prefix(Events, ExpectedIds, SummaryEvent) ->
+    case take_matching_prefix(Events, ExpectedIds) of
+        {ok, Rest} -> {ok, [SummaryEvent | Rest]};
+        conflict -> conflict
+    end.
+
+take_matching_prefix(Rest, []) -> {ok, Rest};
+take_matching_prefix([#adk_event{id = Id} | Events], [Id | Ids]) ->
+    take_matching_prefix(Events, Ids);
+take_matching_prefix(_, _) -> conflict.
 
 %% --- Internal functions ---
 

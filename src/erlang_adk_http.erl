@@ -148,6 +148,24 @@ add_dev_config(Config) ->
                                               dev_runner_options, #{}),
                           run_options => application:get_env(
                                            erlang_adk, dev_run_options, #{}),
+                          resource_provider => application:get_env(
+                                                 erlang_adk,
+                                                 dev_resource_provider,
+                                                 undefined),
+                          max_resource_results => application:get_env(
+                                                    erlang_adk,
+                                                    dev_max_resource_results,
+                                                    100),
+                          diagnostic_timeout_ms => application:get_env(
+                                                     erlang_adk,
+                                                     dev_diagnostic_timeout_ms,
+                                                     5000),
+                          diagnostic_context_policy => application:get_env(
+                                                         erlang_adk,
+                                                         dev_diagnostic_context_policy,
+                                                         #{max_bytes => 1048576,
+                                                           max_tokens => 262144,
+                                                           overflow => truncate}),
                           max_body_bytes => application:get_env(
                                               erlang_adk,
                                               dev_max_body_bytes, 65536),
