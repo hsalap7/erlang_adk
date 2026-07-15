@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Erlang ADK">
+  <defs>
+    <linearGradient id="background" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c6cff"/>
+      <stop offset="1" stop-color="#48d9c5"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#07101f"/>
+  <path d="M14 15h27v7H23v7h15v7H23v7h18v7H14z" fill="url(#background)"/>
+  <circle cx="48" cy="19" r="4" fill="#f5f7ff"/>
+  <circle cx="48" cy="32" r="4" fill="#f5f7ff"/>
+  <circle cx="48" cy="45" r="4" fill="#f5f7ff"/>
+</svg>

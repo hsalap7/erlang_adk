@@ -60,7 +60,7 @@ defmodule ErlangAdkUiWeb.AgentLiveTest do
 
   @tag agent_mode: :block
   test "cancel reauthorizes against the server-side session", %{conn: conn, fixture: fixture} do
-    {conn, handle, _context} = authenticated(conn)
+    {conn, handle, context} = authenticated(conn)
     {:ok, view, _html} = live(conn, ~p"/agent")
 
     view
@@ -70,6 +70,7 @@ defmodule ErlangAdkUiWeb.AgentLiveTest do
     assert has_element?(view, "button[phx-click=cancel]")
     assert_receive {:agent_blocked, agent}, 1_000
     %{ui: %{run_id: run_id}} = wait_for_run(handle)
+    wait_for_stream_cursor(handle, context.identity, run_id)
     :ok = SessionStore.revoke(handle)
     view |> element("button[phx-click=cancel]") |> render_click()
     assert_redirect(view, ~p"/auth/login")
@@ -244,6 +245,45 @@ defmodule ErlangAdkUiWeb.AgentLiveTest do
 
     {:ok, context} = SessionStore.fetch_context(handle)
     context
+  end
+
+  defp wait_for_stream_cursor(handle, identity, run_id) do
+    assert eventually(fn ->
+             case :adk_web_gateway.status(ErlangAdkUi.TestGateway, identity, run_id) do
+               {:ok, %{event_count: count}} when is_integer(count) and count > 0 -> true
+               _other -> false
+             end
+           end)
+
+    probe =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    try do
+      assert {:ok, %{latest_sequence: latest}} =
+               :adk_web_gateway.subscribe_credit(
+                 ErlangAdkUi.TestGateway,
+                 identity,
+                 run_id,
+                 probe,
+                 0
+               )
+
+      assert latest > 0
+
+      assert eventually(fn ->
+               match?(
+                 {:ok, %{ui: %{run_id: ^run_id, cursor: ^latest}}},
+                 SessionStore.fetch_context(handle)
+               )
+             end)
+    after
+      _ = :adk_web_gateway.unsubscribe(ErlangAdkUi.TestGateway, identity, run_id, probe)
+      send(probe, :stop)
+    end
   end
 
   defp deep_pair?(value, key, expected) when is_map(value) do

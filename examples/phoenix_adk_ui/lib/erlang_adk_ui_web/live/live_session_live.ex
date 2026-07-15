@@ -15,6 +15,8 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
         limits: limits,
         live_sessions: [],
         attached_session_id: nil,
+        attached_session_state: nil,
+        attached_voice_mode: nil,
         attached_session_ref: nil,
         attached_event_token: nil,
         subscription: nil,
@@ -26,7 +28,8 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
         observability_error: nil,
         evaluations: [],
         evaluation_report: nil,
-        evaluation_error: nil
+        evaluation_error: nil,
+        dashboard_loaded: false
       )
 
     if connected?(socket), do: load_dashboard(socket), else: {:ok, socket}
@@ -35,142 +38,306 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
-      <section class="panel stack" id="live-console">
+    <Layouts.app flash={@flash} page_title={@page_title}>
+      <header class="page-heading">
         <div>
-          <h2>ADK Live sessions</h2>
-          <p class="muted">
-            Sessions are created and owned by the server. Attaching receives future events only;
-            this UI does not request or claim event replay.
+          <p class="eyebrow">Realtime control plane</p>
+          <h1>Live and operations</h1>
+          <p>
+            Attach to server-owned Gemini Live sessions and inspect bounded operational data
+            without exposing credentials, media payloads, or provider internals.
           </p>
         </div>
+        <span class="phase-badge phase-ready" role="status">Operational</span>
+      </header>
 
-        <div class="actions">
-          <button type="button" class="secondary" phx-click="refresh-live">Refresh sessions</button>
-          <button
+      <div class="dashboard-grid">
+        <section class="panel panel-primary stack dashboard-wide" id="live-console">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Realtime sessions</p>
+              <h2>ADK Live sessions</h2>
+              <p class="muted">
+                Sessions are created and owned by the server. Attaching receives future events only;
+                this UI does not request or claim event replay.
+              </p>
+            </div>
+            <span class="panel-icon" aria-hidden="true">⌁</span>
+          </div>
+
+          <div class="actions">
+            <button type="button" class="secondary" phx-click="refresh-live">Refresh sessions</button>
+            <button
+              :if={@attached_session_id}
+              type="button"
+              class="danger"
+              phx-click="detach"
+            >Detach</button>
+          </div>
+
+          <p :if={@live_error} class="notice error" id="live-error" role="alert">
+            {@live_error}
+          </p>
+
+          <form :if={@live_sessions != []} id="attach-form" phx-submit="attach" class="stack">
+            <label>
+              Principal-scoped session
+              <select name="session_id" required>
+                <option :for={session <- @live_sessions} value={session.id}>
+                  {session.id} · {session.state} · voice: {session.voice_mode} · {session.model}
+                </option>
+              </select>
+            </label>
+            <button type="submit" phx-disable-with="Attaching…">Attach without replay</button>
+          </form>
+
+          <p
+            :if={!@dashboard_loaded}
+            class="empty-state"
+            id="live-sessions-loading"
+            role="status"
+            aria-live="polite"
+          >
+            <strong>Connecting to the operations gateway</strong>
+            <span>Discovering principal-scoped Live sessions.</span>
+          </p>
+
+          <p
+            :if={@dashboard_loaded && @live_sessions == []}
+            class="empty-state"
+            id="no-live-sessions"
+            role="status"
+          >
+            <strong>No visible Live sessions</strong>
+            <span>Start a server-owned session for this principal, then refresh.</span>
+          </p>
+
+          <div
             :if={@attached_session_id}
-            type="button"
-            class="danger"
-            phx-click="detach"
-          >Detach</button>
-        </div>
+            id="live-attachment"
+            class="notice"
+            role="status"
+            aria-live="polite"
+          >
+            Attached to <code>{@attached_session_id}</code>. Credit is fixed server-side and each
+            event is acknowledged only after safe projection into the bounded view.
+          </div>
 
-        <p :if={@live_error} class="notice error" id="live-error">{@live_error}</p>
+          <div
+            :if={
+              @attached_session_id && @attached_session_state == "active" &&
+                @attached_voice_mode == "automatic"
+            }
+            id="live-voice-container"
+          >
+            <section
+              id="live-voice-console"
+              class="voice-console"
+              phx-hook="LiveVoice"
+              phx-update="ignore"
+              data-session-id={@attached_session_id}
+              data-voice-path="/live/voice"
+              data-worklet-url={~p"/assets/js/live_voice_worklet.js"}
+              aria-labelledby="live-voice-title"
+            >
+              <div class="voice-heading">
+                <div>
+                  <p class="panel-kicker">Native audio</p>
+                  <h3 id="live-voice-title">Full-duplex voice</h3>
+                  <p class="muted">
+                    Stream microphone PCM through the authenticated ADK voice bridge and play the
+                    model response in real time. Headphones are recommended.
+                  </p>
+                </div>
+                <span class="voice-orb" data-voice-orb aria-hidden="true"></span>
+              </div>
 
-        <form :if={@live_sessions != []} id="attach-form" phx-submit="attach" class="stack">
-          <label>
-            Principal-scoped session
-            <select name="session_id" required>
-              <option :for={session <- @live_sessions} value={session.id}>
-                {session.id} · {session.state} · {session.model}
-              </option>
-            </select>
-          </label>
-          <button type="submit">Attach without replay</button>
-        </form>
+              <div class="voice-level" aria-hidden="true">
+                <span data-voice-level></span>
+              </div>
 
-        <p :if={@live_sessions == []} class="muted" id="no-live-sessions">
-          No Live sessions are visible to this principal.
-        </p>
+              <div class="actions voice-actions">
+                <button id="voice-start" type="button" data-voice-start>Start voice</button>
+                <button
+                  id="voice-mute"
+                  type="button"
+                  class="secondary"
+                  data-voice-mute
+                  aria-pressed="false"
+                  disabled
+                >
+                  Mute microphone
+                </button>
+                <button id="voice-stop" type="button" class="danger" data-voice-stop disabled>
+                  Stop voice
+                </button>
+              </div>
 
-        <div :if={@attached_session_id} id="live-attachment" class="notice">
-          Attached to <code>{@attached_session_id}</code>. Credit is fixed server-side and each
-          event is acknowledged only after safe projection into the bounded view.
-        </div>
+              <p class="voice-status" data-voice-status role="status" aria-live="polite">
+                Voice is idle. Starting will request microphone access.
+              </p>
+              <p
+                class="voice-transcript"
+                data-voice-transcript
+                role="region"
+                aria-label="Current voice transcription"
+              >
+              </p>
+              <p
+                class="visually-hidden"
+                data-voice-announcement
+                aria-live="polite"
+                aria-atomic="true"
+              >
+              </p>
+            </section>
+          </div>
 
-        <form
-          :if={@attached_session_id}
-          id="live-text-form"
-          phx-submit="live-text"
-          class="stack"
-        >
-          <label>
-            Realtime text <textarea
-              name="text"
-              required
-              maxlength={@limits[:max_live_text_bytes]}
-              autocomplete="off"
-            ></textarea>
-          </label>
-          <button type="submit">Send text</button>
-        </form>
-      </section>
-
-      <section :if={@live_events != []} class="panel" id="live-event-history">
-        <h2>Live metadata and text events</h2>
-        <p class="muted">
-          Audio/video payloads and thought signatures are omitted before an event enters LiveView assigns.
-        </p>
-        <p :if={@dropped_live_events > 0} class="muted">
-          {@dropped_live_events} event(s) were omitted from this bounded browser view.
-        </p>
-        <ol class="events">
-          <li :for={item <- @live_events} class="event" id={"live-event-#{item.sequence}"}>
-            <strong>Sequence {item.sequence}</strong>
-            <pre><%= item.json %></pre>
-          </li>
-        </ol>
-      </section>
-
-      <section class="panel stack" id="observability-panel">
-        <div>
-          <h2>Observability snapshot</h2>
-          <p class="muted">
-            Read-only, bounded metric and delivery metadata. Prompt, response and media content are not exposed.
+          <p
+            :if={
+              @attached_session_id &&
+                not (@attached_session_state == "active" &&
+                       @attached_voice_mode == "automatic")
+            }
+            id="live-voice-unavailable"
+            class="notice"
+            role="status"
+          >
+            {voice_unavailable_message(@attached_session_state, @attached_voice_mode)}
           </p>
-        </div>
-        <button type="button" class="secondary" phx-click="refresh-observability">Refresh snapshot</button>
-        <p :if={@observability_error} class="notice error">{@observability_error}</p>
-        <pre :if={@observability} class="outcome" id="observability-snapshot"><%= @observability %></pre>
-      </section>
 
-      <section class="panel stack" id="evaluation-panel">
-        <div>
-          <h2>Evaluation reports</h2>
+          <form
+            :if={@attached_session_id}
+            id="live-text-form"
+            phx-submit="live-text"
+            class="stack"
+          >
+            <label>
+              Realtime text <textarea
+                name="text"
+                required
+                maxlength={@limits[:max_live_text_bytes]}
+                autocomplete="off"
+              ></textarea>
+            </label>
+            <button type="submit" phx-disable-with="Sending…">Send text</button>
+          </form>
+        </section>
+
+        <section :if={@live_events != []} class="panel dashboard-wide" id="live-event-history">
+          <h2>Live metadata and text events</h2>
           <p class="muted">
-            Reports are server-configured maps rendered through the pure ADK evaluation boundary.
-            Browser-supplied paths and module names are never accepted.
+            Audio/video payloads and thought signatures are omitted before an event enters LiveView assigns.
           </p>
-        </div>
+          <p :if={@dropped_live_events > 0} class="muted">
+            {@dropped_live_events} event(s) were omitted from this bounded browser view.
+          </p>
+          <ol class="events">
+            <li :for={item <- @live_events} class="event" id={"live-event-#{item.sequence}"}>
+              <strong>Sequence {item.sequence}</strong>
+              <pre><%= item.json %></pre>
+            </li>
+          </ol>
+        </section>
 
-        <p :if={@evaluations == []} class="muted" id="no-evaluations">
-          No evaluation reports are configured.
-        </p>
+        <section class="panel stack" id="observability-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Telemetry</p>
+              <h2>Observability snapshot</h2>
+              <p class="muted">
+                Read-only, bounded metric and delivery metadata. Prompt, response and media content are not exposed.
+              </p>
+            </div>
+            <span class="panel-icon" aria-hidden="true">◫</span>
+          </div>
+          <button type="button" class="secondary" phx-click="refresh-observability">Refresh snapshot</button>
+          <p :if={@observability_error} class="notice error" role="alert">
+            {@observability_error}
+          </p>
+          <pre :if={@observability} class="outcome" id="observability-snapshot" role="status"><%= @observability %></pre>
+        </section>
 
-        <form :if={@evaluations != []} id="evaluation-form" phx-submit="show-evaluation" class="stack">
-          <label>
-            Report
-            <select name="report_id" required>
-              <option :for={report <- @evaluations} value={report.id}>{report.label}</option>
-            </select>
-          </label>
-          <button type="submit">Render report</button>
-        </form>
+        <section class="panel stack" id="evaluation-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Quality</p>
+              <h2>Evaluation reports</h2>
+              <p class="muted">
+                Reports are server-configured maps rendered through the pure ADK evaluation boundary.
+                Browser-supplied paths and module names are never accepted.
+              </p>
+            </div>
+            <span class="panel-icon" aria-hidden="true">◇</span>
+          </div>
 
-        <form
-          :if={length(@evaluations) > 1}
-          id="comparison-form"
-          phx-submit="compare-evaluations"
-          class="stack"
-        >
-          <label>
-            Baseline
-            <select name="baseline_id" required>
-              <option :for={report <- @evaluations} value={report.id}>{report.label}</option>
-            </select>
-          </label>
-          <label>
-            Current
-            <select name="current_id" required>
-              <option :for={report <- @evaluations} value={report.id}>{report.label}</option>
-            </select>
-          </label>
-          <button type="submit">Compare baseline</button>
-        </form>
+          <p
+            :if={!@dashboard_loaded}
+            class="empty-state"
+            id="evaluations-loading"
+            role="status"
+            aria-live="polite"
+          >
+            <strong>Loading evaluation catalog</strong>
+            <span>Checking the server-configured reports available to this principal.</span>
+          </p>
 
-        <p :if={@evaluation_error} class="notice error">{@evaluation_error}</p>
-        <pre :if={@evaluation_report} class="outcome" id="evaluation-report"><%= @evaluation_report %></pre>
-      </section>
+          <p
+            :if={@dashboard_loaded && @evaluations == []}
+            class="empty-state"
+            id="no-evaluations"
+            role="status"
+          >
+            <strong>No reports configured</strong>
+            <span>Add trusted evaluation results in the server configuration.</span>
+          </p>
+
+          <form
+            :if={@evaluations != []}
+            id="evaluation-form"
+            phx-submit="show-evaluation"
+            class="stack"
+          >
+            <label>
+              Report
+              <select name="report_id" required>
+                <option :for={report <- @evaluations} value={report.id}>{report.label}</option>
+              </select>
+            </label>
+            <button type="submit" phx-disable-with="Rendering…">Render report</button>
+          </form>
+
+          <form
+            :if={length(@evaluations) > 1}
+            id="comparison-form"
+            phx-submit="compare-evaluations"
+            class="stack"
+          >
+            <label>
+              Baseline
+              <select name="baseline_id" required>
+                <option :for={report <- @evaluations} value={report.id}>{report.label}</option>
+              </select>
+            </label>
+            <label>
+              Current
+              <select name="current_id" required>
+                <option :for={report <- @evaluations} value={report.id}>{report.label}</option>
+              </select>
+            </label>
+            <button type="submit" phx-disable-with="Comparing…">Compare baseline</button>
+          </form>
+
+          <p :if={@evaluation_error} class="notice error" role="alert">{@evaluation_error}</p>
+          <pre
+            :if={@evaluation_report}
+            class="outcome"
+            id="evaluation-report"
+            role="status"
+            aria-live="polite"
+          ><%= @evaluation_report %></pre>
+        </section>
+      </div>
     </Layouts.app>
     """
   end
@@ -180,7 +347,10 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
     with {:ok, identity} <- current_identity(socket),
          {:ok, sessions} <- LiveGateway.discover(identity),
          {:ok, checked} <- validate_sessions(sessions) do
-      {:noreply, assign(socket, live_sessions: checked, live_error: nil)}
+      {:noreply,
+       socket
+       |> assign(live_sessions: checked, live_error: nil)
+       |> sync_attached_session(checked)}
     else
       {:error, :unauthenticated} -> reauthenticate(socket)
       _error -> {:noreply, assign(socket, live_error: "Live sessions are unavailable.")}
@@ -188,7 +358,7 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
   end
 
   def handle_event("attach", %{"session_id" => session_id}, socket) when is_binary(session_id) do
-    with true <- visible_session?(socket.assigns.live_sessions, session_id),
+    with {:ok, selected_session} <- selected_session(socket.assigns.live_sessions, session_id),
          {:ok, identity} <- current_identity(socket),
          :ok <- detach_current(socket, identity),
          {:ok, public_subscription, attachment_ref, event_token} <-
@@ -196,6 +366,8 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
       {:noreply,
        assign(socket,
          attached_session_id: session_id,
+         attached_session_state: Map.fetch!(public_subscription, "state"),
+         attached_voice_mode: selected_session.voice_mode,
          attached_session_ref: attachment_ref,
          attached_event_token: event_token,
          subscription: public_subscription,
@@ -378,6 +550,7 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
         assign(socket,
           live_sessions: checked_sessions,
           evaluations: checked_evaluations,
+          dashboard_loaded: true,
           live_error: nil,
           evaluation_error: nil
         )
@@ -390,8 +563,15 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
           {:ok, assign(socket, observability_error: "Observability is unavailable.")}
       end
     else
-      {:error, :unauthenticated} -> {:ok, redirect(socket, to: "/auth/login")}
-      _error -> {:ok, assign(socket, live_error: "The operations gateway is unavailable.")}
+      {:error, :unauthenticated} ->
+        {:ok, redirect(socket, to: "/auth/login")}
+
+      _error ->
+        {:ok,
+         assign(socket,
+           dashboard_loaded: true,
+           live_error: "The operations gateway is unavailable."
+         )}
     end
   end
 
@@ -455,6 +635,8 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
   defp detached(socket, error) do
     assign(socket,
       attached_session_id: nil,
+      attached_session_state: nil,
+      attached_voice_mode: nil,
       attached_session_ref: nil,
       attached_event_token: nil,
       subscription: nil,
@@ -471,16 +653,23 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
       Enum.reduce_while(sessions, [], fn
         %{id: id, state: state, model: model} = session, acc
         when is_binary(id) and is_binary(state) and is_binary(model) ->
-          if valid_id?(id) and String.valid?(state) and byte_size(state) <= 64 and
+          if valid_id?(id) and checked_session_state?(state) and
                String.valid?(model) and byte_size(model) <= 256 do
-            public = %{
-              id: id,
-              state: state,
-              model: model,
-              latest_sequence: non_negative(Map.get(session, :latest_sequence, 0))
-            }
+            case checked_voice_mode(Map.get(session, :voice_mode)) do
+              {:ok, voice_mode} ->
+                public = %{
+                  id: id,
+                  state: state,
+                  model: model,
+                  voice_mode: voice_mode,
+                  latest_sequence: non_negative(Map.get(session, :latest_sequence, 0))
+                }
 
-            {:cont, [public | acc]}
+                {:cont, [public | acc]}
+
+              :error ->
+                {:halt, :error}
+            end
           else
             {:halt, :error}
           end
@@ -497,6 +686,14 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
 
   defp validate_sessions(_sessions), do: {:error, :invalid_gateway_result}
 
+  defp checked_voice_mode("automatic"), do: {:ok, "automatic"}
+  defp checked_voice_mode("manual"), do: {:ok, "manual"}
+  defp checked_voice_mode("unavailable"), do: {:ok, "unavailable"}
+  defp checked_voice_mode(_mode), do: :error
+
+  defp checked_session_state?(state),
+    do: state in ["connecting", "setup_pending", "active", "reconnecting", "closed", "unknown"]
+
   defp validate_subscription(subscription) when is_map(subscription) do
     with {:ok, attachment_ref} <- Map.fetch(subscription, :attachment_ref),
          true <- not is_nil(attachment_ref),
@@ -505,7 +702,9 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
          projected when is_map(projected) <-
            subscription
            |> Map.drop([:attachment_ref, :attachment_token])
-           |> PublicData.project() do
+           |> PublicData.project(),
+         state when is_binary(state) <- Map.get(projected, "state"),
+         true <- checked_session_state?(state) do
       {:ok, projected, attachment_ref, event_token}
     else
       _other -> {:error, :invalid_gateway_result}
@@ -544,7 +743,41 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
 
   defp validate_evaluations(_evaluations), do: {:error, :invalid_gateway_result}
 
-  defp visible_session?(sessions, id), do: Enum.any?(sessions, &(&1.id == id))
+  defp selected_session(sessions, id) do
+    case Enum.filter(sessions, &(&1.id == id)) do
+      [session] -> {:ok, session}
+      _other -> {:error, :not_found}
+    end
+  end
+
+  defp sync_attached_session(%{assigns: %{attached_session_id: nil}} = socket, _sessions),
+    do: socket
+
+  defp sync_attached_session(socket, sessions) do
+    case selected_session(sessions, socket.assigns.attached_session_id) do
+      {:ok, session} ->
+        assign(socket,
+          attached_session_state: session.state,
+          attached_voice_mode: session.voice_mode
+        )
+
+      {:error, :not_found} ->
+        assign(socket, attached_session_state: "unknown", attached_voice_mode: "unavailable")
+    end
+  end
+
+  defp voice_unavailable_message(state, _mode) when state != "active" do
+    "Browser voice is available only while the selected Live session reports active. Refresh after it reconnects or finishes setup."
+  end
+
+  defp voice_unavailable_message("active", "manual") do
+    "Browser voice requires automatic activity detection. Text and metadata remain available for this manual-VAD session."
+  end
+
+  defp voice_unavailable_message(_state, _mode) do
+    "Browser voice is unavailable because this session does not expose a supported activity-detection mode."
+  end
+
   defp visible_evaluation?(reports, id), do: Enum.any?(reports, &(&1.id == id))
 
   defp valid_id?(value) when is_binary(value),

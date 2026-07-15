@@ -255,7 +255,7 @@ documents [caching support for this model](https://ai.google.dev/gemini-api/docs
 while the [explicit caching guide](https://ai.google.dev/gemini-api/docs/generate-content/caching)
 says the minimum varies by model but does not publish a number for 3.1
 Flash-Lite. The service response therefore remains authoritative. The adapter
-reads the model key from `GEMINI_API_KEY`. Its
+reads the API key from `GEMINI_API_KEY`. Its
 private `gemini_context_cache` application setting is a strict map containing
 only optional `base_url`, `api_key`, and `request_timeout_ms` keys; an omitted
 `api_key` falls back to the environment:
@@ -277,16 +277,18 @@ the public cache lifecycle and Gemini's cached-token usage on Runner events;
 neither the private lease nor provider resource name is projected. The direct
 compatibility prompt API continues to return only the model answer.
 
-The checked-in `readme_live_gemini_SUITE:context_cache/1` gate uses a real
-Runner and verifies cached-content creation, reuse across two exact sessions,
-the public `created` then `hit` lifecycle, and absence of the private provider
-resource from durable events. In the full 2026-07-14 live run, cached-content
-creation returned HTTP 429 and the one bounded retry after ten seconds also
-returned 429. No resource was returned, so generation/reuse could not run.
-This case is **rate-limited and failed**, not passed or skipped; the other 14
-live cases passed and Google Search grounding was the only other 429 failure.
-The deterministic fake-provider and exact-wire suites remain the implementation
-evidence, but do not convert this billable provider result into a live pass.
+The checked-in, historically named
+`readme_live_gemini_SUITE:context_cache/1` REST gate uses a real Runner and
+verifies cached-content creation, reuse across two exact sessions, the public
+`created` then `hit` lifecycle, and absence of the private provider resource
+from durable events. In the full 2026-07-14 billable Gemini REST run,
+cached-content creation returned HTTP 429 and the one bounded retry after ten
+seconds also returned 429. No resource was returned, so generation/reuse could
+not run. This case is **rate-limited and failed**, not passed or skipped; the
+other 14 REST cases passed and Google Search grounding was the only other 429
+failure. The deterministic fake-provider and exact-wire suites remain the
+implementation evidence, but do not convert this billable provider result into
+a REST pass.
 
 ## Developer diagnostics
 

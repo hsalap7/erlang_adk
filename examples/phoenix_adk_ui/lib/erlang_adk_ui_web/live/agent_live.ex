@@ -29,13 +29,30 @@ defmodule ErlangAdkUiWeb.AgentLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
-      <section class="panel stack" id="agent-console">
+    <Layouts.app flash={@flash} page_title={@page_title}>
+      <header class="page-heading">
         <div>
-          <h2>Run an agent</h2>
-          <p class="muted">
-            Runs are supervised independently of this browser connection. Reconnects resume from the last acknowledged event.
+          <p class="eyebrow">Agent workspace</p>
+          <h1>Run a supervised agent</h1>
+          <p>
+            Start a Gemini-backed task, follow its bounded event stream, and reconnect without
+            taking ownership away from the server.
           </p>
+        </div>
+        <span class={"phase-badge phase-#{@phase}"} role="status" aria-live="polite">
+          {@phase}
+        </span>
+      </header>
+
+      <section class="panel panel-primary stack" id="agent-console">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">New invocation</p>
+            <h2>Run an agent</h2>
+            <p class="muted">
+              Runs are supervised independently of this browser connection. Reconnects resume from the last acknowledged event.
+            </p>
+          </div>
         </div>
 
         <form id="prompt-form" phx-submit="start" class="stack">
@@ -55,7 +72,11 @@ defmodule ErlangAdkUiWeb.AgentLive do
             ></textarea>
           </label>
           <div class="actions">
-            <button type="submit" disabled={@phase in [:running, :cancelling, :paused]}>Start run</button>
+            <button
+              type="submit"
+              disabled={@phase in [:running, :cancelling, :paused]}
+              phx-disable-with="Starting…"
+            >Start run</button>
             <button
               :if={@phase == :running}
               class="danger"
@@ -69,10 +90,10 @@ defmodule ErlangAdkUiWeb.AgentLive do
       <section :if={@run_id || @outcome || @error} class="panel stack" id="run-status">
         <div :if={@run_id}>
           <strong>Run</strong> <code>{@run_id}</code>
-          <span class="muted"> · {@phase}</span>
+          <span class={"phase-badge compact phase-#{@phase}"}>{@phase}</span>
         </div>
-        <p :if={@error} class="notice error" id="run-error">{@error}</p>
-        <pre :if={@outcome} class="outcome" id="run-outcome"><%= @outcome %></pre>
+        <p :if={@error} class="notice error" id="run-error" role="alert">{@error}</p>
+        <pre :if={@outcome} class="outcome" id="run-outcome" role="status" aria-live="polite"><%= @outcome %></pre>
         <p :if={@dropped_events > 0} class="muted">
           {@dropped_events} older event(s) were removed from the bounded view.
         </p>
@@ -85,7 +106,7 @@ defmodule ErlangAdkUiWeb.AgentLive do
           <button type="button" phx-click="decide" phx-value-decision="approve">Approve</button>
           <button class="danger" type="button" phx-click="decide" phx-value-decision="reject">Reject</button>
         </div>
-        <p :if={!@pause.supported} class="notice error">
+        <p :if={!@pause.supported} class="notice error" role="alert">
           This pause type is not supported by the UI. It was left paused and was not resumed.
         </p>
       </section>

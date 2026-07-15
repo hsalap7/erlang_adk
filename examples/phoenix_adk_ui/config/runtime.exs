@@ -4,7 +4,54 @@ if System.get_env("PHX_SERVER") do
   config :erlang_adk_ui, ErlangAdkUiWeb.Endpoint, server: true
 end
 
-if config_env() != :test do
+local_auth =
+  case System.get_env("ADK_UI_LOCAL_AUTH", "false") do
+    "true" -> true
+    "false" -> false
+    _other -> raise "ADK_UI_LOCAL_AUTH must be true or false"
+  end
+
+if config_env() == :prod and local_auth do
+  raise "ADK_UI_LOCAL_AUTH is forbidden in production"
+end
+
+if config_env() == :dev and local_auth do
+  port = String.to_integer(System.get_env("PORT", "4000"))
+
+  unless port >= 1 and port <= 65_535 do
+    raise "PORT must be between 1 and 65535"
+  end
+
+  issuer = "https://local.erlang-adk.invalid"
+
+  scopes = [
+    "adk.agents.read",
+    "adk.run.start",
+    "adk.run.read",
+    "adk.run.control",
+    "adk.live.read",
+    "adk.live.control",
+    "adk.observability.read",
+    "adk.evaluation.read"
+  ]
+
+  config :erlang_adk_ui,
+    auth_provider: ErlangAdkUi.Auth.LocalDev,
+    local_dev_mode: true,
+    trusted_auth_issuer: issuer,
+    local_dev_auth: [
+      enabled: true,
+      issuer: issuer,
+      subject: "local-developer",
+      audiences: ["erlang-adk-ui"],
+      scopes: scopes
+    ]
+
+  config :erlang_adk_ui, ErlangAdkUiWeb.Endpoint,
+    url: [scheme: "http", host: "127.0.0.1", port: port]
+end
+
+if config_env() != :test and not (config_env() == :dev and local_auth) do
   issuer = System.fetch_env!("OIDC_ISSUER")
   client_id = System.fetch_env!("OIDC_CLIENT_ID")
   redirect_uri = System.fetch_env!("OIDC_REDIRECT_URI")
@@ -61,10 +108,20 @@ if config_env() != :test do
     scopes: scopes,
     signing_algs: signing_algs,
     clock_skew_seconds: 60
+
+  config :erlang_adk_ui, :trusted_auth_issuer, issuer
 end
 
-config :erlang_adk_ui, ErlangAdkUiWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+endpoint_port = String.to_integer(System.get_env("PORT", "4000"))
+
+endpoint_http =
+  if config_env() == :dev and local_auth do
+    [ip: {127, 0, 0, 1}, port: endpoint_port]
+  else
+    [port: endpoint_port]
+  end
+
+config :erlang_adk_ui, ErlangAdkUiWeb.Endpoint, http: endpoint_http
 
 if config_env() == :prod do
   secret_key_base =

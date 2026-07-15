@@ -9,6 +9,7 @@ live_session_test_() ->
      fun setup/0,
      fun cleanup/1,
      [fun setup_gating_authorization_and_input_case/0,
+      fun current_gemini_server_content_advances_one_turn_case/0,
       fun bounded_ingress_backpressure_case/0,
       fun bounded_subscriber_admission_and_recovery_case/0,
       fun outbound_credit_waits_for_transport_consumption_case/0,
@@ -66,6 +67,53 @@ setup_gating_authorization_and_input_case() ->
     {ok, Status} = adk_live_session:status(Session, ?PRINCIPAL),
     ?assertEqual(active, maps:get(state, Status)),
     ?assertEqual(0, maps:get(input_queue_messages, Status)),
+    ok = adk_live_session:close(Session, ?PRINCIPAL, done).
+
+current_gemini_server_content_advances_one_turn_case() ->
+    {SessionId, Session, Handle, _SetupFrame} = start_session(#{}),
+    make_ready_without_subscriber(Session, Handle),
+    {ok, #{latest_sequence := BeforeSequence,
+           turn_epoch := 0}} =
+        adk_live_session:subscribe(
+          Session, ?PRINCIPAL, #{messages => 2, bytes => 4096}),
+
+    adk_live_fake_transport:inject(
+      Handle,
+      #{<<"serverContent">> =>
+            #{<<"interimInputTranscription">> =>
+                  #{<<"text">> => <<"hel">>,
+                    <<"languageCode">> => <<"en-US">>},
+              <<"turnComplete">> => true,
+              <<"turnCompleteReason">> => <<"NEED_MORE_INPUT">>,
+              <<"waitingForInput">> => true}}),
+
+    {InterimSequence, Interim} = receive_event(SessionId),
+    ?assertEqual(BeforeSequence + 1, InterimSequence),
+    ?assertEqual(input_transcription, adk_live_event:kind(Interim)),
+    ?assertEqual(#{text => <<"hel">>, final => false},
+                 maps:get(payload, Interim)),
+    ?assertEqual(0, maps:get(turn_epoch, Interim)),
+    ?assertEqual(nomatch,
+                 binary:match(term_to_binary(Interim), <<"en-US">>)),
+
+    {TurnSequence, TurnComplete} = receive_event(SessionId),
+    ?assertEqual(InterimSequence + 1, TurnSequence),
+    ?assertEqual(turn_complete, adk_live_event:kind(TurnComplete)),
+    ?assertEqual(#{reason => <<"NEED_MORE_INPUT">>,
+                   waiting_for_input => true},
+                 maps:get(payload, TurnComplete)),
+    ?assertEqual(0, maps:get(turn_epoch, TurnComplete)),
+
+    {ok, Status} = adk_live_session:status(Session, ?PRINCIPAL),
+    ?assertEqual(active, maps:get(state, Status)),
+    ?assertEqual(1, maps:get(turn_epoch, Status)),
+    ?assertEqual(0, maps:get(generation_epoch, Status)),
+    ?assertEqual(TurnSequence, maps:get(latest_sequence, Status)),
+    ?assert(is_process_alive(Session)),
+    {ok, 1} = adk_live_session:send_text(
+                Session, ?PRINCIPAL, <<"still active">>),
+    #{<<"realtimeInput">> := #{<<"text">> := <<"still active">>}} =
+        jsx:decode(receive_sent(Handle), [return_maps]),
     ok = adk_live_session:close(Session, ?PRINCIPAL, done).
 
 bounded_ingress_backpressure_case() ->

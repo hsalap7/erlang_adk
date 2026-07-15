@@ -28,6 +28,7 @@ defmodule ErlangAdkUiWeb.Endpoint do
     from: :erlang_adk_ui,
     gzip: not code_reloading?,
     only: ErlangAdkUiWeb.static_paths(),
+    only_matching: ["favicon-", "robots-"],
     raise_on_missing_only: code_reloading?
 
   if code_reloading? do

@@ -11,9 +11,10 @@ defmodule ErlangAdkUi.AgentCatalog.Gemini do
   @app_name <<"erlang_adk_ui">>
 
   def gateway_options do
-    oidc = Application.fetch_env!(:erlang_adk_ui, :oidc)
+    trusted_issuer = Application.fetch_env!(:erlang_adk_ui, :trusted_auth_issuer)
 
-    with {:ok, agent} <- ensure_agent() do
+    with true <- is_binary(trusted_issuer) and byte_size(trusted_issuer) <= 2_048,
+         {:ok, agent} <- ensure_agent() do
       runner =
         :adk_runner.new(agent, @app_name, :erlang_adk_session, %{
           run_timeout: 120_000,
@@ -38,7 +39,7 @@ defmodule ErlangAdkUi.AgentCatalog.Gemini do
            }
          },
          policy: %{
-           trusted_issuers: [oidc[:issuer]],
+           trusted_issuers: [trusted_issuer],
            required_scopes: %{
              list_agents: [<<"adk.agents.read">>],
              start_run: [<<"adk.run.start">>],
@@ -50,6 +51,9 @@ defmodule ErlangAdkUi.AgentCatalog.Gemini do
          max_message_bytes: 16_384,
          max_decision_bytes: 65_536
        }}
+    else
+      false -> {:error, :invalid_trusted_auth_issuer}
+      {:error, _reason} = error -> error
     end
   end
 

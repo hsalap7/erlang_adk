@@ -163,7 +163,12 @@ owner_death_cancels_owned_task_case() ->
                      class => external, reason => killed}}},
                  adk_task:await(TaskRef, 1000)),
     receive
-        {'DOWN', ExecutionRef, process, Execution, killed} -> ok
+        %% The monitor signal and the task worker's kill signal have different
+        %% senders, so either may reach the execution process first. A monitor
+        %% installed after the kill reports noproc even though cancellation
+        %% still force-stopped the exact execution process.
+        {'DOWN', ExecutionRef, process, Execution, Reason}
+          when Reason =:= killed; Reason =:= noproc -> ok
     after 1000 ->
         ?assert(false)
     end.

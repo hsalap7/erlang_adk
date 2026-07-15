@@ -228,9 +228,13 @@ mcp_stdio_request_timeout_test_() ->
     {timeout, 5, fun() ->
         Fixture = filename:absname("test/mcp_stdio_timeout_fixture.sh"),
         Command = unicode:characters_to_binary(["sh ", Fixture]),
+        %% Stdio initialization must use its distinct startup budget. The
+        %% fixture then blocks the list request for one second, so the shorter
+        %% operation budget deterministically exercises request timeout.
         {ok, Client} = adk_mcp_client:connect(
                          <<"stdio">>, Command,
-                         #{request_timeout => 50}),
+                         #{initialize_timeout => 2000,
+                           request_timeout => 250}),
         try
             ?assertEqual({error, timeout}, adk_mcp_client:list_tools(Client)),
             ?assert(is_process_alive(Client))

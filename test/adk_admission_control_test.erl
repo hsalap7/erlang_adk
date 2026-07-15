@@ -205,7 +205,9 @@ malformed_options_do_not_crash_controller_test() ->
 
 bounded_concurrency_drains_without_leaks_test() ->
     with_server(
-      #{global_limit => 3, default_agent_limit => 2,
+      %% Per-agent saturation is covered separately. Match the agent limit to
+      %% the global limit here so this stress case isolates global draining.
+      #{global_limit => 3, default_agent_limit => 3,
         overflow => queue, max_queue => 20,
         default_queue_timeout => 5000},
       fun(Server) ->

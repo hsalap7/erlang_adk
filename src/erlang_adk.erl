@@ -26,7 +26,9 @@
          live_subscribe/3, live_subscribe/4,
          live_ack/3, live_ack/4,
          live_unsubscribe/2, live_unsubscribe/3,
-         live_status/2, live_status/3, close_live_session/3]).
+         live_status/2, live_status/3, close_live_session/3,
+         start_live_voice_bridge/4, live_voice_frame/2,
+         stop_live_voice_bridge/1]).
 
 -export_type([planning_ref/0]).
 
@@ -272,3 +274,26 @@ live_status(Session, Principal, TimeoutMs) ->
 
 close_live_session(Session, Principal, Reason) ->
     adk_live_session:close(Session, Principal, Reason).
+
+%% @doc Start an owner-bound binary bridge for a server-owned Live session.
+%%
+%% The owner receives only strict binary messages shaped as
+%% `{adk_live_voice_frame, BridgePid, Frame}'.  Forwarded Live event credit is
+%% released only when the owner submits the exact v1 ACK frame through
+%% `live_voice_frame/2'.  The Live session must already be active.  The bridge
+%% terminates when `OwnerPid' terminates.  A provider reconnect invalidates and
+%% terminates the bridge independently of subscriber event credit; an input
+%% racing that transition is rejected by the same continuity boundary.  An
+%% adapter must detach capture and create a fresh bridge only after the session
+%% resumes.
+start_live_voice_bridge(Session, Principal, OwnerPid, Opts) ->
+    adk_live_voice_bridge:start(Session, Principal, OwnerPid, Opts).
+
+%% @doc Submit one complete version-1 client binary frame synchronously.
+%% Synchronous calls preserve existing Live ingress backpressure.
+live_voice_frame(BridgePid, Frame) ->
+    adk_live_voice_bridge:frame(BridgePid, Frame).
+
+%% @doc Detach and stop an owner-bound Live voice bridge.
+stop_live_voice_bridge(BridgePid) ->
+    adk_live_voice_bridge:stop(BridgePid).

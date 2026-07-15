@@ -1,7 +1,7 @@
 defmodule ErlangAdkUiWeb do
   @moduledoc false
 
-  def static_paths, do: ~w(assets robots.txt)
+  def static_paths, do: ~w(assets favicon.svg robots.txt)
 
   def router do
     quote do

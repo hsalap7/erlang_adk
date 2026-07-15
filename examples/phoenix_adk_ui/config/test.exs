@@ -2,6 +2,7 @@ import Config
 
 config :erlang_adk_ui,
   auth_provider: ErlangAdkUi.TestAuthProvider,
+  trusted_auth_issuer: "https://identity.example.test",
   gateway_server: ErlangAdkUi.TestGateway,
   start_gateway: false,
   live_gateway: ErlangAdkUi.TestLiveGateway,

@@ -147,6 +147,201 @@ all_server_parts_and_control_signals_are_decoded_test() ->
     ?assertEqual(RawAudio, maps:get(data, Audio)),
     ?assertEqual(24000, maps:get(sample_rate, Audio)).
 
+current_transcription_and_turn_metadata_are_safely_projected_test() ->
+    Message =
+      #{<<"serverContent">> =>
+            #{<<"interimInputTranscription">> =>
+                  #{<<"text">> => <<"hel">>,
+                    <<"languageCode">> => <<"en-US">>},
+              <<"inputTranscription">> =>
+                  #{<<"text">> => <<"hello">>,
+                    <<"finished">> => true,
+                    <<"languageCode">> => <<"en-US">>},
+              <<"outputTranscription">> =>
+                  #{<<"text">> => <<"Hi!">>,
+                    <<"languageCode">> => <<"en">>},
+              <<"turnComplete">> => true,
+              <<"turnCompleteReason">> => <<"NEED_MORE_INPUT">>,
+              <<"waitingForInput">> => true}},
+    {ok, Events} = adk_live_gemini:decode_server(
+                     jsx:encode(Message), #{}),
+    ?assertEqual(
+       [#{kind => input_transcription,
+          payload => #{text => <<"hel">>, final => false}},
+        #{kind => input_transcription,
+          payload => #{text => <<"hello">>, final => true}},
+        #{kind => output_transcription,
+          payload => #{text => <<"Hi!">>, final => false}},
+        #{kind => turn_complete,
+          payload => #{reason => <<"NEED_MORE_INPUT">>,
+                       waiting_for_input => true}}],
+       Events).
+
+optional_transcription_metadata_and_wait_state_can_be_noops_test() ->
+    Message =
+      #{<<"serverContent">> =>
+            #{<<"interimInputTranscription">> => #{},
+              <<"inputTranscription">> =>
+                  #{<<"languageCode">> => <<"en-Latn-US">>},
+              <<"outputTranscription">> => #{<<"finished">> => true},
+              <<"turnCompleteReason">> => <<"NEED_MORE_INPUT">>,
+              <<"waitingForInput">> => true}},
+    ?assertEqual(
+       {ok, []},
+       adk_live_gemini:decode_server(jsx:encode(Message), #{})).
+
+current_turn_complete_reasons_remain_bounded_binaries_test() ->
+    Reasons =
+      [<<"TURN_COMPLETE_REASON_UNSPECIFIED">>,
+       <<"MALFORMED_FUNCTION_CALL">>,
+       <<"RESPONSE_REJECTED">>,
+       <<"NEED_MORE_INPUT">>,
+       <<"PROHIBITED_INPUT_CONTENT">>,
+       <<"IMAGE_PROHIBITED_INPUT_CONTENT">>,
+       <<"INPUT_TEXT_CONTAIN_PROMINENT_PERSON_PROHIBITED">>,
+       <<"INPUT_IMAGE_CELEBRITY">>,
+       <<"INPUT_IMAGE_PHOTO_REALISTIC_CHILD_PROHIBITED">>,
+       <<"INPUT_TEXT_NCII_PROHIBITED">>,
+       <<"INPUT_OTHER">>,
+       <<"INPUT_IP_PROHIBITED">>,
+       <<"BLOCKLIST">>,
+       <<"UNSAFE_PROMPT_FOR_IMAGE_GENERATION">>,
+       <<"GENERATED_IMAGE_SAFETY">>,
+       <<"GENERATED_CONTENT_SAFETY">>,
+       <<"GENERATED_AUDIO_SAFETY">>,
+       <<"GENERATED_VIDEO_SAFETY">>,
+       <<"GENERATED_CONTENT_PROHIBITED">>,
+       <<"GENERATED_CONTENT_BLOCKLIST">>,
+       <<"GENERATED_IMAGE_PROHIBITED">>,
+       <<"GENERATED_IMAGE_CELEBRITY">>,
+       <<"GENERATED_IMAGE_PROMINENT_PEOPLE_DETECTED_BY_REWRITER">>,
+       <<"GENERATED_IMAGE_IDENTIFIABLE_PEOPLE">>,
+       <<"GENERATED_IMAGE_MINORS">>,
+       <<"OUTPUT_IMAGE_IP_PROHIBITED">>,
+       <<"GENERATED_OTHER">>,
+       <<"MAX_REGENERATION_REACHED">>],
+    lists:foreach(
+      fun(WireReason) ->
+          Message =
+            #{<<"serverContent">> =>
+                  #{<<"turnComplete">> => true,
+                    <<"turnCompleteReason">> => WireReason}},
+          ?assertEqual(
+             {ok, [#{kind => turn_complete,
+                     payload => #{reason => WireReason}}]},
+             adk_live_gemini:decode_server(jsx:encode(Message), #{}))
+      end,
+      Reasons).
+
+future_enum_shaped_turn_complete_reason_is_forward_compatible_test() ->
+    FutureReason = <<"FUTURE_POLICY_REASON_2">>,
+    Message =
+      #{<<"serverContent">> =>
+            #{<<"turnComplete">> => true,
+              <<"turnCompleteReason">> => FutureReason}},
+    ?assertEqual(
+       {ok, [#{kind => turn_complete,
+               payload => #{reason => FutureReason}}]},
+       adk_live_gemini:decode_server(jsx:encode(Message), #{})).
+
+current_optional_server_content_fields_remain_strictly_bounded_test() ->
+    BadMessages =
+      [#{<<"serverContent">> =>
+             #{<<"interimInputTranscription">> =>
+                   #{<<"text">> => <<"hello">>,
+                     <<"finished">> => <<"false">>}}},
+       #{<<"serverContent">> =>
+             #{<<"inputTranscription">> =>
+                   #{<<"text">> => <<"hello">>,
+                     <<"languageCode">> => <<"en_US">>}}},
+       #{<<"serverContent">> =>
+             #{<<"inputTranscription">> =>
+                   #{<<"text">> =>
+                         binary:copy(<<"x">>, 65537)}}},
+       #{<<"serverContent">> =>
+             #{<<"turnCompleteReason">> => <<>>}},
+       #{<<"serverContent">> =>
+             #{<<"turnCompleteReason">> =>
+                   binary:copy(<<"A">>, 129)}},
+       #{<<"serverContent">> =>
+             #{<<"turnCompleteReason">> => <<"future-reason">>}},
+       #{<<"serverContent">> =>
+             #{<<"turnCompleteReason">> => 42}},
+       #{<<"serverContent">> =>
+             #{<<"waitingForInput">> => <<"true">>}}],
+    lists:foreach(
+      fun(Message) ->
+          ?assertMatch(
+             {error, {live_protocol_error, _, _}},
+             adk_live_gemini:decode_server(jsx:encode(Message), #{}))
+      end,
+      BadMessages).
+
+current_voice_control_messages_are_validated_and_consumed_test() ->
+    VoiceActivityTypes =
+      [<<"TYPE_UNSPECIFIED">>, <<"ACTIVITY_START">>, <<"ACTIVITY_END">>],
+    lists:foreach(
+      fun(ActivityType) ->
+          ?assertEqual(
+             {ok, []},
+             adk_live_gemini:decode_server(
+               jsx:encode(
+                 #{<<"voiceActivity">> =>
+                       #{<<"voiceActivityType">> => ActivityType,
+                         <<"audioOffset">> => <<"1.250s">>}}), #{}))
+      end,
+      VoiceActivityTypes),
+    VadSignalTypes =
+      [<<"VAD_SIGNAL_TYPE_UNSPECIFIED">>,
+       <<"VAD_SIGNAL_TYPE_SOS">>, <<"VAD_SIGNAL_TYPE_EOS">>],
+    lists:foreach(
+      fun(SignalType) ->
+          ?assertEqual(
+             {ok, []},
+             adk_live_gemini:decode_server(
+               jsx:encode(
+                 #{<<"voiceActivityDetectionSignal">> =>
+                       #{<<"vadSignalType">> => SignalType}}), #{}))
+      end,
+      VadSignalTypes).
+
+voice_controls_compose_with_server_content_and_usage_test() ->
+    Message =
+      #{<<"voiceActivity">> =>
+            #{<<"voiceActivityType">> => <<"ACTIVITY_END">>},
+        <<"voiceActivityDetectionSignal">> =>
+            #{<<"vadSignalType">> => <<"VAD_SIGNAL_TYPE_EOS">>},
+        <<"serverContent">> => #{<<"turnComplete">> => true},
+        <<"usageMetadata">> => #{<<"totalTokenCount">> => 7}},
+    {ok, Events} = adk_live_gemini:decode_server(
+                     jsx:encode(Message), #{}),
+    ?assertEqual([turn_complete, usage],
+                 [maps:get(kind, Event) || Event <- Events]).
+
+malformed_or_unknown_voice_controls_are_rejected_test() ->
+    BadMessages =
+      [#{<<"voiceActivity">> =>
+             #{<<"voiceActivityType">> => <<"ACTIVITY_PAUSE">>}},
+       #{<<"voiceActivity">> =>
+             #{<<"voiceActivityType">> => 1}},
+       #{<<"voiceActivity">> =>
+             #{<<"voiceActivityType">> => <<"ACTIVITY_START">>,
+               <<"audioOffset">> => binary:copy(<<"1">>, 65)}},
+       #{<<"voiceActivity">> =>
+             #{<<"voiceActivityType">> => <<"ACTIVITY_START">>,
+               <<"unexpected">> => true}},
+       #{<<"voiceActivityDetectionSignal">> =>
+             #{<<"vadSignalType">> => <<"VAD_SIGNAL_TYPE_MAYBE">>}},
+       #{<<"voiceActivityDetectionSignal">> =>
+             #{<<"vadSignalType">> => false}}],
+    lists:foreach(
+      fun(Message) ->
+          ?assertMatch(
+             {error, {live_protocol_error, _, _}},
+             adk_live_gemini:decode_server(jsx:encode(Message), #{}))
+      end,
+      BadMessages).
+
 setup_tool_and_resumption_messages_are_strict_test() ->
     ?assertEqual(
        {ok, [#{kind => setup_complete, payload => #{}}]},

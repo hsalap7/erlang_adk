@@ -69,6 +69,58 @@ defmodule ErlangAdkUiWeb.LiveSessionLiveTest do
     assert render(view) =~ "input window is full"
   end
 
+  test "voice controls are exposed only for the attached server-owned session", %{conn: conn} do
+    {conn, _handle, _context} = authenticated(conn)
+    {:ok, view, _html} = live(conn, ~p"/live")
+
+    refute has_element?(view, "#live-voice-console")
+    attach(view)
+
+    assert has_element?(
+             view,
+             "#live-voice-console[phx-hook='LiveVoice'][data-session-id='live-alice']"
+           )
+
+    assert has_element?(view, "#voice-start", "Start voice")
+    assert has_element?(view, "#voice-mute[disabled][aria-pressed='false']", "Mute microphone")
+    assert has_element?(view, "#voice-stop[disabled]", "Stop voice")
+    assert has_element?(view, "[data-voice-transcript][role='region']")
+    assert has_element?(view, "[data-voice-announcement][aria-live='polite'][aria-atomic='true']")
+
+    render_click(view, "detach")
+    refute has_element?(view, "#live-voice-console")
+  end
+
+  test "manual-VAD sessions remain attachable but do not expose browser voice", %{conn: conn} do
+    Application.put_env(:erlang_adk_ui, :test_live_voice_mode, :manual)
+    on_exit(fn -> Application.delete_env(:erlang_adk_ui, :test_live_voice_mode) end)
+
+    {conn, _handle, _context} = authenticated(conn)
+    {:ok, view, html} = live(conn, ~p"/live")
+    assert html =~ "voice: manual"
+
+    attach(view)
+    refute has_element?(view, "#live-voice-console")
+    assert has_element?(view, "#live-voice-unavailable", "requires automatic activity detection")
+  end
+
+  test "voice controls follow trusted active state after discovery refresh", %{conn: conn} do
+    Application.put_env(:erlang_adk_ui, :test_live_voice_state, :setup_pending)
+    on_exit(fn -> Application.delete_env(:erlang_adk_ui, :test_live_voice_state) end)
+
+    {conn, _handle, _context} = authenticated(conn)
+    {:ok, view, _html} = live(conn, ~p"/live")
+    attach(view)
+
+    refute has_element?(view, "#live-voice-console")
+    assert has_element?(view, "#live-voice-unavailable", "reports active")
+
+    Application.put_env(:erlang_adk_ui, :test_live_voice_state, :active)
+    render_click(view, "refresh-live")
+    assert has_element?(view, "#live-voice-console")
+    refute has_element?(view, "#live-voice-unavailable")
+  end
+
   test "audio is projected to metadata, raw bytes never enter assigns, and credit is acked", %{
     conn: conn
   } do

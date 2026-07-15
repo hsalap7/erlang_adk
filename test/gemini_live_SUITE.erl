@@ -8,7 +8,7 @@
 
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1]).
 -export([text_audio_transcription/1, audio_input/1, image_input/1,
-         synchronous_tool_round_trip/1]).
+         synchronous_tool_round_trip/1, browser_voice_bridge/1]).
 
 -define(MODEL, <<"gemini-3.1-flash-live-preview">>).
 -define(PRINCIPAL, <<"gemini-live-common-test">>).
@@ -22,7 +22,8 @@ all() ->
     [text_audio_transcription,
      audio_input,
      image_input,
-     synchronous_tool_round_trip].
+     synchronous_tool_round_trip,
+     browser_voice_bridge].
 
 init_per_suite(Config) ->
     case {os:getenv("ERLANG_ADK_GEMINI_LIVE"),
@@ -116,6 +117,115 @@ synchronous_tool_round_trip(_Config) ->
           Summary = collect_turn(Session, SessionId),
           assert_audio_and_transcription(Summary)
       end).
+
+browser_voice_bridge(_Config) ->
+    with_voice_bridge(
+      fun(Session, Bridge) ->
+          %% Exercise browser framing against the real provider. The short tone
+          %% proves binary PCM ingress; text makes the response deterministic
+          %% without checking in a large spoken-audio fixture.
+          Pcm = binary:copy(<<16#40, 16#1f, 16#c0, 16#e0>>, 2000),
+          {ok, _} = erlang_adk:live_voice_frame(
+                      Bridge,
+                      <<1, 1, 1:64/unsigned-big,
+                        16000:32/unsigned-big, 1, Pcm/binary>>),
+          {ok, _} = erlang_adk:live_send_text(
+                      Session, ?PRINCIPAL,
+                      <<"A browser voice bridge sent a short test tone. "
+                        "Reply with one brief sentence.">>),
+          {ok, _} = erlang_adk:live_voice_frame(Bridge, <<1, 2>>),
+          Summary = collect_voice_turn(
+                      Bridge, deadline(?TURN_TIMEOUT_MS),
+                      #{audio_bytes => 0, transcription => <<>>}),
+          assert_audio_and_transcription(Summary)
+      end).
+
+with_voice_bridge(Fun) ->
+    SessionId = <<"ct-live-voice-bridge-",
+                  (integer_to_binary(
+                     erlang:unique_integer([positive, monotonic])))/binary>>,
+    ApiKey = unicode:characters_to_binary(os:getenv("GEMINI_API_KEY")),
+    SessionConfig =
+      #{provider => adk_live_gemini,
+        provider_config =>
+          #{model => ?MODEL,
+            response_modalities => [audio],
+            output_audio_transcription => true,
+            automatic_activity_detection => true,
+            session_resumption => true},
+        transport => adk_live_gun_transport,
+        transport_opts =>
+          #{api_key => ApiKey,
+            connect_timeout_ms => 30000,
+            tls_handshake_timeout_ms => 30000,
+            upgrade_timeout_ms => 30000},
+        connect_timeout_ms => 35000,
+        setup_timeout_ms => 30000,
+        max_reconnect_attempts => 1},
+    {ok, Session} = erlang_adk:start_live_session(
+                      SessionId, ?PRINCIPAL, SessionConfig),
+    try
+        %% A new bridge is future-only and deliberately requires the Live
+        %% session to be active. Use a short-lived setup subscription to
+        %% observe and acknowledge ready before acquiring the exclusive
+        %% bidirectional voice lease.
+        {ok, _} = erlang_adk:live_subscribe(
+                    Session, ?PRINCIPAL, ?CREDIT),
+        _Ready = await_kind(Session, SessionId, ready,
+                            deadline(?TURN_TIMEOUT_MS)),
+        ok = erlang_adk:live_unsubscribe(Session, ?PRINCIPAL),
+        {ok, Bridge} = erlang_adk:start_live_voice_bridge(
+                         Session, ?PRINCIPAL, self(),
+                         #{credit => ?CREDIT,
+                           max_audio_frame_bytes => 64000}),
+        try Fun(Session, Bridge)
+        after
+            _ = erlang_adk:stop_live_voice_bridge(Bridge)
+        end
+    after
+        _ = erlang_adk:close_live_session(
+              Session, ?PRINCIPAL, common_test_complete)
+    end.
+
+collect_voice_turn(Bridge, Deadline, Summary0) ->
+    {Sequence, Frame} = receive_voice_frame(Bridge, Deadline),
+    ok = voice_ack(Bridge, Sequence),
+    case Frame of
+        <<1, 129, Sequence:64/unsigned-big,
+          _Rate:32/unsigned-big, _Channels:8, Pcm/binary>> ->
+            Summary = Summary0#{
+                        audio_bytes := maps:get(audio_bytes, Summary0)
+                                       + byte_size(Pcm)},
+            collect_voice_turn(Bridge, Deadline, Summary);
+        <<1, 130, Sequence:64/unsigned-big, 2, _Final:8, Text/binary>> ->
+            Existing = maps:get(transcription, Summary0),
+            Summary = Summary0#{transcription :=
+                                  <<Existing/binary, Text/binary>>},
+            collect_voice_turn(Bridge, Deadline, Summary);
+        <<1, 130, Sequence:64/unsigned-big, 1, _Final:8, _Text/binary>> ->
+            collect_voice_turn(Bridge, Deadline, Summary0);
+        <<1, 131, Sequence:64/unsigned-big, 3>> ->
+            Summary0;
+        <<1, 131, Sequence:64/unsigned-big, Code>>
+          when Code =:= 8; Code =:= 9 ->
+            ct:fail({gemini_live_voice_terminal, Code});
+        <<1, 131, Sequence:64/unsigned-big, _Code>> ->
+            collect_voice_turn(Bridge, Deadline, Summary0)
+    end.
+
+receive_voice_frame(Bridge, Deadline) ->
+    Timeout = remaining(Deadline),
+    receive
+        {adk_live_voice_frame, Bridge,
+         <<1, _Type, Sequence:64/unsigned-big, _/binary>> = Frame} ->
+            {Sequence, Frame}
+    after Timeout ->
+        ct:fail(gemini_live_voice_frame_timeout)
+    end.
+
+voice_ack(Bridge, Sequence) ->
+    erlang_adk:live_voice_frame(
+      Bridge, <<1, 3, Sequence:64/unsigned-big>>).
 
 with_session(ProviderOverrides, Fun) ->
     SessionId = <<"ct-live-",

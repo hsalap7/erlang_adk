@@ -77,6 +77,9 @@ init([]) ->
                                          erlang_adk, oidc_providers, [])}),
     McpClientSup = adk_mcp_client_sup:child_spec(#{}),
     WorkflowSup = adk_workflow_sup:child_spec(#{}),
+    %% Registry failure restarts the downstream Live supervisor under
+    %% rest_for_one, so no session can outlive lost exclusive voice leases.
+    LiveVoiceRegistry = adk_live_voice_registry:child_spec(#{}),
     LiveSessionSup = adk_live_session_sup:child_spec(#{}),
     ChildSpecs = [SessionOwner, Registry, AgentConfigStore,
                   PluginRuntimeSup, AgentSup,
@@ -86,7 +89,8 @@ init([]) ->
                   MemoryIngestSup,
                   AdmissionControl, AmbientSup,
                   AuthSup, OidcProviderSup, McpClientSup,
-                  WorkflowSup, LiveSessionSup] ++ MemoryOutboxSpecs ++
+                  WorkflowSup, LiveVoiceRegistry, LiveSessionSup] ++
+                 MemoryOutboxSpecs ++
                  a2a_v1_child_specs() ++ http_child_specs() ++
                  observability_child_specs(),
     {ok, {SupFlags, ChildSpecs}}.

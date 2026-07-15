@@ -1,4 +1,9 @@
-# Erlang ADK 0.5.0 development contract
+# Erlang ADK 0.5.0 delivery contract
+
+> **Status:** frozen historical contract, completed on 2026-07-14 at branch
+> checkpoint `b93a79b`. The final gate passed 765 EUnit tests, six Common Test
+> scenarios, and Dialyzer over 160 project files. Unchecked items remain
+> documented limitations.
 
 This document is the implementation and verification contract for the
 `version_0.5.0` branch. Version 0.5.0 focuses on **artifacts, memory, and

@@ -46,6 +46,7 @@ secure_startup() ->
         invalid_oidc_clock_skew_fails_startup(),
         configured_mnesia_startup(TempMnesiaDir),
         developer_listener_is_always_loopback(),
+        legacy_listener_is_always_loopback(),
         a2a_v1_public_listener_fails_closed(),
         supervised_http_is_bounded(),
         supervised_dev_listener_is_authenticated(),
@@ -134,6 +135,39 @@ developer_listener_is_always_loopback() ->
     application:set_env(erlang_adk, dev_enabled, false),
     application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
     application:unset_env(erlang_adk, dev_auth_token).
+
+legacy_listener_is_always_loopback() ->
+    Port = free_port(),
+    application:set_env(erlang_adk, a2a_enabled, true),
+    application:set_env(erlang_adk, a2a_v1_enabled, false),
+    application:set_env(erlang_adk, dev_enabled, false),
+    application:set_env(erlang_adk, a2a_port, Port),
+    application:set_env(erlang_adk, a2a_ip, {0, 0, 0, 0}),
+    application:set_env(erlang_adk, a2a_allow_non_loopback, false),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, false),
+
+    ?assertEqual({error, legacy_a2a_server_must_bind_loopback},
+                 isolated_http_start()),
+
+    ApplicationResult = application:ensure_all_started(erlang_adk),
+    ?assertMatch({error, _}, ApplicationResult),
+    ?assert(reason_in_term(legacy_a2a_server_must_bind_loopback,
+                           ApplicationResult)),
+    ?assertNot(application_running(erlang_adk)),
+
+    %% The v1 public-listener opt-ins do not weaken the legacy route, and an
+    %% IPv6 wildcard is not loopback.
+    application:set_env(erlang_adk, a2a_allow_non_loopback, true),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, true),
+    application:set_env(erlang_adk, a2a_ip,
+                        {0, 0, 0, 0, 0, 0, 0, 0}),
+    ?assertEqual({error, legacy_a2a_server_must_bind_loopback},
+                 isolated_http_start()),
+
+    application:set_env(erlang_adk, a2a_enabled, false),
+    application:set_env(erlang_adk, a2a_allow_non_loopback, false),
+    application:set_env(erlang_adk, a2a_trusted_tls_proxy, false),
+    application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}).
 
 a2a_v1_public_listener_fails_closed() ->
     Port = free_port(),

@@ -1,4 +1,9 @@
-# Erlang ADK 0.4.0 development contract
+# Erlang ADK 0.4.0 delivery contract
+
+> **Status:** frozen historical contract, completed on 2026-07-14 at branch
+> checkpoint `c7a4a83`. The final gate passed 654 EUnit tests, four Common Test
+> scenarios, and Dialyzer over 134 project files. Unchecked items remain
+> documented limitations.
 
 This document is the implementation and verification contract for the
 `version_0.4.0` branch. Version 0.4.0 is focused on **agent, tool, and workflow

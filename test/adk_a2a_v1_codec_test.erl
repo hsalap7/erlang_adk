@@ -13,7 +13,9 @@ agent_card_uses_v1_supported_interfaces_test() ->
     [#{<<"protocolBinding">> := <<"JSONRPC">>,
        <<"protocolVersion">> := <<"1.0">>}] =
         maps:get(<<"supportedInterfaces">>, Card),
-    ?assertEqual(<<"0.6.0">>, maps:get(<<"version">>, Card)),
+    {ok, ApplicationVersion0} = application:get_key(erlang_adk, vsn),
+    ApplicationVersion = unicode:characters_to_binary(ApplicationVersion0),
+    ?assertEqual(ApplicationVersion, maps:get(<<"version">>, Card)),
     false = maps:is_key(<<"protocolVersion">>, Card),
     {ok, Json} = adk_a2a_v1_card:json(Card),
     ?assertEqual(nomatch, binary:match(Json, <<"preferredTransport">>)).

@@ -54,7 +54,13 @@ defmodule ErlangAdkUi.MixProject do
       setup: ["deps.get", "assets.setup", "assets.build"],
       "assets.setup": ["esbuild.install --if-missing"],
       "assets.build": ["compile", "esbuild erlang_adk_ui"],
-      "assets.deploy": ["esbuild erlang_adk_ui --minify", "phx.digest"],
+      "assets.test": ["cmd node --test assets/js/*_test.mjs"],
+      "assets.deploy": [
+        "esbuild erlang_adk_ui --minify",
+        "phx.digest.clean --all",
+        "phx.digest"
+      ],
+      test: ["assets.build", "assets.test", "test"],
       precommit: [
         "format --check-formatted",
         "compile --warnings-as-errors",

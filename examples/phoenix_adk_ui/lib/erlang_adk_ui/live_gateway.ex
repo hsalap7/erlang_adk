@@ -20,9 +20,15 @@ defmodule ErlangAdkUi.LiveGateway do
           required(:id) => session_id(),
           required(:state) => binary(),
           optional(:model) => binary(),
-          optional(:latest_sequence) => non_neg_integer()
+          optional(:latest_sequence) => non_neg_integer(),
+          optional(:voice_mode) => binary()
         }
   @type evaluation :: %{required(:id) => binary(), required(:label) => binary()}
+  @type voice_ref :: term()
+  @type voice_connection :: %{
+          required(:voice_ref) => voice_ref(),
+          required(:bridge) => pid()
+        }
 
   @callback discover(identity()) :: {:ok, [session()]} | {:error, atom()}
   @callback attach(identity(), session_id(), pid(), credit()) ::
@@ -32,6 +38,11 @@ defmodule ErlangAdkUi.LiveGateway do
               {:ok, pos_integer()} | {:error, atom() | tuple()}
   @callback ack(identity(), attachment_ref(), pid(), non_neg_integer()) ::
               :ok | {:error, atom() | tuple()}
+  @callback open_voice(identity(), session_id(), pid(), map()) ::
+              {:ok, voice_connection()} | {:error, atom() | tuple()}
+  @callback voice_frame(identity(), voice_ref(), binary()) ::
+              :ok | {:error, atom() | tuple()}
+  @callback close_voice(identity(), voice_ref()) :: :ok | {:error, atom() | tuple()}
   @callback observability_snapshot(identity()) :: {:ok, map()} | {:error, atom()}
   @callback list_evaluations(identity()) :: {:ok, [evaluation()]} | {:error, atom()}
   @callback evaluation_report(identity(), binary()) :: {:ok, binary()} | {:error, atom()}
@@ -51,6 +62,15 @@ defmodule ErlangAdkUi.LiveGateway do
 
   def ack(identity, attachment_ref, subscriber, sequence),
     do: invoke(:ack, [identity, attachment_ref, subscriber, sequence])
+
+  def open_voice(identity, session_id, owner, options),
+    do: invoke(:open_voice, [identity, session_id, owner, options])
+
+  def voice_frame(identity, voice_ref, frame),
+    do: invoke(:voice_frame, [identity, voice_ref, frame])
+
+  def close_voice(identity, voice_ref),
+    do: invoke(:close_voice, [identity, voice_ref])
 
   def observability_snapshot(identity), do: invoke(:observability_snapshot, [identity])
   def list_evaluations(identity), do: invoke(:list_evaluations, [identity])

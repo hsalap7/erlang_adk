@@ -2,6 +2,7 @@
     {description, "An OTP-native Agent Development Kit for Erlang."},
     {tags, ["agents", "adk", "otp", "llm", "erlang"]},
     {vsn, "0.7.0"},
+    {minimum_otp_vsn, "27.3.4.14"},
     {registered, []},
     {mod, {erlang_adk_app, []}},
     {applications, [
@@ -57,6 +58,35 @@
         {oidc_max_clock_skew_seconds, 300}
     ]},
     {modules, []},
+
+    {files, [
+        "src",
+        "include",
+        "priv",
+        "rebar.config",
+        "rebar.lock",
+        ".tool-versions",
+        "README.md",
+        "CHANGELOG.md",
+        "SECURITY.md",
+        "CONTRIBUTING.md",
+        "LICENSE.md",
+        "docs",
+        "examples/*.erl",
+        "examples/*.json",
+        "examples/phoenix_adk_ui/.formatter.exs",
+        "examples/phoenix_adk_ui/.gitignore",
+        "examples/phoenix_adk_ui/.tool-versions",
+        "examples/phoenix_adk_ui/README.md",
+        "examples/phoenix_adk_ui/mix.exs",
+        "examples/phoenix_adk_ui/mix.lock",
+        "examples/phoenix_adk_ui/assets",
+        "examples/phoenix_adk_ui/config",
+        "examples/phoenix_adk_ui/lib",
+        "examples/phoenix_adk_ui/priv/static/favicon.svg",
+        "examples/phoenix_adk_ui/priv/static/robots.txt",
+        "examples/phoenix_adk_ui/test"
+    ]},
 
     {licenses, ["Apache-2.0"]},
     {links, [{"GitHub", "https://github.com/hsalap7/erlang_adk"}]}

@@ -6,8 +6,13 @@ defmodule ErlangAdkUi.AgentCatalog.GeminiTest do
   @agent_name <<"PhoenixAssistantV06">>
 
   setup do
-    previous_oidc = Application.get_env(:erlang_adk_ui, :oidc)
-    Application.put_env(:erlang_adk_ui, :oidc, issuer: "https://identity.example.com")
+    previous_issuer = Application.get_env(:erlang_adk_ui, :trusted_auth_issuer)
+
+    Application.put_env(
+      :erlang_adk_ui,
+      :trusted_auth_issuer,
+      "https://identity.example.com"
+    )
 
     on_exit(fn ->
       case :adk_agent_registry.lookup(@agent_name) do
@@ -15,9 +20,9 @@ defmodule ErlangAdkUi.AgentCatalog.GeminiTest do
         {:error, :not_found} -> :ok
       end
 
-      case previous_oidc do
-        nil -> Application.delete_env(:erlang_adk_ui, :oidc)
-        value -> Application.put_env(:erlang_adk_ui, :oidc, value)
+      case previous_issuer do
+        nil -> Application.delete_env(:erlang_adk_ui, :trusted_auth_issuer)
+        value -> Application.put_env(:erlang_adk_ui, :trusted_auth_issuer, value)
       end
     end)
 

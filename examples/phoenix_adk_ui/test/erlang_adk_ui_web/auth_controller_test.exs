@@ -130,10 +130,21 @@ defmodule ErlangAdkUiWeb.AuthControllerTest do
     conn = get(conn, ~p"/health")
     [policy] = get_resp_header(conn, "content-security-policy")
 
-    assert policy =~ "connect-src 'self'"
+    assert policy =~ "connect-src 'self' ws://www.example.com"
     refute policy =~ "connect-src *"
+    refute policy =~ "wss://"
     assert get_resp_header(conn, "referrer-policy") == ["no-referrer"]
     assert get_resp_header(conn, "x-frame-options") == ["DENY"]
     assert get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+  end
+
+  test "secure pages authorize only their exact wss origin" do
+    conn =
+      Plug.Test.conn(:get, "https://agents.example.com/health")
+      |> ErlangAdkUiWeb.Endpoint.call([])
+
+    [policy] = get_resp_header(conn, "content-security-policy")
+    assert policy =~ "connect-src 'self' wss://agents.example.com"
+    refute policy =~ "ws://"
   end
 end

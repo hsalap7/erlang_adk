@@ -1,4 +1,8 @@
-# Erlang ADK 0.7.0 development contract
+# Erlang ADK 0.7.0 release contract
+
+> **Status:** completed and frozen for the v0.7.0 release on 2026-07-15.
+> Checked items are release evidence; unchecked items remain explicit
+> limitations and were not silently promoted to completed behavior.
 
 Version 0.7 focuses on **multimodal and Gemini Live sessions, Runner-global
 plugins, evaluation, and expanded observability**. It builds on the v0.6
@@ -83,6 +87,10 @@ Known v0.7 gaps at branch start:
 - [x] Add a strict versioned Live client/server-message codec with text,
   PCM audio, image/video frames, activity signals, tool responses,
   transcriptions, usage, interruption, cancellation, GoAway, and resumption.
+- [x] Track the current Gemini Live response schema, including interim input
+  transcription, optional transcription metadata, completion reason/wait
+  metadata, and server voice/VAD signals, with strict bounds and no dynamic
+  provider atoms.
 - [x] Add a production Gun WebSocket transport with peer verification,
   connection/setup deadlines, secret-safe failures, and response bounds.
 - [x] Add independently supervised Live sessions with stable opaque refs,
@@ -100,10 +108,10 @@ Known v0.7 gaps at branch start:
 
 Live limitations: subscribers receive events produced after subscription;
 there is no historical structural-event replay yet. Deterministic fake
-transport coverage is complete and the paid real-Live gate passes all four
-text/transcription, PCM, image, and synchronous-tool cases; the separate local
-CA-controlled TLS WebSocket lifecycle harness remains open. Automatic tool
-execution requires an explicit
+transport coverage is complete and the paid real-Live gate passes all five
+text/transcription, PCM, image, synchronous-tool, and browser-bridge cases;
+the separate local CA-controlled TLS WebSocket lifecycle harness remains open.
+Automatic tool execution requires an explicit
 trusted executor module, declared-tool allowlist, scheduling policy, worker
 deadline, heap bound, and response bound; it is never inferred from an ambient
 tool catalogue. A reconnect cancels in-flight/queued tool work and never
@@ -236,6 +244,12 @@ Development.
 - [x] Add a Phoenix LiveView reference path for server-owned Live sessions,
   future-only credit/ack event delivery, realtime text, and teardown, using a
   server-only opaque attachment handle after bounded discovery.
+- [x] Add an authenticated same-origin binary voice socket backed by one
+  owner-bound lightweight Erlang bridge, automatic-VAD/active-state admission,
+  exclusive per-session leases, reconnect continuity capabilities, timed
+  authorization revalidation, bounded AudioWorklet capture/resampling and
+  cross-thread credit, native playback, exact ACK credit, interruption, and
+  fail-closed ambiguous-outcome/reconnect teardown.
 - [x] Add evaluation report/comparison and observability views with exact
   authorization and bounded rendering; keep `/dev` loopback-only.
 
@@ -246,9 +260,15 @@ Development.
   explicit limitations.
 - [x] Complete clean compile/EUnit/Common Test/Dialyzer, README, CLI,
   concurrency, Phoenix, and packaging gates.
+- [x] Raise the verified production runtime to OTP 27.3.4.14 / SSL 11.2.12.10
+  and rerun deterministic, Phoenix, package, direct-TLS, REST, and Live gates
+  on that security patch level.
+- [x] Enforce loopback-only startup for the unauthenticated legacy
+  `/a2a/prompt` route, including IPv4/IPv6 wildcard rejection independent of
+  A2A v1 public-listener flags.
 - [x] Run opt-in REST Gemini and Live Gemini suites with no skipped cases;
   provider/quota failures are reported and never counted as passes. Live is
-  4/4; REST is 15/17 with two explicit HTTP 429 failures, while the new
+  5/5; REST is 15/17 with two explicit HTTP 429 failures, while the new
   first-party rubric-judge case passes.
 - [x] Run the Phoenix dependency audit and keep the two unresolved upstream
   Cowlib advisories explicit rather than treating the non-zero audit as pass.
@@ -256,7 +276,9 @@ Development.
 ## Explicit non-goals unless completed later on this branch
 
 - The core does not capture microphones/cameras, resample PCM, render video, or
-  play audio; applications own device/media pipelines.
+  play audio. It now supplies an owner-bound, bounded binary voice bridge; the
+  checked Phoenix companion demonstrates the application-owned AudioWorklet
+  capture/resampling and Web Audio playback pipeline.
 - A Live WebSocket is not a durable queue. Resumption uses provider handles and
   bounded local state; it does not promise replay of arbitrary lost media.
 - Browser-direct Gemini connections require a deployment-owned ephemeral-token

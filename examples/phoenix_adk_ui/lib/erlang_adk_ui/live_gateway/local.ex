@@ -81,6 +81,52 @@ defmodule ErlangAdkUi.LiveGateway.Local do
   def ack(_identity, _session_id, _subscriber, _sequence), do: {:error, :invalid_request}
 
   @impl true
+  def open_voice(identity, session_id, owner, options) when is_pid(owner) and is_map(options) do
+    with {:ok, principal} <- authorize(identity, :live_read),
+         {:ok, ^principal} <- authorize(identity, :live_control),
+         {:ok, checked_options} <- voice_options(options),
+         {:ok, session, status} <- find_session_with_status(session_id, principal),
+         :ok <- require_active_voice_session(status),
+         :ok <- require_automatic_voice(status),
+         {:ok, bridge} when is_pid(bridge) <-
+           safe_core_call(:start_live_voice_bridge, [
+             session,
+             principal,
+             owner,
+             checked_options
+           ]) do
+      voice_ref = {__MODULE__, :voice, bridge, owner, principal, make_ref()}
+      {:ok, %{voice_ref: voice_ref, bridge: bridge}}
+    else
+      {:ok, _invalid_bridge} -> {:error, :service_unavailable}
+      {:error, _reason} = error -> error
+      _other -> {:error, :service_unavailable}
+    end
+  end
+
+  def open_voice(_identity, _session_id, _owner, _options), do: {:error, :invalid_request}
+
+  @impl true
+  def voice_frame(identity, voice_ref, frame) when is_binary(frame) do
+    with {:ok, principal} <- authorize(identity, :live_read),
+         {:ok, ^principal} <- authorize(identity, :live_control),
+         {:ok, bridge} <- resolve_voice_ref(voice_ref, principal, true) do
+      normalize_voice_result(safe_core_call(:live_voice_frame, [bridge, frame]))
+    end
+  end
+
+  def voice_frame(_identity, _voice_ref, _frame), do: {:error, :invalid_request}
+
+  @impl true
+  def close_voice(identity, voice_ref) do
+    with {:ok, principal} <- authorize(identity, :live_read),
+         {:ok, ^principal} <- authorize(identity, :live_control),
+         {:ok, bridge} <- resolve_voice_ref(voice_ref, principal, false) do
+      normalize_voice_result(safe_core_call(:stop_live_voice_bridge, [bridge]))
+    end
+  end
+
+  @impl true
   def observability_snapshot(identity) do
     with {:ok, _principal} <- authorize(identity, :observability_read) do
       {:ok,
@@ -179,18 +225,26 @@ defmodule ErlangAdkUi.LiveGateway.Local do
   end
 
   defp find_session(session_id, principal) when is_binary(session_id) do
+    with {:ok, session, _status} <- find_session_with_status(session_id, principal) do
+      {:ok, session}
+    end
+  end
+
+  defp find_session(_session_id, _principal), do: {:error, :not_found}
+
+  defp find_session_with_status(session_id, principal) when is_binary(session_id) do
     with true <- valid_id?(session_id),
          {:ok, children} <- live_children() do
       matches =
         children
         |> live_statuses(principal)
         |> Enum.flat_map(fn
-          %{session_id: ^session_id, session_pid: pid} -> [pid]
+          %{session_id: ^session_id, session_pid: pid} = status -> [{pid, status}]
           _status -> []
         end)
 
       case matches do
-        [session] -> {:ok, session}
+        [{session, status}] -> {:ok, session, status}
         [] -> {:error, :not_found}
         _multiple -> {:error, :ambiguous}
       end
@@ -200,7 +254,7 @@ defmodule ErlangAdkUi.LiveGateway.Local do
     end
   end
 
-  defp find_session(_session_id, _principal), do: {:error, :not_found}
+  defp find_session_with_status(_session_id, _principal), do: {:error, :not_found}
 
   defp attach_bridge(session, session_id, principal, subscriber, credit) do
     token = make_ref()
@@ -282,6 +336,21 @@ defmodule ErlangAdkUi.LiveGateway.Local do
 
   defp resolve_subscription(_attachment_ref, _subscriber), do: {:error, :not_found}
 
+  defp resolve_voice_ref(
+         {__MODULE__, :voice, bridge, owner, principal, token},
+         principal,
+         require_alive
+       )
+       when is_pid(bridge) and is_pid(owner) and is_reference(token) and is_boolean(require_alive) do
+    cond do
+      owner != self() -> {:error, :not_found}
+      require_alive and not Process.alive?(bridge) -> {:error, :not_found}
+      true -> {:ok, bridge}
+    end
+  end
+
+  defp resolve_voice_ref(_voice_ref, _principal, _require_alive), do: {:error, :not_found}
+
   defp live_statuses(children, principal) do
     children
     |> Task.async_stream(
@@ -309,23 +378,44 @@ defmodule ErlangAdkUi.LiveGateway.Local do
     _kind, _reason -> {:error, :service_unavailable}
   end
 
+  defp safe_core_call(function, arguments) do
+    apply(:erlang_adk, function, arguments)
+  catch
+    :exit, _reason -> {:error, :service_unavailable}
+    _kind, _reason -> {:error, :service_unavailable}
+  end
+
+  defp normalize_voice_result(:ok), do: :ok
+  defp normalize_voice_result({:ok, _sequence}), do: :ok
+  defp normalize_voice_result({:error, _reason} = error), do: error
+  defp normalize_voice_result(_other), do: {:error, :service_unavailable}
+
   defp public_status(status) do
-    %{
-      id: Map.fetch!(status, :session_id),
-      state: status |> Map.get(:state, :unknown) |> to_string(),
-      model: bounded_string(Map.get(status, :model, "unknown"), 256),
-      latest_sequence: non_negative(Map.get(status, :latest_sequence, 0)),
-      turn_epoch: non_negative(Map.get(status, :turn_epoch, 0)),
-      generation_epoch: non_negative(Map.get(status, :generation_epoch, 0)),
-      replayed_inputs: false
-    }
+    public =
+      %{
+        id: Map.fetch!(status, :session_id),
+        state: public_state(Map.get(status, :state)),
+        model: bounded_string(Map.get(status, :model, "unknown"), 256),
+        latest_sequence: non_negative(Map.get(status, :latest_sequence, 0)),
+        turn_epoch: non_negative(Map.get(status, :turn_epoch, 0)),
+        generation_epoch: non_negative(Map.get(status, :generation_epoch, 0)),
+        replayed_inputs: false
+      }
+
+    mode =
+      case voice_mode(status) do
+        {:ok, value} -> Atom.to_string(value)
+        {:error, :voice_mode_unavailable} -> "unavailable"
+      end
+
+    Map.put(public, :voice_mode, mode)
   end
 
   defp public_subscription(subscription, attachment_ref, attachment_token)
        when is_map(subscription) do
     %{
       latest_sequence: non_negative(Map.get(subscription, :latest_sequence, 0)),
-      state: subscription |> Map.get(:state, :unknown) |> to_string(),
+      state: public_state(Map.get(subscription, :state)),
       turn_epoch: non_negative(Map.get(subscription, :turn_epoch, 0)),
       generation_epoch: non_negative(Map.get(subscription, :generation_epoch, 0)),
       replay: false,
@@ -392,6 +482,78 @@ defmodule ErlangAdkUi.LiveGateway.Local do
 
   defp valid_id?(value), do: valid_utf8_binary?(value, 128)
   defp valid_label?(value), do: valid_utf8_binary?(value, 256)
+
+  defp voice_options(
+         %{
+           credit: %{messages: messages, bytes: bytes} = credit,
+           max_audio_frame_bytes: maximum
+         } = options
+       )
+       when map_size(options) == 2 and map_size(credit) == 2 and is_integer(messages) and
+              messages >= 1 and
+              messages <= 256 and is_integer(bytes) and bytes >= 1 and bytes <= 8_388_608 and
+              is_integer(maximum) and maximum >= 1 and maximum <= 65_536,
+       do:
+         {:ok,
+          %{
+            credit: %{messages: messages, bytes: bytes},
+            max_audio_frame_bytes: maximum
+          }}
+
+  defp voice_options(_options), do: {:error, :invalid_request}
+
+  defp require_active_voice_session(%{state: state}) when state in [:active, "active"], do: :ok
+
+  defp require_active_voice_session(_status), do: {:error, :voice_session_not_active}
+
+  defp require_automatic_voice(status) do
+    case voice_mode(status) do
+      {:ok, :automatic} -> :ok
+      {:ok, :manual} -> {:error, :automatic_activity_detection_required}
+      {:error, :voice_mode_unavailable} = error -> error
+    end
+  end
+
+  defp voice_mode(status) when is_map(status) do
+    explicit = Map.get(status, :voice_mode, :missing)
+    automatic = Map.get(status, :automatic_activity_detection, :missing)
+
+    case {explicit, automatic} do
+      {value, :missing} -> normalize_voice_mode(value)
+      {:missing, true} -> {:ok, :automatic}
+      {:missing, false} -> {:ok, :manual}
+      {value, true} -> consistent_voice_mode(value, :automatic)
+      {value, false} -> consistent_voice_mode(value, :manual)
+      _other -> {:error, :voice_mode_unavailable}
+    end
+  end
+
+  defp voice_mode(_status), do: {:error, :voice_mode_unavailable}
+
+  defp consistent_voice_mode(value, expected) do
+    case normalize_voice_mode(value) do
+      {:ok, ^expected} = result -> result
+      _other -> {:error, :voice_mode_unavailable}
+    end
+  end
+
+  defp normalize_voice_mode(:automatic), do: {:ok, :automatic}
+  defp normalize_voice_mode("automatic"), do: {:ok, :automatic}
+  defp normalize_voice_mode(:manual), do: {:ok, :manual}
+  defp normalize_voice_mode("manual"), do: {:ok, :manual}
+  defp normalize_voice_mode(_value), do: {:error, :voice_mode_unavailable}
+
+  defp public_state(:connecting), do: "connecting"
+  defp public_state(:setup_pending), do: "setup_pending"
+  defp public_state(:active), do: "active"
+  defp public_state(:reconnecting), do: "reconnecting"
+  defp public_state(:closed), do: "closed"
+  defp public_state("connecting"), do: "connecting"
+  defp public_state("setup_pending"), do: "setup_pending"
+  defp public_state("active"), do: "active"
+  defp public_state("reconnecting"), do: "reconnecting"
+  defp public_state("closed"), do: "closed"
+  defp public_state(_state), do: "unknown"
 
   defp valid_utf8_binary?(value, maximum) when is_binary(value) do
     byte_size(value) > 0 and byte_size(value) <= maximum and String.valid?(value)

@@ -1,4 +1,9 @@
-# Erlang ADK 0.6.0 development contract
+# Erlang ADK 0.6.0 release contract
+
+> **Status:** frozen historical contract, completed on 2026-07-14 at branch
+> checkpoint `6448793`. The final gate passed 899 EUnit tests, six Common Test
+> scenarios, and Dialyzer over 170 project files. Unchecked items remain
+> documented limitations and release exceptions.
 
 This document is the implementation and release contract for the
 `version_0.6.0` branch. Version 0.6 focuses on **authentication, protocols,
