@@ -25,8 +25,10 @@ versions.
 Production modules use one recursive `src` root. Keep public Erlang module
 names globally unique and place new implementations according to the ownership
 map in [`src/README.md`](src/README.md). Do not add overlapping nested
-`src_dirs`; Rebar3 must discover each source file exactly once. Tests remain
-flat under `test/` unless their build profile is deliberately changed.
+`src_dirs`; Rebar3 must discover each source file exactly once. Tests mirror
+the same ownership hierarchy under the test-profile-only recursive root
+documented in [`docs/TEST_LAYOUT.md`](docs/TEST_LAYOUT.md); do not add
+overlapping test source roots.
 
 Moving a source file between feature directories must not rename its module or
 silently change its API. Use application include paths such as
@@ -48,6 +50,15 @@ The canonical clean gate is:
 ```bash
 ./rebar3 do clean, compile, eunit, ct, dialyzer
 ```
+
+Run the aggregate Erlang coverage gate before submitting behavior changes:
+
+```bash
+./scripts/coverage.sh
+```
+
+It resets stale exports, combines EUnit and Common Test coverage, and enforces
+the repository's deterministic 72% floor.
 
 Without provider opt-in flags, the billable Gemini Common Test cases are
 expected to skip. A skip is not a pass and does not replace deterministic
@@ -133,6 +144,7 @@ Do not substitute the REST model into Live or describe REST SSE as Live.
 - [ ] No secret or real user/model content is present in code, fixtures, logs,
       generated artifacts, or the diff.
 - [ ] `./rebar3 do clean, compile, eunit, ct, dialyzer` passes.
+- [ ] `./scripts/coverage.sh` passes without lowering the coverage floor.
 - [ ] README examples and focused tests pass.
 - [ ] Phoenix `mix precommit` and production assets/release pass when the
       companion is affected.

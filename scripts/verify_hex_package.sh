@@ -27,6 +27,7 @@ required_files=(
   "CHANGELOG.md"
   "SECURITY.md"
   "docs/RELEASING.md"
+  "docs/TEST_LAYOUT.md"
   "examples/readme_weather_tool.erl"
   "examples/phoenix_adk_ui/README.md"
   "examples/phoenix_adk_ui/assets/js/live_voice.js"
@@ -158,7 +159,7 @@ if ! grep -Fq '{<<"version">>,<<"0.7.0">>}.' "${outer_dir}/metadata.config"; the
   exit 1
 fi
 
-if ! rg -q '\{minimum_otp_vsn,[[:space:]]*"27\.3\.4\.14"\}' \
+if ! grep -E -q '\{minimum_otp_vsn,[[:space:]]*"27\.3\.4\.14"\}' \
     "${contents_dir}/src/erlang_adk.app.src"; then
   echo "Package does not declare the OTP 27.3.4.14 security baseline" >&2
   exit 1
@@ -168,6 +169,7 @@ for forbidden_path in \
   "_build" \
   "deps" \
   ".git" \
+  "test" \
   "Mnesia.nonode@nohost" \
   "doc" \
   "examples/phoenix_adk_ui/priv/static/assets" \
@@ -185,11 +187,17 @@ if find "${contents_dir}" -type f \
   exit 1
 fi
 
-if rg -n --hidden \
+if grep -E -r -q -- \
     '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|AIza[0-9A-Za-z_-]{30,})' \
     "${contents_dir}"; then
   echo "A credential-shaped value is present in the Hex package" >&2
   exit 1
+else
+  credential_scan_status=$?
+  if [[ "${credential_scan_status}" -ne 1 ]]; then
+    echo "Credential scan failed with grep status ${credential_scan_status}" >&2
+    exit 1
+  fi
 fi
 
 original_dir="${PWD}"

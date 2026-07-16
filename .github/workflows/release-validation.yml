@@ -30,6 +30,9 @@ jobs:
       - name: Run the deterministic clean gate
         run: ./rebar3 do clean, compile, eunit, ct, dialyzer
 
+      - name: Enforce aggregate Erlang coverage
+        run: ./scripts/coverage.sh
+
       - name: Check cross-references
         run: ./rebar3 xref
 

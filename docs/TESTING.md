@@ -11,15 +11,24 @@ from the repository root unless a section changes directory.
 - Browser assets/tests: Node.js; verified with Node 24.3.0.
 - Use the repository's `./rebar3` for core commands.
 
+## Test source organization
+
+Erlang tests mirror the production ownership hierarchy under `test/`; the
+complete map and placement rules are in [`TEST_LAYOUT.md`](TEST_LAYOUT.md).
+The recursive test root is enabled only in Rebar3's `test` profile, so EUnit
+and Common Test discover nested modules while ordinary builds and packages do
+not compile test helpers.  Explicit Common Test commands must use each suite's
+full path; EUnit module selection remains path-independent.
+
 ## Complete deterministic Erlang gate
 
 ```bash
 ./rebar3 do clean, compile, eunit, ct, dialyzer
 ```
 
-The final 2026-07-15 v0.7 run passed:
+The final 2026-07-16 v0.7 run passed:
 
-- 1,077 EUnit tests;
+- 1,110 EUnit tests;
 - six deterministic Common Test cases;
 - Dialyzer over 210 project files with no warnings; and
 - both 1,000-operation concurrency/resource stress scenarios.
@@ -31,6 +40,32 @@ not included in the six passing cases.
 Some HTTP and protocol fixtures open loopback listeners. A restricted build
 environment must allow local sockets; otherwise a permission failure is an
 environment failure, not passing test evidence.
+
+## Deterministic line coverage gate
+
+```bash
+./scripts/coverage.sh
+```
+
+The script resets all previously exported Cover data, performs a clean build,
+instruments the complete EUnit and Common Test suites, aggregates both exports,
+and fails below 72% executable-line coverage. The HTML summary and per-module
+reports are written under `_build/test/cover/`. Do not run `rebar3 cover`
+against exports from an earlier source tree: `rebar3 clean` does not remove
+stale Cover data.
+
+`./rebar3 cover --verbose` only aggregates previously exported `.coverdata`;
+it does not execute or instrument tests. Therefore `No coverdata found` is the
+expected result on a clean tree or immediately after `cover --reset`. Use
+`./scripts/coverage.sh` to produce both the EUnit and Common Test exports before
+rendering the report.
+
+Paid Gemini cases remain explicitly skipped without their opt-in flags, and
+Phoenix/ExUnit coverage is a separate project concern. The 72% floor therefore
+measures the deterministic Erlang release contract only; it must be raised as
+new deterministic behavior becomes covered and must not be weakened to hide a
+regression. The final 2026-07-16 aggregate is 72.11% across 210 production
+modules.
 
 ## README and focused v0.7 gates
 
@@ -46,8 +81,8 @@ erlc -Werror -pa _build/default/lib/erlang_adk/ebin -o /tmp \
 ./rebar3 eunit \
   --module=adk_live_media_test,adk_live_gemini_codec_test,adk_live_gun_transport_test,adk_live_public_api_test,adk_live_session_test,adk_live_tool_execution_test,adk_live_observability_test,adk_live_voice_protocol_test,adk_live_voice_bridge_test,adk_plugin_pipeline_test,adk_plugin_runner_integration_test,adk_plugin_builtin_test,adk_plugin_stateful_test,adk_trace_context_test,adk_observability_v2_test,adk_observability_runner_test,adk_otlp_json_test,adk_otlp_http_json_exporter_test,adk_eval_criteria_test,adk_eval_v2_test,adk_eval_llm_judge_test,adk_eval_dev_view_test,adk_dev_v07_http_test,adk_cli_test
 
-./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
-./rebar3 ct --suite test/adk_v05_stress_SUITE.erl
+./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
+./rebar3 ct --suite test/integrations/stress/adk_v05_stress_SUITE.erl
 ```
 
 The v0.7 evidence is 29 README tests, four workflow tests, warning-as-error
@@ -87,7 +122,7 @@ Export the key and opt-in flag in the shell that starts Common Test:
 ```bash
 export GEMINI_API_KEY="your_api_key_here"
 ERLANG_ADK_GEMINI_REST=1 ./rebar3 ct \
-  --suite test/readme_live_gemini_SUITE.erl
+  --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 Despite the historical suite filename, this is REST GenerateContent/SSE using
@@ -103,7 +138,7 @@ sufficient quota, pacing can be disabled explicitly:
 ```bash
 ERLANG_ADK_GEMINI_REST=1 \
 ERLANG_ADK_GEMINI_REST_INTERVAL_MS=0 \
-./rebar3 ct --suite test/readme_live_gemini_SUITE.erl
+./rebar3 ct --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 The final 2026-07-15 run completed all 17 cases with no skips: 15 passed;
@@ -120,7 +155,7 @@ historical REST suite. New automation should use the unambiguous REST names.
 ```bash
 export GEMINI_API_KEY="your_api_key_here"
 ERLANG_ADK_GEMINI_LIVE=1 ./rebar3 ct \
-  --suite test/gemini_live_SUITE.erl
+  --suite test/models/gemini/gemini_live_SUITE.erl
 ```
 
 This suite uses `gemini-3.1-flash-live-preview` and covers five cases:

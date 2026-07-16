@@ -188,7 +188,7 @@ gate:
 ./rebar3 do clean, compile, eunit, ct, dialyzer
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
-./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
+./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
 ./rebar3 escriptize
 _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
@@ -206,7 +206,7 @@ access, quota, and billable API calls. The suite is pinned to
 
 ```bash
 ERLANG_ADK_LIVE_GEMINI=1 ./rebar3 ct \
-  --suite test/readme_live_gemini_SUITE.erl
+  --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 The test process must receive `GEMINI_API_KEY`; exporting it in a different

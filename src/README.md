@@ -60,5 +60,6 @@ nested source roots. All modules still compile into one `ebin`, so module names
 must be globally unique. Use `-include("name.hrl")` for application headers;
 do not depend on a source file's relative depth.
 
-Tests intentionally remain directly under `test/`, whose discovery rules are
-separate from the recursive production source tree.
+Tests mirror this ownership hierarchy under one test-profile-only recursive
+`test` root. See [`docs/TEST_LAYOUT.md`](../docs/TEST_LAYOUT.md) for test
+placement, cross-feature integration suites, and fixture conventions.

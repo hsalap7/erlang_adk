@@ -401,8 +401,8 @@ The deterministic release gate is:
 ./rebar3 do clean, compile, eunit, ct, dialyzer
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
-./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
-./rebar3 ct --suite test/adk_v05_stress_SUITE.erl
+./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
+./rebar3 ct --suite test/integrations/stress/adk_v05_stress_SUITE.erl
 ./rebar3 escriptize
 _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
@@ -415,7 +415,7 @@ behavior remains a separate opt-in gate:
 
 ```bash
 ERLANG_ADK_LIVE_GEMINI=1 ./rebar3 ct \
-  --suite test/readme_live_gemini_SUITE.erl
+  --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 The clean deterministic release command passed on 2026-07-14: 765 EUnit tests

@@ -25,11 +25,12 @@ Useful read-only checks:
 git status --short
 git diff --check
 git diff --stat
-git ls-files | rg '(^|/)(_build|deps|Mnesia\.|doc/|rebar3\.crashdump)'
-rg -l --hidden \
-  -g '!.git/**' \
-  -g '!test/fixtures/mcp_test_key.pem' \
-  '(BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AIza[0-9A-Za-z_-]{20,})' .
+git ls-files | grep -E '(^|/)(_build|deps|Mnesia\.|doc/|rebar3\.crashdump)'
+find . -type f \
+  ! -path './.git/*' \
+  ! -path './test/fixtures/mcp_test_key.pem' \
+  -exec grep -E -l \
+  '(BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AIza[0-9A-Za-z_-]{20,})' {} +
 ```
 
 The last two commands should produce no release artifact or credential
@@ -52,11 +53,12 @@ evidence.
 
 ```bash
 ./rebar3 do clean, compile, eunit, ct, dialyzer
+./scripts/coverage.sh
 ./rebar3 xref
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
-./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
-./rebar3 ct --suite test/adk_v05_stress_SUITE.erl
+./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
+./rebar3 ct --suite test/integrations/stress/adk_v05_stress_SUITE.erl
 ./rebar3 escriptize
 _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
@@ -65,17 +67,19 @@ _build/default/bin/adk config validate examples/agent.json
 ./scripts/verify_hex_package.sh
 ```
 
-For 0.7.0, compare against the evidence in [`TESTING.md`](TESTING.md): 1,077
-EUnit tests, six deterministic Common Test cases, warning-free Dialyzer over
-210 files, 29 README tests, four workflow tests, 193 focused v0.7 tests, and
-both 1,000-operation stress suites.
+For 0.7.0, compare against the evidence in [`TESTING.md`](TESTING.md): 1,110
+EUnit tests, six deterministic Common Test cases, 72.11% aggregate Erlang line
+coverage against the enforced 72% floor, warning-free Dialyzer over 210 files,
+29 README tests, four workflow tests, 193 focused v0.7 tests, and both
+1,000-operation stress suites.
 
 Inspect generated documentation and the Hex tarball/file list. Confirm the
 package contains core source, public headers, license, README, changelog,
 guides, root examples, and the intentionally packaged Phoenix companion source;
-it must exclude build/dependency caches, local data, generated Phoenix output,
-credentials, and crash dumps. The verifier also compiles from a clean extracted
-archive; inspect the generated docs landing page separately.
+it must exclude the test source tree, build/dependency caches, local data,
+generated Phoenix output, credentials, and crash dumps. The verifier enforces
+that boundary and also compiles from a clean extracted archive; inspect the
+generated docs landing page separately.
 
 The root Rebar3 project currently has no `rebar3 hex audit` gate. Review
 `rebar.lock` and upstream security advisories independently; do not claim that
@@ -124,10 +128,10 @@ commands use network access, quota, and billable API calls.
 ```bash
 export GEMINI_API_KEY="your_api_key_here"
 ERLANG_ADK_GEMINI_REST=1 ./rebar3 ct \
-  --suite test/readme_live_gemini_SUITE.erl
+  --suite test/readme/readme_live_gemini_SUITE.erl
 
 ERLANG_ADK_GEMINI_LIVE=1 ./rebar3 ct \
-  --suite test/gemini_live_SUITE.erl
+  --suite test/models/gemini/gemini_live_SUITE.erl
 ```
 
 The REST suite must use `gemini-3.1-flash-lite`; the Live suite must use

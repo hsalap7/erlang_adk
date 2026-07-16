@@ -67,7 +67,9 @@ models, plugins, telemetry, and evaluation each have explicit ownership
 directories; provider implementations such as Gemini remain below `models/`.
 This is a filesystem-only organization: public module atoms and BEAM names do
 not change. See [`src/README.md`](src/README.md) for the exact boundaries and
-rules for new modules.
+rules for new modules. Test and fixture modules mirror the same ownership
+hierarchy under a test-profile-only recursive `test` root; see
+[`docs/TEST_LAYOUT.md`](docs/TEST_LAYOUT.md) for placement and discovery rules.
 
 ## Installation
 
@@ -3905,6 +3907,7 @@ the repository's bundled Rebar3:
 
 ```bash
 ./rebar3 do clean, compile, eunit, ct, dialyzer
+./scripts/coverage.sh
 ./rebar3 xref
 ./rebar3 escriptize
 _build/default/bin/adk doctor
@@ -3924,10 +3927,12 @@ For historical comparison, the final v0.6 2026-07-14 clean run passed 899
 EUnit tests, six deterministic Common Test cases, and warning-free Dialyzer
 over 170 project files. The v0.7 results below supersede that baseline.
 
-The final v0.7 2026-07-15 clean Erlang gate completed 1,077 EUnit tests with no failures,
-six deterministic Common Test cases, and warning-free Dialyzer analysis over
-210 project files. Escript packaging, `adk doctor`, checked agent-config
-validation, and the focused README/runtime gates also pass.
+The final v0.7 2026-07-16 clean Erlang gate completed 1,110 EUnit tests with
+no failures, six deterministic Common Test cases, and warning-free Dialyzer
+analysis over 210 project files. Aggregate deterministic Erlang line coverage
+is 72.11%, above the enforced 72% floor. Escript packaging, `adk doctor`,
+checked agent-config validation, and the focused README/runtime gates also
+pass.
 
 Run the focused deterministic README smoke suite with:
 
@@ -3940,8 +3945,8 @@ erlc -Werror -pa _build/default/lib/erlang_adk/ebin -o /tmp \
   examples/readme_stateful_counter_plugin.erl
 ./rebar3 eunit \
   --module=adk_live_media_test,adk_live_gemini_codec_test,adk_live_gun_transport_test,adk_live_public_api_test,adk_live_session_test,adk_live_tool_execution_test,adk_live_observability_test,adk_live_voice_protocol_test,adk_live_voice_bridge_test,adk_plugin_pipeline_test,adk_plugin_runner_integration_test,adk_plugin_builtin_test,adk_plugin_stateful_test,adk_trace_context_test,adk_observability_v2_test,adk_observability_runner_test,adk_otlp_json_test,adk_otlp_http_json_exporter_test,adk_eval_criteria_test,adk_eval_v2_test,adk_eval_llm_judge_test,adk_eval_dev_view_test,adk_dev_v07_http_test,adk_cli_test
-./rebar3 ct --suite test/adk_concurrency_stress_SUITE.erl
-./rebar3 ct --suite test/adk_v05_stress_SUITE.erl
+./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
+./rebar3 ct --suite test/integrations/stress/adk_v05_stress_SUITE.erl
 ```
 
 The concurrency stress suite executes 1,000 stable runs in bounded concurrent batches
@@ -3965,7 +3970,7 @@ with:
 
 ```bash
 ERLANG_ADK_GEMINI_REST=1 ./rebar3 ct \
-  --suite test/readme_live_gemini_SUITE.erl
+  --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 Despite its historical filename,
@@ -4006,7 +4011,7 @@ higher limit can shorten or disable the test pacing, for example:
 ```bash
 ERLANG_ADK_GEMINI_REST=1 \
 ERLANG_ADK_GEMINI_REST_INTERVAL_MS=0 \
-./rebar3 ct --suite test/readme_live_gemini_SUITE.erl
+./rebar3 ct --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 Keep the default interval on free-tier projects. Exhausted daily quota,
@@ -4022,7 +4027,7 @@ the explicit Live preview model:
 
 ```bash
 ERLANG_ADK_GEMINI_LIVE=1 ./rebar3 ct \
-  --suite test/gemini_live_SUITE.erl
+  --suite test/models/gemini/gemini_live_SUITE.erl
 ```
 
 `gemini_live_SUITE` covers text-to-audio plus output transcription, 16 kHz

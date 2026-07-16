@@ -50,6 +50,9 @@ No changes have been assigned to the next release.
   binds to `127.0.0.1`, and uses a CSRF-protected login POST.
 - A complete Phoenix presentation layer, AudioWorklet capture/resampling,
   bounded Web Audio playback, static asset checks, and a favicon route.
+- A reproducible EUnit plus Common Test coverage gate that discards stale
+  exports, writes an HTML/per-module report, and enforces a 72% deterministic
+  Erlang line-coverage floor in release validation.
 
 ### Changed
 
@@ -69,6 +72,10 @@ No changes have been assigned to the next release.
   and evaluation ownership directories. The `src` root now contains only the
   public facade and OTP application shell; Erlang module names, public APIs,
   and BEAM names are unchanged.
+- Reorganized Erlang tests and their dedicated helpers to mirror production
+  ownership under a test-profile-only recursive `test` root. Explicit Common
+  Test paths and documentation now follow the same hierarchy, while default
+  builds and packages continue to contain production modules only.
 - Extracted canonical safety-setting validation into the provider-neutral
   model contract; Gemini retains provider-specific REST encoding.
 
@@ -102,9 +109,10 @@ No changes have been assigned to the next release.
 
 ### Verification and known limitations
 
-- The 2026-07-15 deterministic gate on OTP 27.3.4.14 passed 1,077 EUnit
-  tests, six Common Test cases, Dialyzer over 210 project files, escript
-  packaging, `adk doctor`,
+- The 2026-07-16 deterministic gate on OTP 27.3.4.14 passed 1,110 EUnit
+  tests, six Common Test cases, 72.11% aggregate Erlang line coverage against
+  an enforced 72% floor, Dialyzer over 210 project files, escript packaging,
+  `adk doctor`,
   checked configuration validation, 29 README tests, four workflow tests,
   193 focused v0.7 tests, and both 1,000-operation stress suites.
 - The Phoenix gate on OTP 27.3.4.14 passed 101 ExUnit tests and 31

@@ -10,6 +10,8 @@ for installation and executable examples.
   0.7.0, fixes, evidence, and visible release limitations.
 - [`TESTING.md`](TESTING.md) — deterministic, paid-provider, Phoenix, browser,
   packaging, and audit gates.
+- [`TEST_LAYOUT.md`](TEST_LAYOUT.md) — test ownership, recursive discovery,
+  helper placement, and fixture conventions.
 - [`UPGRADING.md`](UPGRADING.md) — behavior and configuration changes between
   delivery milestones.
 - [`RELEASING.md`](RELEASING.md) — the pre-tag, package, audit, approval, tag,

@@ -76,9 +76,10 @@ provider/quota failures are not counted as passes. The Phoenix dependency
 audit remains non-zero for the two documented Cowlib 2.18.0 advisories and is
 recorded as an explicit exception, not a passing gate.
 
-The final 2026-07-15 v0.7 clean Erlang gate passes 1,077 EUnit tests, six
-deterministic Common Test cases, and warning-free Dialyzer analysis over 210
-project files.
+The final 2026-07-16 v0.7 clean Erlang gate passes 1,110 EUnit tests, six
+deterministic Common Test cases, 72.11% aggregate Erlang line coverage against
+the enforced 72% floor, and warning-free Dialyzer analysis over 210 project
+files.
 Escript packaging, `adk doctor`, checked agent-config validation, all 29 README
 tests, all four workflow tests, three warning-as-error example-module runtime
 smokes, 193 focused v0.7 tests, and both 1,000-run stress suites also pass. The

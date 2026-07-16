@@ -208,7 +208,7 @@ billable API calls:
 
 ```bash
 ERLANG_ADK_LIVE_GEMINI=1 ./rebar3 ct \
-  --suite test/readme_live_gemini_SUITE.erl
+  --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
 ## Documentation policy
