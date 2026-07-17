@@ -7,6 +7,10 @@
 
 -export([client_credentials/4, refresh_token/6]).
 
+-ifdef(TEST).
+-export([test_normalize_token/1, test_oidcc_opts/1]).
+-endif.
+
 -spec client_credentials(adk_oauth_adapter:provider(), binary(), binary(),
                          adk_oauth_adapter:opts()) ->
     {ok, adk_oauth_adapter:token()} | {error, term()}.
@@ -71,3 +75,8 @@ oidcc_opts(#{scope := Scopes} = Opts) ->
         error ->
             Base
     end.
+
+-ifdef(TEST).
+test_normalize_token(Token) -> normalize_token(Token).
+test_oidcc_opts(Opts) -> oidcc_opts(Opts).
+-endif.

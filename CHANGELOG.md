@@ -51,8 +51,12 @@ No changes have been assigned to the next release.
 - A complete Phoenix presentation layer, AudioWorklet capture/resampling,
   bounded Web Audio playback, static asset checks, and a favicon route.
 - A reproducible EUnit plus Common Test coverage gate that discards stale
-  exports, writes an HTML/per-module report, and enforces a 72% deterministic
+  exports, writes an HTML/per-module report, and enforces a 73% deterministic
   Erlang line-coverage floor in release validation.
+- Deterministic boundary coverage for OIDCC authorization/OAuth adapters,
+  OpenAPI compilation and execution, Live transport/voice leases, evaluation
+  agents and limits, JSON/OpenAPI schemas, trace context, and secret-safe
+  failure classification.
 
 ### Changed
 
@@ -67,6 +71,9 @@ No changes have been assigned to the next release.
 - Phoenix voice playback uses continuous bounded scheduling and defers each
   ADK audio acknowledgement until its corresponding browser audio has been
   admitted, preventing credit from outrunning playback.
+- Release validation now pins Node 24-native `actions/checkout` and
+  `actions/setup-node` releases, eliminating the GitHub Actions Node 20
+  deprecation fallback while retaining immutable commit-SHA references.
 - Reorganized the production source tree into explicit agent, tool, workflow,
   Live, runtime, state, protocol, integration, auth, model, plugin, telemetry,
   and evaluation ownership directories. The `src` root now contains only the
@@ -109,9 +116,9 @@ No changes have been assigned to the next release.
 
 ### Verification and known limitations
 
-- The 2026-07-16 deterministic gate on OTP 27.3.4.14 passed 1,110 EUnit
-  tests, six Common Test cases, 72.11% aggregate Erlang line coverage against
-  an enforced 72% floor, Dialyzer over 210 project files, escript packaging,
+- The 2026-07-16 deterministic gate on OTP 27.3.4.14 passed 1,176 EUnit
+  tests, six Common Test cases, 73.88% aggregate Erlang line coverage against
+  an enforced 73% floor, Dialyzer over 210 project files, escript packaging,
   `adk doctor`,
   checked configuration validation, 29 README tests, four workflow tests,
   193 focused v0.7 tests, and both 1,000-operation stress suites.

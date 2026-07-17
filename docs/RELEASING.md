@@ -67,9 +67,9 @@ _build/default/bin/adk config validate examples/agent.json
 ./scripts/verify_hex_package.sh
 ```
 
-For 0.7.0, compare against the evidence in [`TESTING.md`](TESTING.md): 1,110
-EUnit tests, six deterministic Common Test cases, 72.11% aggregate Erlang line
-coverage against the enforced 72% floor, warning-free Dialyzer over 210 files,
+For 0.7.0, compare against the evidence in [`TESTING.md`](TESTING.md): 1,176
+EUnit tests, six deterministic Common Test cases, 73.88% aggregate Erlang line
+coverage against the enforced 73% floor, warning-free Dialyzer over 210 files,
 29 README tests, four workflow tests, 193 focused v0.7 tests, and both
 1,000-operation stress suites.
 

@@ -28,7 +28,7 @@ full path; EUnit module selection remains path-independent.
 
 The final 2026-07-16 v0.7 run passed:
 
-- 1,110 EUnit tests;
+- 1,176 EUnit tests;
 - six deterministic Common Test cases;
 - Dialyzer over 210 project files with no warnings; and
 - both 1,000-operation concurrency/resource stress scenarios.
@@ -49,7 +49,7 @@ environment failure, not passing test evidence.
 
 The script resets all previously exported Cover data, performs a clean build,
 instruments the complete EUnit and Common Test suites, aggregates both exports,
-and fails below 72% executable-line coverage. The HTML summary and per-module
+and fails below 73% executable-line coverage. The HTML summary and per-module
 reports are written under `_build/test/cover/`. Do not run `rebar3 cover`
 against exports from an earlier source tree: `rebar3 clean` does not remove
 stale Cover data.
@@ -61,10 +61,10 @@ expected result on a clean tree or immediately after `cover --reset`. Use
 rendering the report.
 
 Paid Gemini cases remain explicitly skipped without their opt-in flags, and
-Phoenix/ExUnit coverage is a separate project concern. The 72% floor therefore
+Phoenix/ExUnit coverage is a separate project concern. The 73% floor therefore
 measures the deterministic Erlang release contract only; it must be raised as
 new deterministic behavior becomes covered and must not be weakened to hide a
-regression. The final 2026-07-16 aggregate is 72.11% across 210 production
+regression. The final 2026-07-16 aggregate is 73.88% across 210 production
 modules.
 
 ## README and focused v0.7 gates

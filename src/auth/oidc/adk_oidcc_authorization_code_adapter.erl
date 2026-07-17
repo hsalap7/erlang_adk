@@ -14,6 +14,10 @@
 
 -export([validate_context/1, authorization_uri/2, exchange_code/3]).
 
+-ifdef(TEST).
+-export([test_validated_refresh_credential/3]).
+-endif.
+
 -define(MAX_CLIENT_ID_BYTES, 4096).
 -define(MAX_CLIENT_SECRET_BYTES, 16384).
 -define(MAX_REFRESH_TOKEN_BYTES, 65536).
@@ -152,3 +156,8 @@ safe_binary(Value) ->
 
 safe_external_size(Term) ->
     try erlang:external_size(Term) catch _:_ -> invalid end.
+
+-ifdef(TEST).
+test_validated_refresh_credential(Token, ClientId, ClientSecret) ->
+    validated_refresh_credential(Token, ClientId, ClientSecret).
+-endif.

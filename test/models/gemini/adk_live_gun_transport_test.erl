@@ -73,7 +73,188 @@ invalid_credentials_and_bounds_test() ->
     ?assertEqual(
        {error, invalid_transport_options},
        adk_live_gun_transport:test_validate_options(
-         #{api_key => <<"key">>, cacertfile => <<>>})).
+         #{api_key => <<"key">>, cacertfile => <<>>})),
+    ?assertEqual(
+       {error, invalid_transport_options},
+       adk_live_gun_transport:test_validate_options(
+         #{api_key => <<"key">>, cacertfile => [0]})),
+    ?assertEqual(
+       {error, invalid_transport_options},
+       adk_live_gun_transport:test_validate_options(
+         #{api_key => <<"key">>, cacertfile => invalid})),
+    BinaryCa = adk_live_gun_transport:test_gun_options(
+                 #{api_key => <<"key">>,
+                   cacertfile => <<"/tmp/test-ca.pem">>}),
+    ?assert(lists:member(
+              {cacertfile, "/tmp/test-ca.pem"},
+              maps:get(tls_opts, BinaryCa))),
+    ListCa = adk_live_gun_transport:test_gun_options(
+               #{api_key => <<"key">>,
+                 cacertfile => "/tmp/test-ca.pem"}),
+    ?assert(lists:member(
+              {cacertfile, "/tmp/test-ca.pem"},
+              maps:get(tls_opts, ListCa))).
+
+handoff_installs_and_revokes_owned_credential_test() ->
+    HandoffRef = make_ref(),
+    {ok, Awaiting} = adk_live_gun_transport:init(HandoffRef),
+    Secret = <<"owned-handoff-secret">>,
+    {reply, ok, Connecting} =
+        adk_live_gun_transport:handle_call(
+          {handoff, HandoffRef, self(),
+           #{api_key => Secret,
+             connect_timeout_ms => 100,
+             upgrade_timeout_ms => 100}},
+          {self(), make_ref()}, Awaiting),
+    ?assertEqual(connecting, maps:get(phase, Connecting)),
+    ?assertEqual(true, maps:get(credential_owned, Connecting)),
+    CredentialRef = maps:get(credential_ref, Connecting),
+    ?assertEqual({ok, Secret},
+                 adk_live_credential_broker:resolve(CredentialRef)),
+    receive
+        connect -> ok
+    after 0 ->
+        erlang:error(connect_message_missing)
+    end,
+    OwnerMonitor = maps:get(owner_monitor, Connecting),
+    ?assertEqual(ok,
+                 adk_live_gun_transport:terminate(normal, Connecting)),
+    erlang:demonitor(OwnerMonitor, [flush]),
+    ?assertEqual({error, credential_unavailable},
+                 adk_live_credential_broker:resolve(CredentialRef)).
+
+handoff_preserves_referenced_credential_and_rejects_bad_options_test() ->
+    {ok, CredentialRef} =
+        adk_live_credential_broker:start(self(), <<"referenced-secret">>),
+    HandoffRef = make_ref(),
+    {ok, Awaiting} = adk_live_gun_transport:init(HandoffRef),
+    {reply, {error, invalid_transport_options}, Awaiting} =
+        adk_live_gun_transport:handle_call(
+          {handoff, HandoffRef, self(), #{}},
+          {self(), make_ref()}, Awaiting),
+    {reply, ok, Connecting} =
+        adk_live_gun_transport:handle_call(
+          {handoff, HandoffRef, self(),
+           #{credential_ref => CredentialRef,
+             connect_timeout_ms => 100}},
+          {self(), make_ref()}, Awaiting),
+    ?assertEqual(false, maps:get(credential_owned, Connecting)),
+    receive
+        connect -> ok
+    after 0 ->
+        erlang:error(connect_message_missing)
+    end,
+    OwnerMonitor = maps:get(owner_monitor, Connecting),
+    ?assertEqual(ok,
+                 adk_live_gun_transport:terminate(normal, Connecting)),
+    erlang:demonitor(OwnerMonitor, [flush]),
+    ?assertEqual({ok, <<"referenced-secret">>},
+                 adk_live_credential_broker:resolve(CredentialRef)),
+    ok = adk_live_credential_broker:revoke(CredentialRef).
+
+gun_up_resolves_credential_and_starts_strict_upgrade_test() ->
+    Secret = <<"upgrade key with ? and &">>,
+    {ok, CredentialRef} =
+        adk_live_credential_broker:start(self(), Secret),
+    TestPid = self(),
+    FakeGun = spawn(fun() -> fake_gun_loop(TestPid) end),
+    Connecting = (transport_state(connecting))#{
+                   connection => FakeGun,
+                   stream_ref => undefined,
+                   credential_ref => CredentialRef,
+                   upgrade_timeout_ms => 100,
+                   ws_flow => 3},
+    {noreply, Upgrading} = adk_live_gun_transport:handle_info(
+                             {gun_up, FakeGun, http}, Connecting),
+    ?assertEqual(upgrading, maps:get(phase, Upgrading)),
+    UpgradeRef = maps:get(stream_ref, Upgrading),
+    receive
+        {'$gen_cast',
+         {ws_upgrade, ReplyTo, UpgradeRef, Path, Headers, WsOptions}} ->
+            ?assertEqual(self(), ReplyTo),
+            [_FixedPath, Query] = binary:split(Path, <<"?">>),
+            ?assertEqual([{<<"key">>, Secret}],
+                         uri_string:dissect_query(Query)),
+            ?assert(lists:member(
+                      {<<"user-agent">>, <<"erlang-adk/0.7">>},
+                      Headers)),
+            ?assertEqual(3, maps:get(flow, WsOptions)),
+            ?assertEqual(false, maps:get(compress, WsOptions)),
+            ?assertEqual(true, maps:get(silence_pings, WsOptions))
+    after 1000 ->
+        erlang:error(fake_gun_upgrade_missing)
+    end,
+    ?assertEqual(ok, adk_live_gun_transport:terminate(normal, Upgrading)),
+    stop_fake_gun(FakeGun),
+    ok = adk_live_credential_broker:revoke(CredentialRef).
+
+gun_up_rejects_revoked_credential_test() ->
+    {ok, CredentialRef} =
+        adk_live_credential_broker:start(self(), <<"revoked-secret">>),
+    ok = adk_live_credential_broker:revoke(CredentialRef),
+    TestPid = self(),
+    FakeGun = spawn(fun() -> fake_gun_loop(TestPid) end),
+    Connecting = (transport_state(connecting))#{
+                   connection => FakeGun,
+                   stream_ref => undefined,
+                   credential_ref => CredentialRef},
+    {stop, normal, Closed} = adk_live_gun_transport:handle_info(
+                               {gun_up, FakeGun, http}, Connecting),
+    ?assertEqual(true, maps:get(notified_closed, Closed)),
+    assert_transport_message({closed, credential_unavailable}),
+    stop_fake_gun(FakeGun).
+
+active_send_close_and_gun_exit_paths_test() ->
+    TestPid = self(),
+    FakeGun = spawn(fun() -> fake_gun_loop(TestPid) end),
+    Active = (transport_state(active))#{connection => FakeGun},
+    StreamRef = maps:get(stream_ref, Active),
+    {reply, {ok, SendRef}, Pending} =
+        adk_live_gun_transport:handle_call(
+          {send, <<"outbound">>}, {self(), make_ref()}, Active),
+    ?assert(is_reference(SendRef)),
+    ?assertEqual(SendRef, maps:get(outbound_pending, Pending)),
+    receive
+        {'$gen_cast', {ws_send, ReplyTo, StreamRef,
+                       {text, <<"outbound">>}}} ->
+            ?assertEqual(self(), ReplyTo)
+    after 1000 ->
+        erlang:error(fake_gun_send_missing)
+    end,
+
+    Failed = Active#{connection => make_ref()},
+    ?assertEqual(
+       {reply, {error, transport_send_failed}, Failed},
+       adk_live_gun_transport:handle_call(
+         {send, <<"outbound">>}, {self(), make_ref()}, Failed)),
+
+    ?assertEqual(
+       {stop, normal, ok, Active},
+       adk_live_gun_transport:handle_call(
+         close, {self(), make_ref()}, Active)),
+    receive
+        {'$gen_cast', {ws_send, _ReplyTo, StreamRef, close}} -> ok
+    after 1000 ->
+        erlang:error(fake_gun_close_missing)
+    end,
+
+    {stop, normal, ExitClosed} = adk_live_gun_transport:handle_info(
+                                   {'EXIT', FakeGun, shutdown}, Active),
+    ?assertEqual(true, maps:get(notified_closed, ExitClosed)),
+    assert_transport_message({closed, transport_closed}),
+
+    ConnectionOnly = Active#{stream_ref => undefined},
+    ?assertEqual(ok,
+                 adk_live_gun_transport:terminate(
+                   normal, ConnectionOnly)),
+    stop_fake_gun(FakeGun).
+
+ownerless_terminal_event_does_not_attempt_notification_test() ->
+    State = (transport_state(active))#{owner => undefined},
+    Connection = maps:get(connection, State),
+    {stop, normal, State} = adk_live_gun_transport:handle_info(
+                              {gun_error, Connection, opaque}, State),
+    assert_no_transport_message().
 
 opaque_credential_and_frame_end_event_test() ->
     Secret = <<"gun-secret-must-not-enter-state">>,
@@ -135,6 +316,37 @@ public_api_rejects_invalid_and_dead_handles_test() ->
     ?assertEqual(ok, adk_live_gun_transport:consumed(Dead, 1)),
     ?assertEqual(ok, adk_live_gun_transport:consumed(not_a_pid, 1)),
     ?assertEqual(ok, adk_live_gun_transport:consumed(Dead, 0)).
+
+public_api_forwards_send_flow_and_close_to_handle_test() ->
+    TestPid = self(),
+    Handle = spawn(fun() -> fake_transport_handle_loop(TestPid) end),
+    Monitor = erlang:monitor(process, Handle),
+    {ok, SendRef} = adk_live_gun_transport:send(
+                      Handle, <<"public-frame">>),
+    ?assert(is_reference(SendRef)),
+    receive
+        {fake_transport_call, {send, <<"public-frame">>}} -> ok
+    after 1000 ->
+        erlang:error(fake_transport_send_missing)
+    end,
+    ?assertEqual(ok, adk_live_gun_transport:consumed(Handle, 2)),
+    receive
+        {fake_transport_cast, {consumed, 2}} -> ok
+    after 1000 ->
+        erlang:error(fake_transport_flow_missing)
+    end,
+    ?assertEqual(ok,
+                 adk_live_gun_transport:close(Handle, normal)),
+    receive
+        {fake_transport_call, close} -> ok
+    after 1000 ->
+        erlang:error(fake_transport_close_missing)
+    end,
+    receive
+        {'DOWN', Monitor, process, Handle, normal} -> ok
+    after 1000 ->
+        erlang:error(fake_transport_handle_stop_timeout)
+    end.
 
 inbound_frames_are_delivered_and_bounded_test() ->
     State = transport_state(active),
@@ -380,4 +592,36 @@ assert_no_gun_event() ->
         {adk_live_gun_event, _, _} = Unexpected ->
             erlang:error({unexpected_gun_event, Unexpected})
     after 0 -> ok
+    end.
+
+fake_gun_loop(TestPid) ->
+    receive
+        stop ->
+            ok;
+        Message ->
+            TestPid ! Message,
+            fake_gun_loop(TestPid)
+    end.
+
+stop_fake_gun(FakeGun) ->
+    Monitor = erlang:monitor(process, FakeGun),
+    FakeGun ! stop,
+    receive
+        {'DOWN', Monitor, process, FakeGun, normal} -> ok
+    after 1000 ->
+        erlang:error(fake_gun_stop_timeout)
+    end.
+
+fake_transport_handle_loop(TestPid) ->
+    receive
+        {'$gen_call', From, {send, _Frame} = Request} ->
+            TestPid ! {fake_transport_call, Request},
+            gen_server:reply(From, {ok, make_ref()}),
+            fake_transport_handle_loop(TestPid);
+        {'$gen_call', From, close} ->
+            TestPid ! {fake_transport_call, close},
+            gen_server:reply(From, ok);
+        {'$gen_cast', Request} ->
+            TestPid ! {fake_transport_cast, Request},
+            fake_transport_handle_loop(TestPid)
     end.

@@ -20,7 +20,8 @@ init({Issuer, Jwks}) ->
                        scopes_supported = [],
                        response_types_supported = [<<"code">>],
                        subject_types_supported = [public],
-                       id_token_signing_alg_values_supported = [<<"RS256">>]},
+                       id_token_signing_alg_values_supported = [<<"RS256">>],
+                       code_challenge_methods_supported = [<<"S256">>]},
     {ok, #{configuration => Configuration, jwks => Jwks}}.
 
 handle_call(get_provider_configuration, _From,

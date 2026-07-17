@@ -59,8 +59,8 @@ HTTP 429 after the one bounded ten-second retry; those are explicit quota/rate-
 limit failures, not implementation passes. These v0.5/v0.6 results are
 historical evidence, not a v0.7 release result. REST and Gemini Live evidence
 supplements rather than replaces deterministic contracts in this ledger. The
-final 2026-07-16 v0.7 clean Erlang gate passes 1,110 EUnit tests, six
-deterministic Common Test cases, 72.11% aggregate Erlang line coverage, and
+final 2026-07-16 v0.7 clean Erlang gate passes 1,176 EUnit tests, six
+deterministic Common Test cases, 73.88% aggregate Erlang line coverage, and
 warning-free Dialyzer analysis over 210 project files. Escript
 packaging, CLI checks, 29 README tests, four workflow tests, three example
 runtime smokes, 193 focused v0.7 tests, and both 1,000-run stress suites pass.
@@ -198,7 +198,7 @@ F01-F78 mapping.
 
 | ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
 | --- | --- | --- | --- | --- | --- |
-| F75 | Complete deterministic Erlang release and packaging gates | Bash | Literal deterministic | `./rebar3 do clean, compile, eunit, ct, dialyzer`; `./scripts/coverage.sh`; Xref; `./rebar3 escriptize`; `adk doctor`; checked agent-config validation; warning-free ExDoc; `./rebar3 hex build`; and `scripts/verify_hex_package.sh`. F63 covers the CLI-specific assertions. | The final 2026-07-16 v0.7 gate passes 1,110 EUnit tests, six deterministic Common Test cases, 72.11% aggregate Erlang line coverage against the enforced 72% floor, warning-free Dialyzer over 210 project files, Xref, escript packaging, doctor, checked config validation, docs generation, and an inspected clean-compiling Hex archive. No provider flag is required. |
+| F75 | Complete deterministic Erlang release and packaging gates | Bash | Literal deterministic | `./rebar3 do clean, compile, eunit, ct, dialyzer`; `./scripts/coverage.sh`; Xref; `./rebar3 escriptize`; `adk doctor`; checked agent-config validation; warning-free ExDoc; `./rebar3 hex build`; and `scripts/verify_hex_package.sh`. F63 covers the CLI-specific assertions. | The final 2026-07-16 v0.7 gate passes 1,176 EUnit tests, six deterministic Common Test cases, 73.88% aggregate Erlang line coverage against the enforced 73% floor, warning-free Dialyzer over 210 project files, Xref, escript packaging, doctor, checked config validation, docs generation, and an inspected clean-compiling Hex archive. No provider flag is required. |
 | F76 | Focused README and 1,000-run stress gates | Bash | Literal deterministic | `readme_examples_test`; `readme_workflow_examples_test`; the focused v0.7 module set below; `adk_concurrency_stress_SUITE`; `adk_v05_stress_SUITE` | Current documentation checks pass 29 README tests, four workflow tests, warning-as-error compilation/runtime smoke for all three new example modules, 193 focused v0.7 tests, and both 1,000-run stress suites. No provider key is required. |
 | F77 | Opt-in billable Gemini REST suite | Bash | Billable REST | `readme_live_gemini_SUITE`, including `context_cache/1`, `artifact_and_memory_tools/1`, and `llm_rubric_judge/1` | Requires F03 and `ERLANG_ADK_GEMINI_REST=1` in the same shell, network access, quota, and billable API permission. Despite its historical filename, this is GenerateContent REST with `gemini-3.1-flash-lite`, not Gemini Live. The final v0.7 run passes 15/17 with no skips; Search and cache creation fail on explicit HTTP 429 after one retry. `ERLANG_ADK_LIVE_GEMINI=1` remains a compatibility alias. |
 | F78 | Billable Gemini REST suite without request pacing | Bash | Billable REST | `readme_live_gemini_SUITE`; pacing is parsed by `request_interval_ms/0` | `ERLANG_ADK_GEMINI_REST_INTERVAL_MS=0` disables pacing. The historical `ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS` alias remains accepted. Keep the default interval on constrained projects. |

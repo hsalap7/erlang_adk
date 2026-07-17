@@ -58,7 +58,7 @@ Run the aggregate Erlang coverage gate before submitting behavior changes:
 ```
 
 It resets stale exports, combines EUnit and Common Test coverage, and enforces
-the repository's deterministic 72% floor.
+the repository's deterministic 73% floor.
 
 Without provider opt-in flags, the billable Gemini Common Test cases are
 expected to skip. A skip is not a pass and does not replace deterministic

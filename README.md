@@ -3927,10 +3927,10 @@ For historical comparison, the final v0.6 2026-07-14 clean run passed 899
 EUnit tests, six deterministic Common Test cases, and warning-free Dialyzer
 over 170 project files. The v0.7 results below supersede that baseline.
 
-The final v0.7 2026-07-16 clean Erlang gate completed 1,110 EUnit tests with
+The final v0.7 2026-07-16 clean Erlang gate completed 1,176 EUnit tests with
 no failures, six deterministic Common Test cases, and warning-free Dialyzer
 analysis over 210 project files. Aggregate deterministic Erlang line coverage
-is 72.11%, above the enforced 72% floor. Escript packaging, `adk doctor`,
+is 73.88%, above the enforced 73% floor. Escript packaging, `adk doctor`,
 checked agent-config validation, and the focused README/runtime gates also
 pass.
 
