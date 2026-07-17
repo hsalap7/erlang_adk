@@ -44,13 +44,129 @@ init([]) ->
                  shutdown => 5000,
                  type => worker,
                  modules => [adk_agent_registry]},
+    AgentConfigStore = adk_agent_config_store:child_spec(#{}),
+    %% Stateful plugin instances are serialized and isolated below their own
+    %% dynamic supervisor. Keep it ahead of agents so a runtime replacement
+    %% also replaces downstream consumers under rest_for_one.
+    PluginRuntimeSup = adk_plugin_runtime_sup:child_spec(),
     AgentSup = #{id => adk_agent_sup,
                  start => {adk_agent_sup, start_link, []},
                  restart => permanent,
                  shutdown => infinity,
                  type => supervisor,
                  modules => [adk_agent_sup]},
-    ChildSpecs = [SessionOwner, Registry, AgentSup],
+    AgentTurnSup = adk_agent_turn_sup:child_spec(#{}),
+    %% Blocking model/tool work is independently supervised. Keep every
+    %% registry immediately ahead of its dynamic supervisor. Tasks sit before
+    %% runs because invocations may own tasks; rest_for_one can therefore never
+    %% leave a run attached to a stale task registry.
+    TaskRegistry = adk_task_registry:child_spec(#{}),
+    TaskSup = adk_task_sup:child_spec(#{}),
+    RunRegistry = adk_run_registry:child_spec(#{}),
+    InvocationSup = adk_invocation_sup:child_spec(#{}),
+    ContextCapabilitySup = adk_context_capability_sup:child_spec(#{}),
+    MemoryIngestSup = adk_memory_ingest_sup:child_spec(#{}),
+    MemoryOutboxSpecs = memory_outbox_child_specs(),
+    AdmissionControl = adk_admission_control:child_spec(
+                         application:get_env(
+                           erlang_adk, admission_control, #{})),
+    AmbientSup = adk_ambient_sup:child_spec(#{}),
+    AuthSup = adk_auth_sup:child_spec(#{}),
+    OidcProviderSup = adk_oidc_provider_sup:child_spec(
+                        #{providers => application:get_env(
+                                         erlang_adk, oidc_providers, [])}),
+    McpClientSup = adk_mcp_client_sup:child_spec(#{}),
+    WorkflowSup = adk_workflow_sup:child_spec(#{}),
+    %% Registry failure restarts the downstream Live supervisor under
+    %% rest_for_one, so no session can outlive lost exclusive voice leases.
+    LiveVoiceRegistry = adk_live_voice_registry:child_spec(#{}),
+    LiveSessionSup = adk_live_session_sup:child_spec(#{}),
+    ChildSpecs = [SessionOwner, Registry, AgentConfigStore,
+                  PluginRuntimeSup, AgentSup,
+                  AgentTurnSup,
+                  TaskRegistry, TaskSup,
+                  RunRegistry, InvocationSup, ContextCapabilitySup,
+                  MemoryIngestSup,
+                  AdmissionControl, AmbientSup,
+                  AuthSup, OidcProviderSup, McpClientSup,
+                  WorkflowSup, LiveVoiceRegistry, LiveSessionSup] ++
+                 MemoryOutboxSpecs ++
+                 a2a_v1_child_specs() ++ http_child_specs() ++
+                 observability_child_specs(),
     {ok, {SupFlags, ChildSpecs}}.
 
+memory_outbox_child_specs() ->
+    case application:get_env(erlang_adk, memory_outbox_enabled, false) of
+        false -> [];
+        true ->
+            Options = application:get_env(
+                        erlang_adk, memory_outbox_options, #{}),
+            case is_map(Options) of
+                true -> [adk_memory_outbox_sup:child_spec(Options)];
+                false ->
+                    erlang:error({invalid_application_env,
+                                  memory_outbox_options, Options})
+            end;
+        Invalid ->
+            erlang:error({invalid_application_env,
+                          memory_outbox_enabled, Invalid})
+    end.
+
 %% internal functions
+
+a2a_v1_child_specs() ->
+    case application:get_env(erlang_adk, a2a_v1_enabled, false) of
+        true ->
+            Options = application:get_env(
+                        erlang_adk, a2a_v1_server_options, #{}),
+            [adk_a2a_v1_server:child_spec(Options)];
+        false -> [];
+        Invalid ->
+            erlang:error({invalid_application_env, a2a_v1_enabled, Invalid})
+    end.
+
+http_child_specs() ->
+    A2AEnabled = application:get_env(erlang_adk, a2a_enabled, false),
+    A2AV1Enabled = application:get_env(erlang_adk, a2a_v1_enabled, false),
+    DevEnabled = application:get_env(erlang_adk, dev_enabled, false),
+    case {A2AEnabled, A2AV1Enabled, DevEnabled} of
+        {false, false, false} -> [];
+        {A2A, A2AV1, Dev}
+          when is_boolean(A2A), is_boolean(A2AV1), is_boolean(Dev) ->
+            [#{id => erlang_adk_http,
+               start => {erlang_adk_http, start_link, []},
+               restart => permanent,
+               shutdown => 5000,
+               type => worker,
+               modules => [erlang_adk_http]}];
+        {Invalid, _, _} when not is_boolean(Invalid) ->
+            erlang:error({invalid_application_env, a2a_enabled, Invalid});
+        {_, Invalid, _} when not is_boolean(Invalid) ->
+            erlang:error({invalid_application_env, a2a_v1_enabled, Invalid});
+        {_, _, Invalid} ->
+            erlang:error({invalid_application_env, dev_enabled, Invalid})
+    end.
+
+observability_child_specs() ->
+    MetricsOptions = application:get_env(
+                       erlang_adk, observability_metrics_options, #{}),
+    BusEnabled = application:get_env(
+                   erlang_adk, observability_bus_enabled, false),
+    BusOptions = application:get_env(
+                   erlang_adk, observability_bus_options, #{}),
+    case {is_map(MetricsOptions), BusEnabled, is_map(BusOptions)} of
+        {true, false, true} ->
+            [adk_observability_metrics:child_spec(MetricsOptions)];
+        {true, true, true} ->
+            [adk_observability_metrics:child_spec(MetricsOptions),
+             adk_observability_bus:child_spec(BusOptions)];
+        {false, _, _} ->
+            erlang:error({invalid_application_env,
+                          observability_metrics_options, MetricsOptions});
+        {_, Invalid, _} when not is_boolean(Invalid) ->
+            erlang:error({invalid_application_env,
+                          observability_bus_enabled, Invalid});
+        {_, _, false} ->
+            erlang:error({invalid_application_env,
+                          observability_bus_options, BusOptions})
+    end.

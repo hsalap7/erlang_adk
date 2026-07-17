@@ -64,12 +64,23 @@ a2a_test_case() ->
         provider => adk_llm_probe,
         response => UnicodeResponse
     }, []),
-    %% Wait a tiny bit for Cowboy to be ready
-    timer:sleep(100),
-    Res = erlang_adk_a2a_client:prompt(
-            "http://localhost:8080/a2a/prompt", "A2AAgent", <<"héllo"/utf8>>),
-    ?assertEqual({ok, UnicodeResponse}, Res),
-    ok = erlang_adk:stop_agent(Pid).
+    Listener = erlang_adk_tests_a2a_listener,
+    Dispatch = cowboy_router:compile(
+                 [{'_',[{"/a2a/prompt", erlang_adk_a2a_handler,
+                         #{max_body_bytes => 65536}}]}]),
+    {ok, _} = cowboy:start_clear(
+                Listener, [{ip, {127, 0, 0, 1}}, {port, 0}],
+                #{env => #{dispatch => Dispatch}}),
+    Port = ranch:get_port(Listener),
+    Url = "http://127.0.0.1:" ++ integer_to_list(Port) ++ "/a2a/prompt",
+    try
+        Res = erlang_adk_a2a_client:prompt(
+                Url, "A2AAgent", <<"héllo"/utf8>>),
+        ?assertEqual({ok, UnicodeResponse}, Res)
+    after
+        _ = cowboy:stop_listener(Listener),
+        ok = erlang_adk:stop_agent(Pid)
+    end.
 
 mnesia_session_test_case() ->
     LLMConfig = #{provider => adk_llm_dummy, session_id => mnesia_test_1, session_store => erlang_adk_session_mnesia},

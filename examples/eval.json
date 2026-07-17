@@ -1,0 +1,9 @@
+[
+  {
+    "input": "Reply with exactly ERLANG and nothing else.",
+    "expected": "ERLANG",
+    "metadata": {
+      "case": "exact-output-smoke"
+    }
+  }
+]

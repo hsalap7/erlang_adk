@@ -1,7 +1,40 @@
 -module(erlang_adk).
 
--export([spawn_agent/3, stop_agent/1, prompt/2, delegate/2, delegate/3,
-         delegate/4, sequential/2, parallel/2, parallel/3, loop/4]).
+-export([spawn_agent/3, stop_agent/1, prompt/2, invoke/3,
+         delegate/2, delegate/3,
+         delegate/4, sequential/2, parallel/2, parallel/3, loop/4,
+         compile_workflow/1,
+         start_workflow/2, start_workflow/3,
+         run_workflow/2, run_workflow/3,
+         await_workflow/1, await_workflow/2,
+         cancel_workflow/1, cancel_workflow/2,
+         workflow_status/1, workflow_checkpoint/1,
+         resume_workflow/2, resume_workflow/3,
+         start_workflow_invocation/3,
+         resume_workflow_invocation/3,
+         workflow_invocation_status/2,
+         delete_workflow_invocation/2,
+         run_planning/4, run_planning/5,
+         start_planning/4, start_planning/5,
+         await_planning/1, await_planning/2,
+         cancel_planning/1, cancel_planning/2]).
+
+-export([start_live_session/3,
+         live_send_text/3, live_send_audio/3, live_send_video_frame/3,
+         live_activity_start/2, live_activity_end/2,
+         live_audio_stream_end/2, live_send_tool_response/5,
+         live_subscribe/3, live_subscribe/4,
+         live_ack/3, live_ack/4,
+         live_unsubscribe/2, live_unsubscribe/3,
+         live_status/2, live_status/3, close_live_session/3,
+         start_live_voice_bridge/4, live_voice_frame/2,
+         stop_live_voice_bridge/1]).
+
+-export_type([planning_ref/0]).
+
+-define(PLANNING_REF, adk_planning_ref).
+
+-opaque planning_ref() :: {?PLANNING_REF, pid(), pid(), reference()}.
 
 %% @doc Spawn a new agent.
 spawn_agent(Name, LLMConfig, Tools) ->
@@ -14,6 +47,12 @@ stop_agent(AgentPid) ->
 %% @doc Synchronously prompt an agent.
 prompt(AgentPid, Message) ->
     adk_agent:prompt(AgentPid, Message).
+
+%% @doc Execute one fresh-history invocation in an explicit runtime context.
+%% Reusing an agent PID through this API never reads or mutates prompt/2's
+%% compatibility conversation history.
+invoke(AgentPid, Message, Context) when is_map(Context) ->
+    adk_agent:invoke(AgentPid, Message, Context).
 
 %% @doc Asynchronously delegate a task to an agent (fire and forget).
 delegate(Pid, Message) ->
@@ -39,3 +78,222 @@ parallel(Pids, Prompt, Timeout) ->
 
 loop(WorkerPid, ReviewerPid, Prompt, MaxIterations) ->
     erlang_adk_orchestrator:loop(WorkerPid, ReviewerPid, Prompt, MaxIterations).
+
+%% First-class bounded workflows
+
+%% @doc Validate and compile a declarative workflow specification.
+compile_workflow(Spec) ->
+    adk_workflow:compile(Spec).
+
+%% @doc Start an independently supervised workflow coordinator.
+start_workflow(Compiled, InitialState) ->
+    adk_workflow:start(Compiled, InitialState).
+
+start_workflow(Compiled, InitialState, Opts) ->
+    adk_workflow:start(Compiled, InitialState, Opts).
+
+%% @doc Run a compiled workflow synchronously to one terminal outcome.
+run_workflow(Compiled, InitialState) ->
+    adk_workflow:run(Compiled, InitialState).
+
+run_workflow(Compiled, InitialState, Opts) ->
+    adk_workflow:run(Compiled, InitialState, Opts).
+
+await_workflow(WorkflowRef) ->
+    adk_workflow:await(WorkflowRef).
+
+await_workflow(WorkflowRef, Timeout) ->
+    adk_workflow:await(WorkflowRef, Timeout).
+
+cancel_workflow(WorkflowRef) ->
+    adk_workflow:cancel(WorkflowRef).
+
+cancel_workflow(WorkflowRef, Reason) ->
+    adk_workflow:cancel(WorkflowRef, Reason).
+
+workflow_status(WorkflowRef) ->
+    adk_workflow:status(WorkflowRef).
+
+workflow_checkpoint(WorkflowRef) ->
+    adk_workflow:checkpoint(WorkflowRef).
+
+resume_workflow(Compiled, Checkpoint) ->
+    adk_workflow:resume(Compiled, Checkpoint).
+
+resume_workflow(Compiled, Checkpoint, Opts) ->
+    adk_workflow:resume(Compiled, Checkpoint, Opts).
+
+%% @doc Start a durably checkpointed workflow and return its stable invocation
+%% ID together with the current supervised coordinator pid.
+start_workflow_invocation(Compiled, InitialState, Opts) ->
+    adk_workflow:start_invocation(Compiled, InitialState, Opts).
+
+%% @doc Resume a durable workflow by invocation ID after coordinator or
+%% application failure.
+resume_workflow_invocation(InvocationId, Compiled, Opts) ->
+    adk_workflow:resume_invocation(InvocationId, Compiled, Opts).
+
+workflow_invocation_status(InvocationId, Opts) ->
+    adk_workflow:invocation_status(InvocationId, Opts).
+
+delete_workflow_invocation(InvocationId, Opts) ->
+    adk_workflow:delete_invocation(InvocationId, Opts).
+
+%% Provider-neutral explicit planning
+
+%% @doc Run a trusted planner and executor synchronously with default limits.
+-spec run_planning(adk_planner:descriptor(),
+                   adk_plan_executor:descriptor(), term(), map()) ->
+    {ok, adk_planning_runtime:result()} | {error, term()}.
+run_planning(Planner, Executor, Goal, Context) ->
+    run_planning(Planner, Executor, Goal, Context, #{}).
+
+%% @doc Run explicit planning synchronously with bounded runtime options.
+-spec run_planning(adk_planner:descriptor(),
+                   adk_plan_executor:descriptor(), term(), map(), map()) ->
+    {ok, adk_planning_runtime:result()} | {error, term()}.
+run_planning(Planner, Executor, Goal, Context, Opts) ->
+    adk_planning_runtime:run(Planner, Executor, Goal, Context, Opts).
+
+%% @doc Start owner-bound explicit planning with default limits.
+-spec start_planning(adk_planner:descriptor(),
+                     adk_plan_executor:descriptor(), term(), map()) ->
+    {ok, planning_ref()} | {error, term()}.
+start_planning(Planner, Executor, Goal, Context) ->
+    start_planning(Planner, Executor, Goal, Context, #{}).
+
+%% @doc Start owner-bound explicit planning with bounded runtime options.
+-spec start_planning(adk_planner:descriptor(),
+                     adk_plan_executor:descriptor(), term(), map(), map()) ->
+    {ok, planning_ref()} | {error, term()}.
+start_planning(Planner, Executor, Goal, Context, Opts) ->
+    Owner = self(),
+    case adk_planning_runtime:start(
+           Planner, Executor, Goal, Context, Opts) of
+        {ok, RuntimePid, RunRef} ->
+            {ok, {?PLANNING_REF, Owner, RuntimePid, RunRef}};
+        {error, _} = Error -> Error
+    end.
+
+%% @doc Await a planning result without an additional caller timeout.
+-spec await_planning(planning_ref()) ->
+    {ok, adk_planning_runtime:result()} | {error, term()}.
+await_planning(PlanningRef) ->
+    await_planning(PlanningRef, infinity).
+
+%% @doc Await a planning result for at most `Timeout' milliseconds.
+-spec await_planning(planning_ref(), timeout()) ->
+    {ok, adk_planning_runtime:result()} | {error, term()}.
+await_planning({?PLANNING_REF, Owner, RuntimePid, RunRef}, Timeout)
+  when Owner =:= self(), is_pid(RuntimePid), is_reference(RunRef) ->
+    case adk_planning_runtime:validate_ref(RuntimePid, RunRef) of
+        ok ->
+            adk_planning_runtime:await(RuntimePid, RunRef, Timeout);
+        {error, {planning_process_down, _}} ->
+            %% A fast runtime may have delivered its terminal result before
+            %% this validation round trip. `await/3' consumes that exact
+            %% owner/correlation message or reports the process failure.
+            adk_planning_runtime:await(RuntimePid, RunRef, Timeout);
+        {error, _} = Error -> Error
+    end;
+await_planning({?PLANNING_REF, Owner, RuntimePid, RunRef}, _Timeout)
+  when is_pid(Owner), is_pid(RuntimePid), is_reference(RunRef) ->
+    {error, not_planning_owner};
+await_planning(_PlanningRef, _Timeout) ->
+    {error, invalid_planning_ref}.
+
+%% @doc Cancel planning with the default `user_cancelled' reason.
+-spec cancel_planning(planning_ref()) -> ok | {error, term()}.
+cancel_planning(PlanningRef) ->
+    cancel_planning(PlanningRef, user_cancelled).
+
+%% @doc Cancel planning with an application-supplied reason.
+-spec cancel_planning(planning_ref(), term()) -> ok | {error, term()}.
+cancel_planning({?PLANNING_REF, Owner, RuntimePid, RunRef}, Reason)
+  when Owner =:= self(), is_pid(RuntimePid), is_reference(RunRef) ->
+    adk_planning_runtime:cancel(RuntimePid, RunRef, Reason);
+cancel_planning({?PLANNING_REF, Owner, RuntimePid, RunRef}, _Reason)
+  when is_pid(Owner), is_pid(RuntimePid), is_reference(RunRef) ->
+    {error, not_planning_owner};
+cancel_planning(_PlanningRef, _Reason) ->
+    {error, invalid_planning_ref}.
+
+%% Server-owned Gemini Live sessions
+
+%% @doc Start one independently supervised bidirectional Live session.
+%% `Principal' is checked on every subsequent operation and is never returned
+%% in status/events. Provider credentials stay inside the session transport.
+start_live_session(SessionId, Principal, Config) ->
+    adk_live_session_sup:start_session(SessionId, Principal, Config).
+
+live_send_text(Session, Principal, Text) ->
+    adk_live_session:send_text(Session, Principal, Text).
+
+live_send_audio(Session, Principal, Media) ->
+    adk_live_session:send_audio(Session, Principal, Media).
+
+live_send_video_frame(Session, Principal, Media) ->
+    adk_live_session:send_video_frame(Session, Principal, Media).
+
+live_activity_start(Session, Principal) ->
+    adk_live_session:activity_start(Session, Principal).
+
+live_activity_end(Session, Principal) ->
+    adk_live_session:activity_end(Session, Principal).
+
+live_audio_stream_end(Session, Principal) ->
+    adk_live_session:audio_stream_end(Session, Principal).
+
+live_send_tool_response(Session, Principal, CallId, ToolName, Response) ->
+    adk_live_session:send_tool_response(
+      Session, Principal, CallId, ToolName, Response).
+
+live_subscribe(Session, Principal, Credit) ->
+    adk_live_session:subscribe(Session, Principal, Credit).
+
+live_subscribe(Session, Principal, Subscriber, Credit) ->
+    adk_live_session:subscribe(Session, Principal, Subscriber, Credit).
+
+live_ack(Session, Principal, Sequence) ->
+    adk_live_session:ack(Session, Principal, Sequence).
+
+live_ack(Session, Principal, Subscriber, Sequence) ->
+    adk_live_session:ack(Session, Principal, Subscriber, Sequence).
+
+live_unsubscribe(Session, Principal) ->
+    adk_live_session:unsubscribe(Session, Principal).
+
+live_unsubscribe(Session, Principal, Subscriber) ->
+    adk_live_session:unsubscribe(Session, Principal, Subscriber).
+
+live_status(Session, Principal) ->
+    adk_live_session:status(Session, Principal).
+
+live_status(Session, Principal, TimeoutMs) ->
+    adk_live_session:status(Session, Principal, TimeoutMs).
+
+close_live_session(Session, Principal, Reason) ->
+    adk_live_session:close(Session, Principal, Reason).
+
+%% @doc Start an owner-bound binary bridge for a server-owned Live session.
+%%
+%% The owner receives only strict binary messages shaped as
+%% `{adk_live_voice_frame, BridgePid, Frame}'.  Forwarded Live event credit is
+%% released only when the owner submits the exact v1 ACK frame through
+%% `live_voice_frame/2'.  The Live session must already be active.  The bridge
+%% terminates when `OwnerPid' terminates.  A provider reconnect invalidates and
+%% terminates the bridge independently of subscriber event credit; an input
+%% racing that transition is rejected by the same continuity boundary.  An
+%% adapter must detach capture and create a fresh bridge only after the session
+%% resumes.
+start_live_voice_bridge(Session, Principal, OwnerPid, Opts) ->
+    adk_live_voice_bridge:start(Session, Principal, OwnerPid, Opts).
+
+%% @doc Submit one complete version-1 client binary frame synchronously.
+%% Synchronous calls preserve existing Live ingress backpressure.
+live_voice_frame(BridgePid, Frame) ->
+    adk_live_voice_bridge:frame(BridgePid, Frame).
+
+%% @doc Detach and stop an owner-bound Live voice bridge.
+stop_live_voice_bridge(BridgePid) ->
+    adk_live_voice_bridge:stop(BridgePid).

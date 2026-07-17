@@ -1,14 +1,23 @@
 -module(readme_audit_callback).
 -behaviour(adk_callbacks).
 
--export([before_model/3, after_model/2, before_tool/3, after_tool/4]).
+-export([set_observer/1, clear_observer/0,
+         before_model/3, after_model/2, before_tool/3, after_tool/4]).
 
-before_model(Config, _Memory, Tools) ->
-    notify(Config, {before_model, length(Tools)}),
+set_observer(Pid) when is_pid(Pid) ->
+    persistent_term:put({?MODULE, observer}, Pid),
     ok.
 
-after_model(Config, ProviderResult) ->
-    notify(Config, {after_model, ProviderResult}),
+clear_observer() ->
+    persistent_term:erase({?MODULE, observer}),
+    ok.
+
+before_model(_Config, _Memory, Tools) ->
+    notify({before_model, length(Tools)}),
+    ok.
+
+after_model(_Config, ProviderResult) ->
+    notify({after_model, ProviderResult}),
     ok.
 
 before_tool(_ToolName, _Args, _Context) ->
@@ -17,8 +26,8 @@ before_tool(_ToolName, _Args, _Context) ->
 after_tool(_ToolName, _Args, _Context, _ToolResult) ->
     ok.
 
-notify(Config, Message) ->
-    case maps:get(callback_pid, Config, undefined) of
+notify(Message) ->
+    case persistent_term:get({?MODULE, observer}, undefined) of
         Pid when is_pid(Pid) -> Pid ! Message;
         _ -> ok
     end.

@@ -1,0 +1,129 @@
+name: Release validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  erlang-core:
+    name: Erlang core (OTP 27)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Erlang/OTP
+        uses: erlef/setup-beam@0f75c29430f34bb5af4cce5e3b7f6a8860fca236 # v1
+        with:
+          otp-version: 27.3.4.14
+
+      - name: Run the deterministic clean gate
+        run: ./rebar3 do clean, compile, eunit, ct, dialyzer
+
+      - name: Enforce aggregate Erlang coverage
+        run: ./scripts/coverage.sh
+
+      - name: Check cross-references
+        run: ./rebar3 xref
+
+      - name: Compile checked examples with warnings as errors
+        run: |
+          erlc -Werror -pa _build/default/lib/erlang_adk/ebin -o /tmp \
+            examples/readme_weather_tool.erl \
+            examples/readme_live_weather_executor.erl \
+            examples/readme_stateful_counter_plugin.erl
+
+      - name: Build and smoke-test the CLI
+        run: |
+          ./rebar3 escriptize
+          _build/default/bin/adk doctor
+          _build/default/bin/adk config validate examples/agent.json
+
+      - name: Generate ExDoc documentation
+        run: |
+          output="$(./rebar3 ex_doc 2>&1)"
+          printf '%s\n' "$output"
+          if grep -Eq '(^|[[:space:]])warning:' <<<"$output"; then
+            exit 1
+          fi
+
+      - name: Build and verify the Hex package without publishing
+        run: |
+          ./rebar3 hex build
+          ./scripts/verify_hex_package.sh
+
+  phoenix-companion:
+    name: Phoenix companion (OTP 27 / Elixir 1.19 / Node 24)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: examples/phoenix_adk_ui
+    env:
+      OIDC_ISSUER: https://issuer.example.invalid
+      OIDC_CLIENT_ID: erlang-adk-ui-ci
+      OIDC_REDIRECT_URI: https://ui.example.invalid/auth/callback
+      OIDC_PUBLIC_CLIENT: "true"
+      PHX_HOST: ui.example.invalid
+      PHX_BEHIND_HTTPS_PROXY: "true"
+      SECRET_KEY_BASE: ci-only-placeholder-not-a-secret-0123456789abcdef0123456789abcdef0123456789abcdef
+      MIX_REBAR3: ${{ github.workspace }}/rebar3
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Erlang/OTP and Elixir
+        uses: erlef/setup-beam@0f75c29430f34bb5af4cce5e3b7f6a8860fca236 # v1
+        with:
+          otp-version: 27.3.4.14
+          elixir-version: 1.19.5
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.3.0
+          package-manager-cache: false
+
+      - name: Fetch dependencies
+        run: |
+          mix deps.get
+          mix deps --check-locked
+
+      - name: Install asset tooling
+        run: mix assets.setup
+
+      - name: Run the Phoenix precommit gate
+        run: mix precommit
+
+      - name: Enforce the exact documented dependency exception
+        run: elixir ../../scripts/verify_phoenix_hex_audit.exs
+
+      - name: Build production assets from a clean production build
+        run: |
+          MIX_ENV=prod mix clean
+          MIX_ENV=prod mix assets.deploy
+
+      - name: Assemble the production release
+        run: MIX_ENV=prod mix release
+
+      - name: Smoke-test trusted-proxy and direct-TLS releases
+        run: |
+          ../../scripts/smoke_phoenix_release.sh proxy 4101
+          ../../scripts/smoke_phoenix_release.sh tls 4443
+
+      # The advisory wrapper succeeds only for the exact two documented Cowlib
+      # findings. New findings, a clean audit, or any stale exception fail the
+      # job and force a dependency/security-document review.
+      # Paid Gemini REST and Live suites are also intentionally absent: pull
+      # requests never receive provider credentials or incur provider charges.

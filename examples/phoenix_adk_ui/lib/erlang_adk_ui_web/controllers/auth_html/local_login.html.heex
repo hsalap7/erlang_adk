@@ -1,0 +1,17 @@
+<main class="auth-shell">
+  <section class="panel stack auth-panel" id="local-login">
+    <div>
+      <p class="eyebrow">Development mode</p>
+      <h1>Open the Erlang ADK console</h1>
+      <p class="muted">
+        This fixed local identity is available only on the loopback development server.
+        Production continues to require OIDC.
+      </p>
+    </div>
+
+    <form action={~p"/auth/local"} method="post">
+      <input type="hidden" name="_csrf_token" value={Plug.CSRFProtection.get_csrf_token()} />
+      <button type="submit">Continue as local developer</button>
+    </form>
+  </section>
+</main>
