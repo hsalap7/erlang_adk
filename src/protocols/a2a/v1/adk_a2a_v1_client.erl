@@ -447,24 +447,6 @@ resolver_result(Host, Resolver) ->
         _:_ -> error
     end.
 
--ifdef(TEST).
-normalize_resolved_addresses(Addresses) when is_list(Addresses) ->
-    bounded_addresses(Addresses, ?MAX_DNS_ADDRESSES, []);
-normalize_resolved_addresses(_Addresses) ->
-    error.
-
-bounded_addresses([], _Remaining, Acc) ->
-    {ok, lists:usort(Acc)};
-bounded_addresses(_Addresses, 0, _Acc) ->
-    error;
-bounded_addresses([Address | Rest], Remaining, Acc) ->
-    case valid_ip_address(Address) of
-        true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
-        false -> error
-    end;
-bounded_addresses(_Improper, _Remaining, _Acc) ->
-    error.
--else.
 normalize_resolved_addresses(Addresses) ->
     bounded_addresses(Addresses, ?MAX_DNS_ADDRESSES, []).
 
@@ -477,7 +459,6 @@ bounded_addresses([Address | Rest], Remaining, Acc) ->
         true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
         false -> error
     end.
--endif.
 
 resolved_addresses(Host) ->
     HostString = binary_to_list(Host),

@@ -14,11 +14,12 @@ function sine(sampleRate, frequency, seconds = 1) {
   return result
 }
 
-function stream(sourceSampleRate, samples, blockSizes) {
+function stream(sourceSampleRate, samples, blockSizes, targetSampleRate = TARGET_RATE) {
+  const chunkSamples = targetSampleRate / 50
   const downsampler = new StreamingPcmDownsampler({
     sourceSampleRate,
-    targetSampleRate: TARGET_RATE,
-    chunkSamples: CHUNK_SAMPLES,
+    targetSampleRate,
+    chunkSamples,
   })
   const chunks = []
   let offset = 0
@@ -32,8 +33,8 @@ function stream(sourceSampleRate, samples, blockSizes) {
     blockIndex += 1
   }
 
-  const output = new Float32Array(chunks.length * CHUNK_SAMPLES)
-  chunks.forEach((chunk, index) => output.set(chunk, index * CHUNK_SAMPLES))
+  const output = new Float32Array(chunks.length * chunkSamples)
+  chunks.forEach((chunk, index) => output.set(chunk, index * chunkSamples))
   return {chunks, output}
 }
 
@@ -65,6 +66,36 @@ test("fractional resampling is identical across arbitrary render-block boundarie
   for (let index = 0; index < contiguous.length; index += 1) {
     assert.equal(fragmented[index], contiguous[index], `sample ${index}`)
   }
+})
+
+test("16 kHz device input is safely upsampled into negotiated 24 kHz chunks", () => {
+  const sourceSampleRate = 16_000
+  const targetSampleRate = 24_000
+  // One look-ahead input sample lets the streaming interpolator complete the
+  // final 20 ms chunk without inventing a terminal sample.
+  const input = new Float32Array(sourceSampleRate + 1)
+  for (let index = 0; index < input.length; index += 1) {
+    input[index] = Math.sin((2 * Math.PI * 1_000 * index) / sourceSampleRate)
+  }
+
+  const contiguous = stream(
+    sourceSampleRate,
+    input,
+    [input.length],
+    targetSampleRate,
+  )
+  const fragmented = stream(
+    sourceSampleRate,
+    input,
+    [1, 127, 19, 256, 3, 64],
+    targetSampleRate,
+  )
+
+  assert.equal(contiguous.chunks.length, 50)
+  assert.equal(contiguous.output.length, targetSampleRate)
+  contiguous.chunks.forEach((chunk) => assert.equal(chunk.length, 480))
+  assert.deepEqual(fragmented.output, contiguous.output)
+  assert.ok(rms(contiguous.output, 2_000) > 0.5)
 })
 
 test("the anti-alias filter strongly attenuates content above the 16 kHz Nyquist limit", () => {

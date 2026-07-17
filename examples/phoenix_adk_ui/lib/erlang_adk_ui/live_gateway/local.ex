@@ -88,6 +88,7 @@ defmodule ErlangAdkUi.LiveGateway.Local do
          {:ok, session, status} <- find_session_with_status(session_id, principal),
          :ok <- require_active_voice_session(status),
          :ok <- require_automatic_voice(status),
+         {:ok, input_sample_rate} <- voice_input_sample_rate(status),
          {:ok, bridge} when is_pid(bridge) <-
            safe_core_call(:start_live_voice_bridge, [
              session,
@@ -96,7 +97,13 @@ defmodule ErlangAdkUi.LiveGateway.Local do
              checked_options
            ]) do
       voice_ref = {__MODULE__, :voice, bridge, owner, principal, make_ref()}
-      {:ok, %{voice_ref: voice_ref, bridge: bridge}}
+
+      {:ok,
+       %{
+         voice_ref: voice_ref,
+         bridge: bridge,
+         input_format: %{sample_rate: input_sample_rate, channels: 1, format: :pcm_s16le}
+       }}
     else
       {:ok, _invalid_bridge} -> {:error, :service_unavailable}
       {:error, _reason} = error -> error
@@ -408,7 +415,9 @@ defmodule ErlangAdkUi.LiveGateway.Local do
         {:error, :voice_mode_unavailable} -> "unavailable"
       end
 
-    Map.put(public, :voice_mode, mode)
+    public
+    |> Map.put(:voice_mode, mode)
+    |> put_public_input_sample_rate(status)
   end
 
   defp public_subscription(subscription, attachment_ref, attachment_token)
@@ -511,6 +520,22 @@ defmodule ErlangAdkUi.LiveGateway.Local do
       {:ok, :automatic} -> :ok
       {:ok, :manual} -> {:error, :automatic_activity_detection_required}
       {:error, :voice_mode_unavailable} = error -> error
+    end
+  end
+
+  defp voice_input_sample_rate(status) when is_map(status) do
+    case Map.get(status, :input_audio_sample_rate) do
+      rate when rate in [16_000, 24_000] -> {:ok, rate}
+      _other -> {:error, :voice_input_format_unavailable}
+    end
+  end
+
+  defp voice_input_sample_rate(_status), do: {:error, :voice_input_format_unavailable}
+
+  defp put_public_input_sample_rate(public, status) do
+    case voice_input_sample_rate(status) do
+      {:ok, rate} -> Map.put(public, :input_sample_rate, rate)
+      {:error, :voice_input_format_unavailable} -> public
     end
   end
 

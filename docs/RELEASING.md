@@ -3,7 +3,7 @@
 This is the maintainer checklist for preparing, approving, tagging, and
 publishing a release. The commands below describe actions to take only after
 their prerequisites and approvals are satisfied. This document does not claim
-that `v0.7.0` has been tagged, pushed, or published.
+that `v0.8.0` has been tagged, pushed, or published.
 
 ## 1. Establish the release candidate
 
@@ -12,9 +12,15 @@ that `v0.7.0` has been tagged, pushed, or published.
 - [ ] Confirm `src/erlang_adk.app.src`, the CLI/doctor output, the README, and
       `examples/phoenix_adk_ui/mix.exs` all use the intended version.
 - [ ] Confirm `CHANGELOG.md`, the current version contract,
-      `FEATURE_PARITY.md`, `README_EXAMPLE_COVERAGE.md`, `TESTING.md`, and
-      `UPGRADING.md` agree with the implementation.
+      `FEATURE_PARITY.md`, `PROVIDER_PROFILES.md`,
+      `README_EXAMPLE_COVERAGE.md`, `TESTING.md`, and `UPGRADING.md` agree
+      with the implementation.
 - [ ] Preserve both lock files and the Apache-2.0 license.
+- [ ] Validate the release's model `provider_profiles` with
+      `adk_provider_registry:profiles/0`; review binary aliases, concrete
+      models, endpoint presets/HTTPS hosts, locked options, and credential
+      source descriptors. Do not place a literal production credential in
+      version-controlled configuration.
 - [ ] Do not include `_build`, `Mnesia.*`, generated `doc`, crash dumps,
       Phoenix `_build`/`deps`, local certificates/keys, provider responses, or
       secrets.
@@ -67,15 +73,30 @@ _build/default/bin/adk config validate examples/agent.json
 ./scripts/verify_hex_package.sh
 ```
 
-For 0.7.0, compare against the evidence in [`TESTING.md`](TESTING.md): 1,176
-EUnit tests, six deterministic Common Test cases, 73.88% aggregate Erlang line
-coverage against the enforced 73% floor, warning-free Dialyzer over 210 files,
-29 README tests, four workflow tests, 193 focused v0.7 tests, and both
-1,000-operation stress suites.
+The 1,176 EUnit, six deterministic Common Test, 73.88% coverage, 210-file
+Dialyzer, 29 README, four workflow, and 193 focused totals in
+[`TESTING.md`](TESTING.md) are historical v0.7 evidence. The recorded
+2026-07-17 v0.8 gate passed 1,414 EUnit tests, six deterministic Common Test
+cases, Dialyzer over 235 source modules with no warnings, 74.17% line coverage, 244/244
+focused provider/profile/Realtime tests, 30 README plus four workflow tests,
+and warning-as-error compilation of all three example modules. Common Test
+intentionally skipped 22 paid cases in the deterministic command. Do not
+approve a later candidate by copying either release's numbers or by running
+only the focused modules.
+
+The seven-module post-audit repair regression set passed 67/67, covering
+contiguous in-flight multi-frame priority ordering, Anthropic's minimum
+`max_tokens` value of one, and the 64 KiB synchronous/streaming Gun
+header/trailer cap.
+
+The same v0.8 record includes passing xref, escript, doctor 0.8.0, checked
+configuration validation, ExDoc, Hex 0.8.0 build, and extracted-package
+compilation verification.
 
 Inspect generated documentation and the Hex tarball/file list. Confirm the
 package contains core source, public headers, license, README, changelog,
-guides, root examples, and the intentionally packaged Phoenix companion source;
+the provider-profile/version guides, root examples, and the intentionally
+packaged Phoenix companion source;
 it must exclude the test source tree, build/dependency caches, local data,
 generated Phoenix output, credentials, and crash dumps. The verifier enforces
 that boundary and also compiles from a clean extracted archive; inspect the
@@ -100,11 +121,13 @@ elixir ../../scripts/verify_phoenix_hex_audit.exs
 ../../scripts/smoke_phoenix_release.sh tls 4443
 ```
 
-Expected deterministic evidence is 101 ExUnit tests, 31 browser/audio tests,
-format and warning checks, production assets, and release assembly. Also boot
-the assembled release on loopback in the test-only trusted-proxy and verified
-direct-TLS configurations, require HTTP 200 from `/health`, and stop it
-cleanly. Follow the exact deployment setup in the companion README.
+The 101 ExUnit and 31 browser/audio test totals are historical v0.7 evidence.
+The recorded 2026-07-17 v0.8 `mix precommit` gate passed 103 ExUnit and 40 Node
+tests, including negotiated 16/24 kHz voice assertions. Production assets and
+release assembly passed, and the assembled release passed both the test-only
+trusted-proxy and verified direct-TLS loopback smokes. Each smoke required HTTP
+200 from `/health` and clean shutdown. Follow the exact deployment setup in
+the companion README.
 
 `mix hex.audit` currently returns non-zero for EEF-CVE-2026-43969 and
 EEF-CVE-2026-43966 in Cowlib 2.18.0. This is a known release exception, not a
@@ -139,10 +162,25 @@ The REST suite must use `gemini-3.1-flash-lite`; the Live suite must use
 provider reasons without model content or secrets.
 
 The final recorded 0.7 evidence is REST 15/17 with Search and context cache
-failing on bounded HTTP 429 retries, and Live 5/5. A release owner may rerun
-REST with sufficient quota to seek 17/17 or explicitly accept the two quota
-results. A case that was skipped or rejected by the provider must never be
-reported as passing implementation evidence.
+failing on bounded HTTP 429 retries, and Live 5/5. That evidence is historical
+and does not replace a fresh provider run for a later candidate. A release
+owner may explicitly accept a provider/quota result, but a skipped or rejected
+case must never be reported as passing implementation evidence.
+
+The 2026-07-17 v0.8 REST attempt reached Google, but HTTP 401
+`UNAUTHENTICATED` / `ACCESS_TOKEN_TYPE_UNSUPPORTED` rejected the configured
+credential shape. This is external credential evidence, not a pass, skip, or
+product regression. No v0.8 paid Gemini Live pass is recorded; deterministic
+Live broker/transport coverage must not be described as remote-provider
+success.
+
+There is currently no first-party paid Common Test suite for OpenAI Responses,
+OpenAI Realtime, Anthropic Messages, or an arbitrary compatible endpoint. The
+release record must describe their deterministic injected-transport/codec
+evidence accurately and must not infer paid-provider success from configured
+environment variables. If the release owner runs a manual smoke, record it as
+separate provider evidence without prompts, outputs, or credentials. Each
+compatible endpoint is a distinct target, not a blanket certification.
 
 ## 6. Approve the release record
 
@@ -176,9 +214,9 @@ signed tag where maintainer signing is configured; otherwise use an annotated
 tag and preserve the external approval record:
 
 ```bash
-git tag -s v0.7.0 -m "Erlang ADK 0.7.0"
+git tag -s v0.8.0 -m "Erlang ADK 0.8.0"
 # or, when signing is unavailable:
-git tag -a v0.7.0 -m "Erlang ADK 0.7.0"
+git tag -a v0.8.0 -m "Erlang ADK 0.8.0"
 ```
 
 Verify the tag points to the approved commit, then push the branch/tag through
@@ -186,9 +224,9 @@ the repository's protected release process. Publication is a separate
 credentialed action:
 
 ```bash
-git show --no-patch --decorate v0.7.0
-git push origin version_0.7.0
-git push origin v0.7.0
+git show --no-patch --decorate v0.8.0
+git push origin version_0.8.0
+git push origin v0.8.0
 ./rebar3 hex publish
 ```
 

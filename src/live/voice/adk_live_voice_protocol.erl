@@ -7,15 +7,17 @@
 %% samples inside the payload are signed 16-bit little-endian.
 -module(adk_live_voice_protocol).
 
--export([decode_client/2, encode_event/2, lifecycle_code/1]).
+-export([decode_client/2, encode_input_config/1,
+         encode_event/2, lifecycle_code/1]).
 
 -define(VERSION, 1).
 -define(MAX_AUDIO_BYTES, 1048576).
 -define(MAX_FRAME_BYTES, 67108864).
 -define(MAX_U64, 16#ffffffffffffffff).
+-define(INPUT_FORMAT_PCM_S16LE, 1).
 
 -type client_action() ::
-    {audio, pos_integer(), binary()} |
+    {audio, pos_integer(), 16000 | 24000, binary()} |
     audio_stream_end |
     {ack, pos_integer()} |
     activity_start |
@@ -26,6 +28,7 @@
     live_voice_audio_frame_too_large |
     invalid_live_voice_frame_limit.
 -type encode_error() ::
+    invalid_live_voice_config |
     invalid_live_voice_event |
     invalid_live_voice_frame_limit |
     live_voice_output_frame_too_large.
@@ -33,7 +36,7 @@
 -export_type([client_action/0, decode_error/0, encode_error/0]).
 
 %% Client -> server v1 frames:
-%%   audio       <<1, 1, ClientAudioSeq:64/big, 16000:32/big, 1, PCM/binary>>
+%%   audio       <<1, 1, ClientAudioSeq:64/big, Rate:32/big, 1, PCM/binary>>
 %%   stream end  <<1, 2>>
 %%   event ack   <<1, 3, LiveEventSeq:64/big>>
 %%   VAD start   <<1, 4>>
@@ -57,9 +60,11 @@ decode_client_frame(
     case byte_size(Pcm) > MaxAudioBytes of
         true ->
             {error, live_voice_audio_frame_too_large};
-        false when Sequence > 0, Rate =:= 16000, Channels =:= 1,
+        false when Sequence > 0,
+                   (Rate =:= 16000 orelse Rate =:= 24000),
+                   Channels =:= 1,
                    byte_size(Pcm) > 0, byte_size(Pcm) rem 2 =:= 0 ->
-            {ok, {audio, Sequence, Pcm}};
+            {ok, {audio, Sequence, Rate, Pcm}};
         false ->
             {error, invalid_live_voice_audio}
     end;
@@ -75,6 +80,23 @@ decode_client_frame(<<?VERSION, 5>>, _MaxAudioBytes) ->
     {ok, activity_end};
 decode_client_frame(_Frame, _MaxAudioBytes) ->
     {error, invalid_live_voice_frame}.
+
+%% Server -> client input-format negotiation frame:
+%%   <<1, 128, Rate:32/big, Channels:8, Format:8>>
+%%
+%% The frame is connection configuration rather than a Live event.  It has no
+%% event sequence and consumes no subscriber credit, so clients must not ACK
+%% it.  Format code 1 is signed 16-bit little-endian PCM.
+-spec encode_input_config(map()) ->
+    {ok, binary()} | {error, invalid_live_voice_config}.
+encode_input_config(#{sample_rate := Rate, channels := 1,
+                      format := pcm_s16le} = Config)
+  when map_size(Config) =:= 3,
+       (Rate =:= 16000 orelse Rate =:= 24000) ->
+    {ok, <<?VERSION, 128, Rate:32/unsigned-big, 1,
+           ?INPUT_FORMAT_PCM_S16LE>>};
+encode_input_config(_Config) ->
+    {error, invalid_live_voice_config}.
 
 %% Server -> client v1 frames:
 %%   audio         <<1, 129, EventSeq:64/big, Rate:32/big, Channels:8, PCM>>

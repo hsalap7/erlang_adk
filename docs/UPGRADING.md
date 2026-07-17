@@ -1,7 +1,7 @@
 # Upgrading Erlang ADK
 
-Version 0.7.0 is cumulative. This guide highlights behavior and deployment
-changes introduced by the 0.3-0.7 delivery milestones; it is not a substitute
+Version 0.8.0 is cumulative. This guide highlights behavior and deployment
+changes introduced by the 0.3-0.8 delivery milestones; it is not a substitute
 for the exact contracts in the version documents.
 
 ## Before upgrading
@@ -21,7 +21,9 @@ for the exact contracts in the version documents.
 There is no general automatic schema-migration promise for arbitrary
 application session tables or custom adapters. Node-local web sessions, run
 lookup, A2A tasks, and Live discovery also do not gain transparent horizontal
-failover in 0.7. Stage any persistent-data or multi-node change explicitly.
+failover in 0.8. Model profiles are also node-local application configuration,
+not a distributed registry. Stage any persistent-data, profile rollout, or
+multi-node change explicitly.
 
 ## Moving to 0.3.0: supervised runtime foundation
 
@@ -187,6 +189,126 @@ A REST model is rejected by the Live provider. Update automation to use
   on the checked AudioWorklet/resampler, continuous bounded playback, exact
   ACK timing, interruption cleanup, styles, and packaged favicon.
 
+## 0.7.0 to 0.8.0: model profiles, vendors, and Realtime
+
+### Move public model selection to binary profiles
+
+Direct module configuration remains compatible for trusted Erlang code:
+
+```erlang
+#{provider => adk_llm_gemini,
+  model => <<"gemini-3.1-flash-lite">>}
+```
+
+For browser-, tenant-, file-, or API-selected configuration, define an
+operator-owned `provider_profiles` entry and expose only aliases:
+
+```erlang
+ok = application:set_env(
+    erlang_adk, provider_profiles,
+    #{<<"openai-prod">> =>
+          #{request_adapter => adk_llm_openai,
+            endpoint => openai,
+            models => #{<<"fast">> => <<"gpt-5-mini">>},
+            credential => {env, "OPENAI_API_KEY"},
+            request_options => #{store => false}}}),
+
+PublicConfig = #{provider => <<"openai-prod">>,
+                 model => <<"fast">>,
+                 temperature => 0.2}.
+```
+
+Do not translate a public provider string to an atom. Do not merge public maps
+over profiles. Profile callers cannot replace concrete model IDs, endpoints,
+credentials, arbitrary headers, API versions, auth/storage/billing settings,
+transports, or Live audio rates. Review the full schema in
+[`PROVIDER_PROFILES.md`](PROVIDER_PROFILES.md).
+
+Validate the complete registry at startup:
+
+```erlang
+{ok, _CheckedProfiles} = adk_provider_registry:profiles().
+```
+
+Profile selection and credential lookup are generation-consistent. If a
+profile changes between those operations, the request fails with
+`provider_profile_changed`. Deploy profile authority and its credential source
+as one change rather than relying on a partially updated in-memory map.
+
+### Choose the protocol-specific request adapter
+
+- Use `adk_llm_openai` for the native OpenAI Responses API, not Chat
+  Completions.
+- Use `adk_llm_anthropic` for the native Anthropic Messages API and keep
+  `anthropic_version` operator-owned. `max_tokens` must be at least one.
+- Use `adk_llm_compatible` only for the documented Chat Completions subset at
+  a trusted structured HTTPS endpoint. Lock `auth_scheme` to `bearer`,
+  `x_api_key`, or `none`, and set `response_format => unsupported` in trusted
+  configuration when the endpoint does not implement structured output.
+- Continue using `adk_llm_gemini` for Gemini REST GenerateContent/SSE.
+
+OpenAI and Anthropic direct legacy adapters read their conventional ambient
+key only at the exact official base URL. Custom origins require an explicit
+profile credential. The compatible adapter never guesses that a process-wide
+key belongs to a custom origin. If an older compatible integration relied on
+`OPENAI_COMPATIBLE_API_KEY` without an explicit key/profile, move it to
+`credential => {env, "OPENAI_COMPATIBLE_API_KEY"}` in a trusted profile.
+
+Both synchronous and streaming model Gun paths now reject any aggregate
+response-header or trailer block above 64 KiB. Custom transports should apply
+an equivalent bound before admitting provider metadata.
+
+Provider-specific tool, content, finish-reason, structured-output, and stream
+semantics remain distinct. Test the exact configured model/endpoint; a working
+OpenAI profile is not evidence for Anthropic or an arbitrary compatible
+vendor, and deterministic codec fixtures are not paid-provider evidence.
+
+### Add OpenAI Realtime without changing Live ownership
+
+OpenAI Realtime uses the existing explicit server-owned Live lifecycle:
+
+```erlang
+#{provider => <<"openai-live">>,
+  provider_config =>
+      #{model => <<"voice">>,
+        response_modalities => [audio],
+        automatic_activity_detection => true}}
+```
+
+The matching trusted profile supplies `live_adapter => adk_live_openai`, the
+`openai` endpoint preset, concrete Realtime model ID, and credential. Profile
+callers cannot inject a WebSocket transport or origin. The bundled transport
+is fixed to verified TLS at the official OpenAI origin.
+
+One logical action may now produce multiple ordered provider frames. Admission
+is atomic for that frame batch, so concurrent callers cannot interleave the
+item-creation and response-request halves. Once transmission begins, even a
+later priority action waits until that in-flight frame batch is complete. If a
+custom Live provider is updated to use this contract, return `{ok, Frame}` or
+`{ok, [Frame, ...]}`; return `ignored` only for a deliberate provider no-op.
+Existing single-frame providers remain compatible.
+
+OpenAI manual turn detection commits on `activity_end`. `audio_stream_end` is
+a no-op because the Phoenix/browser lifecycle emits it after capture stops;
+committing there as well would request a duplicate empty response. In server
+VAD mode the provider owns commits.
+
+### Negotiate voice input rate
+
+Do not hard-code 16 kHz in a generic browser/voice adapter. Live status now
+reports a trusted `input_audio_sample_rate`:
+
+- Gemini Live: 16 kHz PCM s16le mono input;
+- OpenAI Realtime: 24 kHz PCM s16le mono input; and
+- both bundled paths currently expose native 24 kHz PCM audio output events.
+
+The owner-bound bridge sends an unsequenced server configuration frame before
+accepting client audio. Update custom socket clients to wait for that frame,
+initialize their resampler with its rate, and never ACK it. Sequence/credit
+ACKs still apply only to subsequent sequenced provider events. The rate is
+derived from trusted provider capabilities inside the Live session; remove any
+caller-supplied sample-rate override.
+
 ## Post-upgrade validation
 
 Run every gate in [`TESTING.md`](TESTING.md) that applies to the deployment.
@@ -194,6 +316,15 @@ Specifically verify:
 
 - no cross-user/session/run/Live visibility;
 - exact OIDC callbacks, audiences, algorithms, scopes, and session rotation;
+- binary profile/model selection, generation changes, missing credentials,
+  and caller authority-override rejection;
+- provider-native content, tools, structured output, streaming, and sanitized
+  failure behavior for every configured endpoint;
+- Anthropic `max_tokens >= 1` and 64 KiB synchronous/streaming Gun
+  header/trailer rejection;
+- OpenAI Realtime 24 kHz and Gemini Live 16 kHz input negotiation, manual/VAD
+  turn completion, contiguous multi-frame priority ordering, and interruption
+  cleanup;
 - provider model/config selection and explicit paid-test flags;
 - continuation and Live reconnect behavior under process/network loss;
 - browser microphone permission cancellation, audio backpressure, and

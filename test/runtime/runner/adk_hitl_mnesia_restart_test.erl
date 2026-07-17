@@ -8,6 +8,30 @@
 -define(CALL_ID, <<"restart-approval-call">>).
 
 paused_continuation_survives_mnesia_restart_test() ->
+    AdkWasRunning = application_running(erlang_adk),
+    MnesiaWasRunning = application_running(mnesia),
+    SavedDir = application:get_env(mnesia, dir),
+    TempDir = filename:join(
+                os:getenv("TMPDIR", "/tmp"),
+                "erlang_adk_hitl_restart_" ++
+                    integer_to_list(
+                      erlang:unique_integer([positive, monotonic]))),
+    stop_application(erlang_adk),
+    stop_application(mnesia),
+    try
+        ok = file:make_dir(TempDir),
+        ok = application:set_env(mnesia, dir, TempDir),
+        paused_continuation_survives_isolated_restart()
+    after
+        stop_application(erlang_adk),
+        stop_application(mnesia),
+        restore_mnesia_dir(SavedDir),
+        _ = file:del_dir_r(TempDir),
+        maybe_restart(mnesia, MnesiaWasRunning),
+        maybe_restart(erlang_adk, AdkWasRunning)
+    end.
+
+paused_continuation_survives_isolated_restart() ->
     {ok, _} = application:ensure_all_started(erlang_adk),
     ok = erlang_adk_session_mnesia:init(),
     _ = erlang_adk_session_mnesia:delete_session(
@@ -164,3 +188,22 @@ has_correlated_tool_response(History, InvocationId) ->
               Id =:= InvocationId;
          (_) -> false
       end, History).
+
+application_running(App) ->
+    lists:keymember(App, 1, application:which_applications()).
+
+stop_application(App) ->
+    case application:stop(App) of
+        ok -> ok;
+        {error, {not_started, App}} -> ok
+    end.
+
+restore_mnesia_dir(undefined) ->
+    ok = application:unset_env(mnesia, dir);
+restore_mnesia_dir({ok, Dir}) ->
+    ok = application:set_env(mnesia, dir, Dir).
+
+maybe_restart(_App, false) -> ok;
+maybe_restart(App, true) ->
+    {ok, _} = application:ensure_all_started(App),
+    ok.

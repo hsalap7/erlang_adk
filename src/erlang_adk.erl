@@ -280,7 +280,10 @@ close_live_session(Session, Principal, Reason) ->
 %% The owner receives only strict binary messages shaped as
 %% `{adk_live_voice_frame, BridgePid, Frame}'.  Forwarded Live event credit is
 %% released only when the owner submits the exact v1 ACK frame through
-%% `live_voice_frame/2'.  The Live session must already be active.  The bridge
+%% `live_voice_frame/2'.  The first message is an unsequenced input-format
+%% configuration frame and must not be acknowledged.  Its 16000 or 24000 Hz
+%% rate is derived inside the bridge from trusted Live-session status; callers
+%% cannot override it.  The Live session must already be active.  The bridge
 %% terminates when `OwnerPid' terminates.  A provider reconnect invalidates and
 %% terminates the bridge independently of subscriber event credit; an input
 %% racing that transition is rejected by the same continuity boundary.  An

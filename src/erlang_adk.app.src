@@ -1,7 +1,7 @@
 {application, erlang_adk, [
     {description, "An OTP-native Agent Development Kit for Erlang."},
     {tags, ["agents", "adk", "otp", "llm", "erlang"]},
-    {vsn, "0.7.0"},
+    {vsn, "0.8.0"},
     {minimum_otp_vsn, "27.3.4.14"},
     {registered, []},
     {mod, {erlang_adk_app, []}},
@@ -19,6 +19,7 @@
         oidcc
     ]},
     {env, [
+        {provider_profiles, #{}},
         {a2a_enabled, false},
         {a2a_v1_enabled, false},
         {dev_enabled, false},

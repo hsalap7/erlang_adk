@@ -10,15 +10,32 @@
 
 -behaviour(adk_openapi_http_transport).
 
--export([request/2]).
+-export([request/2, is_public_address/1, resolve_host/3]).
 
 -ifdef(TEST).
--export([test_is_public_address/1, test_resolve_target/4]).
+-export([test_connection_options/2, test_is_public_address/1,
+         test_resolve_target/4]).
 -endif.
+
+%% @doc Resolve a host inside a bounded, monitored worker and return one
+%% address only after every answer satisfies the private-address policy.
+%% Callers connect to this returned address while retaining the original host
+%% for TLS SNI, hostname verification, and the Host header.
+-spec resolve_host(binary(), boolean(), pos_integer()) ->
+    {ok, inet:ip_address()} |
+    {error, timeout | dns_resolution_failed | private_address_rejected}.
+resolve_host(Host, AllowPrivate, Timeout)
+  when is_binary(Host), byte_size(Host) > 0,
+       is_boolean(AllowPrivate), is_integer(Timeout), Timeout > 0 ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    resolve_target(Host, AllowPrivate, Deadline);
+resolve_host(_Host, _AllowPrivate, _Timeout) ->
+    {error, dns_resolution_failed}.
 
 -define(DNS_MAX_HEAP_WORDS, 262144).
 -define(DNS_WATCHDOG_MAX_HEAP_WORDS, 8192).
 -define(MAX_DNS_ADDRESSES, 64).
+-define(MAX_HEADER_BYTES, 65536).
 
 -spec request(adk_openapi_http_transport:handle(),
               adk_openapi_http_transport:request()) ->
@@ -234,24 +251,6 @@ resolver_result(Host, Resolver) ->
         _:_ -> error
     end.
 
--ifdef(TEST).
-normalize_addresses(Addresses) when is_list(Addresses) ->
-    bounded_addresses(Addresses, ?MAX_DNS_ADDRESSES, []);
-normalize_addresses(_Addresses) ->
-    error.
-
-bounded_addresses([], _Remaining, Acc) ->
-    {ok, lists:usort(Acc)};
-bounded_addresses(_Addresses, 0, _Acc) ->
-    error;
-bounded_addresses([Address | Rest], Remaining, Acc) ->
-    case valid_ip_address(Address) of
-        true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
-        false -> error
-    end;
-bounded_addresses(_Improper, _Remaining, _Acc) ->
-    error.
--else.
 normalize_addresses(Addresses) ->
     bounded_addresses(Addresses, ?MAX_DNS_ADDRESSES, []).
 
@@ -264,7 +263,6 @@ bounded_addresses([Address | Rest], Remaining, Acc) ->
         true -> bounded_addresses(Rest, Remaining - 1, [Address | Acc]);
         false -> error
     end.
--endif.
 
 select_address([], _AllowPrivate) ->
     {error, dns_resolution_failed};
@@ -309,6 +307,8 @@ connection_options(#{scheme := <<"https">>, host := Host}, Deadline) ->
       retry => 0,
       connect_timeout => remaining(Deadline),
       tls_handshake_timeout => remaining(Deadline),
+      http_opts => #{max_header_block_size => ?MAX_HEADER_BYTES,
+                     max_trailer_block_size => ?MAX_HEADER_BYTES},
       tls_opts => [{verify, verify_peer},
                    {cacerts, public_key:cacerts_get()},
                    {server_name_indication, HostString},
@@ -317,7 +317,9 @@ connection_options(#{scheme := <<"https">>, host := Host}, Deadline) ->
                       public_key:pkix_verify_hostname_match_fun(https)}]}]};
 connection_options(#{scheme := <<"http">>}, Deadline) ->
     #{transport => tcp, protocols => [http], retry => 0,
-      connect_timeout => remaining(Deadline)}.
+      connect_timeout => remaining(Deadline),
+      http_opts => #{max_header_block_size => ?MAX_HEADER_BYTES,
+                     max_trailer_block_size => ?MAX_HEADER_BYTES}}.
 
 await_connection(Connection, Target, Deadline) ->
     case gun:await_up(Connection, remaining(Deadline)) of
@@ -404,18 +406,10 @@ has_control(Binary) ->
 lower(Binary) ->
     unicode:characters_to_binary(string:lowercase(Binary)).
 
--ifdef(TEST).
-valid_ip_address({A, B, C, D}) ->
-    lists:all(fun valid_ipv4_part/1, [A, B, C, D]);
-valid_ip_address({A, B, C, D, E, F, G, H}) ->
-    lists:all(fun valid_ipv6_part/1, [A, B, C, D, E, F, G, H]);
-valid_ip_address(_Address) -> false.
--else.
 valid_ip_address({A, B, C, D}) ->
     lists:all(fun valid_ipv4_part/1, [A, B, C, D]);
 valid_ip_address({A, B, C, D, E, F, G, H}) ->
     lists:all(fun valid_ipv6_part/1, [A, B, C, D, E, F, G, H]).
--endif.
 
 valid_ipv4_part(Value) ->
     is_integer(Value) andalso Value >= 0 andalso Value =< 255.
@@ -425,6 +419,13 @@ valid_ipv6_part(Value) ->
 
 %% Reject loopback, link-local, private, carrier-grade NAT, documentation,
 %% benchmarking, multicast, and otherwise non-global IPv4 ranges.
+%% @doc Return whether an already parsed IP address is globally routable.
+%%
+%% This is shared by other outbound transports so the repository has one
+%% fail-closed classification policy for OpenAPI tools, model APIs and OTLP.
+%% Hostname resolution and connect-to-the-validated-address are still the
+%% caller's responsibility.
+-spec is_public_address(inet:ip_address()) -> boolean().
 is_public_address({A, _B, _C, _D}) when A =:= 0; A =:= 10; A =:= 127 -> false;
 is_public_address({100, B, _C, _D}) when B >= 64, B =< 127 -> false;
 is_public_address({169, 254, _C, _D}) -> false;
@@ -472,6 +473,11 @@ is_public_address({A, _B, _C, _D, _E, _F, _G, _H})
 is_public_address(_) -> false.
 
 -ifdef(TEST).
+test_connection_options(Target, Timeout)
+  when is_map(Target), is_integer(Timeout), Timeout > 0 ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    connection_options(Target, Deadline).
+
 test_is_public_address(Address) ->
     is_public_address(Address).
 

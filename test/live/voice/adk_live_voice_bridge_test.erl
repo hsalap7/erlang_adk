@@ -101,6 +101,10 @@ audio_input_is_strictly_sequenced_and_bounded_test() ->
     try
         #{bridge := Bridge, handle := Handle} = Fixture,
         Pcm = <<0, 0, 1, 0>>,
+        ?assertEqual(
+           {error, {unexpected_live_voice_input_sample_rate, 16000}},
+           erlang_adk:live_voice_frame(
+             Bridge, audio_frame(1, 24000, Pcm))),
         {ok, 1} = erlang_adk:live_voice_frame(
                     Bridge, audio_frame(1, Pcm)),
         #{<<"realtimeInput">> := #{<<"audio">> := Blob1}} =
@@ -131,6 +135,24 @@ audio_input_is_strictly_sequenced_and_bounded_test() ->
         {ok, 3} = erlang_adk:live_voice_frame(Bridge, <<1, 2>>),
         #{<<"realtimeInput">> := #{<<"audioStreamEnd">> := true}} =
             decode_sent(Handle)
+    after
+        cleanup(Fixture)
+    end.
+
+trusted_24khz_input_format_is_derived_signalled_and_enforced_test() ->
+    Fixture = start_openai_fixture(),
+    try
+        #{bridge := Bridge, handle := Handle} = Fixture,
+        Pcm = <<0, 0, 1, 0, 255, 127, 0, 128>>,
+        ?assertEqual(
+           {error, {unexpected_live_voice_input_sample_rate, 24000}},
+           erlang_adk:live_voice_frame(
+             Bridge, audio_frame(1, 16000, Pcm))),
+        {ok, 1} = erlang_adk:live_voice_frame(
+                    Bridge, audio_frame(1, 24000, Pcm)),
+        #{<<"type">> := <<"input_audio_buffer.append">>,
+          <<"audio">> := Encoded} = decode_sent(Handle),
+        ?assertEqual(Pcm, base64:decode(Encoded))
     after
         cleanup(Fixture)
     end.
@@ -671,6 +693,16 @@ startup_validation_fails_closed_test() ->
              Session, ?PRINCIPAL, self(),
              #{credit => #{messages => 0, bytes => 4096}})),
         ?assertEqual(
+           {error, invalid_live_voice_bridge},
+           erlang_adk:start_live_voice_bridge(
+             Session, ?PRINCIPAL, self(),
+             #{input_sample_rate => 16000})),
+        ?assertEqual(
+           {error, invalid_live_voice_bridge},
+           erlang_adk:start_live_voice_bridge(
+             Session, ?PRINCIPAL, self(),
+             #{input_sample_rate => 24000})),
+        ?assertEqual(
            {error, not_found},
            erlang_adk:start_live_voice_bridge(
              Session, <<"wrong-principal">>, self(), #{})),
@@ -703,10 +735,43 @@ start_fixture(ProviderConfig, BridgeOpts) ->
     {SessionId, Session, Handle} = start_session(ProviderConfig),
     {ok, Bridge} = erlang_adk:start_live_voice_bridge(
                      Session, ?PRINCIPAL, self(), BridgeOpts),
+    assert_input_config(Bridge, 16000),
     #{session_id => SessionId,
       session => Session,
       handle => Handle,
       bridge => Bridge}.
+
+start_openai_fixture() ->
+    {ok, _} = application:ensure_all_started(erlang_adk),
+    SessionId = <<"voice-openai-",
+                  (integer_to_binary(
+                     erlang:unique_integer([positive, monotonic])))/binary>>,
+    Config = #{provider => adk_live_openai,
+               provider_config =>
+                   #{model => <<"gpt-realtime-test">>,
+                     response_modalities => [audio]},
+               transport => adk_live_fake_transport,
+               transport_opts => #{test_pid => self()}},
+    {ok, Session} = erlang_adk:start_live_session(
+                      SessionId, ?PRINCIPAL, Config),
+    Handle = receive
+        {adk_live_fake_transport, opened, Opened} -> Opened
+    after 1000 -> erlang:error(live_transport_open_timeout)
+    end,
+    receive
+        {adk_live_fake_transport, sent, Handle, SetupFrame} ->
+            #{<<"type">> := <<"session.update">>} =
+                jsx:decode(SetupFrame, [return_maps])
+    after 1000 -> erlang:error(live_setup_timeout)
+    end,
+    adk_live_fake_transport:inject(
+      Handle, #{<<"type">> => <<"session.updated">>}),
+    wait_for_live_state(Session, active, 50),
+    {ok, Bridge} = erlang_adk:start_live_voice_bridge(
+                     Session, ?PRINCIPAL, self(), #{}),
+    assert_input_config(Bridge, 24000),
+    #{session_id => SessionId, session => Session,
+      handle => Handle, bridge => Bridge}.
 
 start_session(ProviderConfig) ->
     {SessionId, Session, Handle} =
@@ -765,8 +830,18 @@ gemini_audio_part(Pcm) ->
             <<"data">> => base64:encode(Pcm)}}.
 
 audio_frame(Sequence, Pcm) ->
-    <<1, 1, Sequence:64/unsigned-big, 16000:32/unsigned-big,
+    audio_frame(Sequence, 16000, Pcm).
+
+audio_frame(Sequence, Rate, Pcm) ->
+    <<1, 1, Sequence:64/unsigned-big, Rate:32/unsigned-big,
       1, Pcm/binary>>.
+
+assert_input_config(Bridge, Rate) ->
+    receive
+        {adk_live_voice_frame, Bridge,
+         <<1, 128, Rate:32/unsigned-big, 1, 1>>} -> ok
+    after 1000 -> erlang:error(live_voice_input_config_timeout)
+    end.
 
 ack(Bridge, Sequence) ->
     erlang_adk:live_voice_frame(

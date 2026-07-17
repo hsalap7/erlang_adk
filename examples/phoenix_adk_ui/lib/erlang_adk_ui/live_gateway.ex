@@ -21,13 +21,19 @@ defmodule ErlangAdkUi.LiveGateway do
           required(:state) => binary(),
           optional(:model) => binary(),
           optional(:latest_sequence) => non_neg_integer(),
-          optional(:voice_mode) => binary()
+          optional(:voice_mode) => binary(),
+          optional(:input_sample_rate) => 16_000 | 24_000
         }
   @type evaluation :: %{required(:id) => binary(), required(:label) => binary()}
   @type voice_ref :: term()
   @type voice_connection :: %{
           required(:voice_ref) => voice_ref(),
-          required(:bridge) => pid()
+          required(:bridge) => pid(),
+          optional(:input_format) => %{
+            required(:sample_rate) => 16_000 | 24_000,
+            required(:channels) => 1,
+            required(:format) => :pcm_s16le
+          }
         }
 
   @callback discover(identity()) :: {:ok, [session()]} | {:error, atom()}

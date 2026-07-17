@@ -6,6 +6,7 @@ readme_test_() ->
     {setup, fun setup/0, fun cleanup/1, [
         fun example_modules_compile_and_load/0,
         fun provider_capability_contract/0,
+        fun multi_provider_profile_contract/0,
         fun multimodal_content_contract/0,
         fun direct_agent_and_provider_error/0,
         fun agent_contracts_and_context_policy/0,
@@ -132,6 +133,74 @@ provider_capability_contract() ->
        {error, {unknown_gemini_options, [temperatur]}},
        adk_llm:validate_config(
          #{provider => adk_llm_gemini, temperatur => 0.2})).
+
+multi_provider_profile_contract() ->
+    Previous = application:get_env(erlang_adk, provider_profiles),
+    ProviderProfiles = #{
+        <<"gemini">> =>
+            #{request_adapter => adk_llm_gemini,
+              endpoint => gemini,
+              models => #{<<"chat">> => <<"gemini-3.1-flash-lite">>},
+              credential => {env, <<"GEMINI_API_KEY">>}},
+        <<"openai">> =>
+            #{request_adapter => adk_llm_openai,
+              endpoint => openai,
+              models => #{<<"chat">> => <<"YOUR_OPENAI_MODEL_ID">>},
+              credential => {env, <<"OPENAI_API_KEY">>},
+              request_options => #{store => false}},
+        <<"anthropic">> =>
+            #{request_adapter => adk_llm_anthropic,
+              endpoint => anthropic,
+              models => #{<<"chat">> => <<"YOUR_ANTHROPIC_MODEL_ID">>},
+              credential => {env, <<"ANTHROPIC_API_KEY">>},
+              request_options =>
+                  #{anthropic_version => <<"2023-06-01">>}},
+        <<"compatible">> =>
+            #{request_adapter => adk_llm_compatible,
+              endpoint => #{scheme => https,
+                            host => <<"models.vendor.example">>,
+                            port => 443,
+                            base_path => <<"/v1">>},
+              models => #{<<"chat">> => <<"YOUR_VENDOR_MODEL_ID">>},
+              credential => {env, <<"VENDOR_API_KEY">>},
+              request_options => #{auth_scheme => bearer}},
+        <<"openai-live">> =>
+            #{live_adapter => adk_live_openai,
+              endpoint => openai,
+              models => #{<<"voice">> => <<"gpt-realtime-2.1">>},
+              credential => {env, <<"OPENAI_API_KEY">>}}
+    },
+    ok = application:set_env(
+           erlang_adk, provider_profiles, ProviderProfiles),
+    try
+        {ok, CheckedProfiles} = adk_provider_registry:profiles(),
+        ?assertEqual(5, map_size(CheckedProfiles)),
+        {ok, Live} = adk_provider_registry:resolve_live_config(
+                       <<"openai-live">>,
+                       #{model => <<"voice">>,
+                         response_modalities => [audio]}),
+        ?assertEqual(adk_live_openai, maps:get(adapter, Live)),
+        ?assertEqual(adk_live_openai_gun_transport,
+                     maps:get(transport, Live)),
+        ?assertEqual(env,
+                     maps:get(source, maps:get(credential, Live))),
+        {ok, CompatibleCapabilities} = adk_llm:capabilities(
+            #{provider => adk_llm_compatible,
+              base_url => <<"https://models.vendor.example/v1">>,
+              model => <<"YOUR_VENDOR_MODEL_ID">>,
+              auth_scheme => none,
+              response_format => unsupported}),
+        ?assertEqual(false,
+                     maps:get(structured_output,
+                              CompatibleCapabilities))
+    after
+        case Previous of
+            undefined -> application:unset_env(erlang_adk,
+                                                provider_profiles);
+            {ok, Value} -> application:set_env(erlang_adk,
+                                               provider_profiles, Value)
+        end
+    end.
 
 multimodal_content_contract() ->
     TinyPng = base64:decode(

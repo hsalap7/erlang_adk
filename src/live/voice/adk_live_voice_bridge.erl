@@ -33,6 +33,7 @@
     credit :: map(),
     max_audio_frame_bytes :: pos_integer(),
     max_output_frame_bytes :: pos_integer(),
+    input_sample_rate = undefined :: undefined | 16000 | 24000,
     next_audio_sequence = 1 :: pos_integer(),
     pending = #{} :: map(),
     subscribed = false :: boolean()
@@ -117,11 +118,16 @@ handle_call(initialize, _From, #state{subscribed = false} = State) ->
     case status_claim_and_subscribe(
            State#state.session, State#state.principal,
            State#state.credit) of
-        {ok, SessionId, ContinuityToken} ->
-            {reply, ok,
-             State#state{session_id = SessionId,
-                         continuity_token = ContinuityToken,
-                         subscribed = true}};
+        {ok, SessionId, ContinuityToken, InputSampleRate} ->
+            Active = State#state{session_id = SessionId,
+                                 continuity_token = ContinuityToken,
+                                 input_sample_rate = InputSampleRate,
+                                 subscribed = true},
+            case signal_input_config(Active) of
+                ok -> {reply, ok, Active};
+                {error, Reason} ->
+                    {stop, normal, {error, Reason}, Active}
+            end;
         {error, Reason} ->
             {stop, normal, {error, Reason}, State}
     end;
@@ -182,6 +188,7 @@ format_status(Status) ->
                 owner => State#state.owner,
                 credit => State#state.credit,
                 max_audio_frame_bytes => State#state.max_audio_frame_bytes,
+                input_sample_rate => State#state.input_sample_rate,
                 next_audio_sequence => State#state.next_audio_sequence,
                 pending_events => map_size(State#state.pending)};
          (message, _Message) -> redacted;
@@ -191,8 +198,8 @@ format_status(Status) ->
 handle_owner_frame(Binary, State) ->
     case adk_live_voice_protocol:decode_client(
            Binary, State#state.max_audio_frame_bytes) of
-        {ok, {audio, Sequence, Pcm}} ->
-            handle_audio(Sequence, Pcm, State);
+        {ok, {audio, Sequence, Rate, Pcm}} ->
+            handle_audio(Sequence, Rate, Pcm, State);
         {ok, {ack, Sequence}} ->
             handle_ack(Sequence, State);
         {ok, audio_stream_end} ->
@@ -205,12 +212,17 @@ handle_owner_frame(Binary, State) ->
             {reply, {error, Reason}, State}
     end.
 
-handle_audio(Sequence, _Pcm,
+handle_audio(Sequence, _Rate, _Pcm,
              #state{next_audio_sequence = Expected} = State)
   when Sequence =/= Expected ->
     {reply, {error, {out_of_order_live_voice_audio, Expected}}, State};
-handle_audio(_Sequence, Pcm, State) ->
-    case adk_live_media:audio_pcm(Pcm, 16000, 1) of
+handle_audio(_Sequence, Rate, _Pcm,
+             #state{input_sample_rate = Expected} = State)
+  when Rate =/= Expected ->
+    {reply,
+     {error, {unexpected_live_voice_input_sample_rate, Expected}}, State};
+handle_audio(_Sequence, Rate, Pcm, State) ->
+    case adk_live_media:audio_pcm(Pcm, Rate, 1) of
         {ok, Media} ->
             case adk_live_session:send_voice_audio(
                    State#state.session, State#state.principal,
@@ -351,16 +363,14 @@ status_claim_and_subscribe(Session, Principal, Credit) ->
     case adk_live_session:status(Session, Principal, ?CALL_TIMEOUT_MS) of
         {ok, #{state := reconnecting}} ->
             {error, live_voice_reconnect_required};
-        {ok, #{state := active, session_id := SessionId}}
+        {ok, #{state := active, session_id := SessionId} = Status}
           when is_binary(SessionId), byte_size(SessionId) > 0,
                byte_size(SessionId) =< 256 ->
-            case adk_live_voice_registry:claim(Session, self()) of
-                ok ->
-                    case subscribe_active(Session, Principal, Credit) of
-                        {ok, ContinuityToken} ->
-                            {ok, SessionId, ContinuityToken};
-                        {error, _} = Error -> Error
-                    end;
+            case trusted_input_sample_rate(Status) of
+                {ok, InputSampleRate} ->
+                    claim_and_subscribe(
+                      Session, Principal, Credit, SessionId,
+                      InputSampleRate);
                 {error, _} = Error ->
                     Error
             end;
@@ -372,6 +382,39 @@ status_claim_and_subscribe(Session, Principal, Credit) ->
             {error, invalid_live_status};
         {error, _} = Error ->
             Error
+    end.
+
+trusted_input_sample_rate(#{input_audio_sample_rate := Rate})
+  when Rate =:= 16000; Rate =:= 24000 ->
+    {ok, Rate};
+trusted_input_sample_rate(_Status) ->
+    {error, invalid_live_status}.
+
+claim_and_subscribe(Session, Principal, Credit, SessionId,
+                    InputSampleRate) ->
+    case adk_live_voice_registry:claim(Session, self()) of
+        ok ->
+            case subscribe_active(Session, Principal, Credit) of
+                {ok, ContinuityToken} ->
+                    {ok, SessionId, ContinuityToken, InputSampleRate};
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+signal_input_config(#state{owner = Owner,
+                           input_sample_rate = Rate}) ->
+    Format = #{sample_rate => Rate, channels => 1, format => pcm_s16le},
+    case adk_live_voice_protocol:encode_input_config(Format) of
+        {ok, Frame} ->
+            Owner ! {adk_live_voice_frame, self(), Frame},
+            ok;
+        {error, _} ->
+            %% The trusted session status was checked before subscription.
+            %% Keep a stable boundary error if state corruption ever makes
+            %% this impossible.
+            {error, invalid_live_voice_input_config}
     end.
 
 subscribe_active(Session, Principal, Credit) ->

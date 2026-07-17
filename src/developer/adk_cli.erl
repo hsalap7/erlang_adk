@@ -297,6 +297,11 @@ parse_options([Flag], _Allowed, _Acc) ->
 doctor() ->
     _ = application:load(erlang_adk),
     ProviderStatus = module_status(adk_llm_gemini),
+    ProviderStatuses =
+        #{gemini => ProviderStatus,
+          openai => module_status(adk_llm_openai),
+          anthropic => module_status(adk_llm_anthropic),
+          compatible => module_status(adk_llm_compatible)},
     DependencyModules = [cowboy, gun, jsx, telemetry, oidcc, jose],
     Dependencies = maps:from_list(
                      [{Module, module_status(Module)}
@@ -307,6 +312,8 @@ doctor() ->
                               end,
                               maps:values(Dependencies)),
     ApiKeyConfigured = valid_environment_secret("GEMINI_API_KEY"),
+    OpenAiKeyConfigured = valid_environment_secret("OPENAI_API_KEY"),
+    AnthropicKeyConfigured = valid_environment_secret("ANTHROPIC_API_KEY"),
     DevTokenConfigured = valid_environment_secret(
                            "ERLANG_ADK_DEV_TOKEN"),
     Warnings0 = case ApiKeyConfigured of
@@ -329,8 +336,11 @@ doctor() ->
            erlang_adk_version => application_version(),
            default_model => ?DEFAULT_MODEL,
            gemini_provider => ProviderStatus,
+           providers => ProviderStatuses,
            dependencies => Dependencies,
            gemini_api_key_configured => ApiKeyConfigured,
+           openai_api_key_configured => OpenAiKeyConfigured,
+           anthropic_api_key_configured => AnthropicKeyConfigured,
            developer_token_configured => DevTokenConfigured,
            warnings => lists:reverse(Warnings)}}.
 
@@ -2036,21 +2046,53 @@ cli_capability(<<"content_streaming">>) -> content_streaming;
 cli_capability(<<"google_search_grounding">>) -> google_search_grounding;
 cli_capability(Value) -> Value.
 
-provider_module(<<"gemini">>) -> {ok, adk_llm_gemini};
-provider_module(<<"adk_llm_probe">>) ->
-    checked_provider(adk_llm_probe, <<"adk_llm_probe">>);
 provider_module(Name) when is_binary(Name) ->
-    case Name of
-        <<"adk_llm_", _/binary>> ->
-            try binary_to_existing_atom(Name, utf8) of
-                Module -> checked_provider(Module, Name)
-            catch
-                error:badarg -> {error, {unknown_provider, Name}}
-            end;
-        _ -> {error, {unknown_provider, Name}}
+    %% An operator-owned profile deliberately takes precedence over the four
+    %% convenient built-in CLI aliases. This lets a JSON config select the
+    %% documented `compatible' profile without accepting a caller-controlled
+    %% URL, credential, or header in that file. With no matching profile the
+    %% legacy aliases retain their existing fixed-adapter behavior.
+    case configured_provider_profile(Name) of
+        true -> profile_provider_module(Name);
+        false -> fallback_provider_module(Name)
     end;
 provider_module(_Name) ->
     {error, invalid_provider_name}.
+
+configured_provider_profile(Name) ->
+    case application:get_env(erlang_adk, provider_profiles, #{}) of
+        Profiles when is_map(Profiles) -> maps:is_key(Name, Profiles);
+        _InvalidProfiles -> false
+    end.
+
+profile_provider_module(Name) ->
+    case adk_provider_registry:lookup(Name) of
+        {ok, #{request_adapter := _}} -> {ok, Name};
+        {ok, _LiveOnlyProfile} ->
+            {error, {invalid_provider, Name,
+                     request_capability_unavailable}};
+        {error, unknown_provider_profile} ->
+            legacy_provider_module(Name);
+        {error, _} -> {error, {unknown_provider, Name}}
+    end.
+
+fallback_provider_module(<<"gemini">>) -> {ok, adk_llm_gemini};
+fallback_provider_module(<<"openai">>) -> {ok, adk_llm_openai};
+fallback_provider_module(<<"anthropic">>) -> {ok, adk_llm_anthropic};
+fallback_provider_module(<<"compatible">>) -> {ok, adk_llm_compatible};
+fallback_provider_module(<<"adk_llm_probe">> = Name) ->
+    checked_provider(adk_llm_probe, Name);
+fallback_provider_module(Name) ->
+    legacy_provider_module(Name).
+
+legacy_provider_module(<<"adk_llm_", _/binary>> = Name) ->
+    try binary_to_existing_atom(Name, utf8) of
+        Module -> checked_provider(Module, Name)
+    catch
+        error:badarg -> {error, {unknown_provider, Name}}
+    end;
+legacy_provider_module(Name) ->
+    {error, {unknown_provider, Name}}.
 
 checked_provider(Module, Name) ->
     case adk_llm:capabilities(Module) of

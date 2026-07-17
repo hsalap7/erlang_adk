@@ -23,13 +23,13 @@ authorization_code_adapter_test_() ->
 oauth_options_are_translated_without_untrusted_extras() ->
     ?assertEqual(
        #{scope => [<<"agent.run">>]},
-       adk_oidcc_oauth_adapter:test_oidcc_opts(
+       adk_oidcc_adapter_policy:oauth_opts(
          #{scope => [<<"agent.run">>], ignored => <<"value">>})),
     ?assertEqual(
        #{scope => [<<"agent.run">>],
          body_extension =>
              [{<<"resource">>, <<"https://api.example">>}]},
-       adk_oidcc_oauth_adapter:test_oidcc_opts(
+       adk_oidcc_adapter_policy:oauth_opts(
          #{scope => [<<"agent.run">>],
            resource => <<"https://api.example">>})).
 
@@ -74,7 +74,7 @@ oauth_tokens_are_normalized_and_bounded() ->
        {ok, #{access_token => <<"access-token">>,
               expires_in_ms => 60000,
               token_type => <<"Bearer">>}},
-       adk_oidcc_oauth_adapter:test_normalize_token(Base)),
+       adk_oidcc_adapter_policy:normalize_oauth_token(Base)),
     Rotated = Base#oidcc_token{
                 refresh = #oidcc_token_refresh{token = <<"new-refresh">>}},
     ?assertEqual(
@@ -82,7 +82,7 @@ oauth_tokens_are_normalized_and_bounded() ->
               expires_in_ms => 60000,
               token_type => <<"Bearer">>,
               refresh_token => <<"new-refresh">>}},
-       adk_oidcc_oauth_adapter:test_normalize_token(Rotated)),
+       adk_oidcc_adapter_policy:normalize_oauth_token(Rotated)),
     InvalidTokens =
         [not_a_token,
          #oidcc_token{access = none, refresh = none},
@@ -103,7 +103,7 @@ oauth_tokens_are_normalized_and_bounded() ->
       fun(Token) ->
           ?assertEqual(
              {error, invalid_token_response},
-             adk_oidcc_oauth_adapter:test_normalize_token(Token))
+             adk_oidcc_adapter_policy:normalize_oauth_token(Token))
       end, InvalidTokens).
 
 authorization_context_is_exact_and_bounded() ->
@@ -213,8 +213,7 @@ validated_exchange_token_becomes_refresh_credential() ->
               client_secret => ?CLIENT_SECRET,
               refresh_token => <<"refresh-token">>,
               expected_subject => <<"provider-subject">>}},
-       adk_oidcc_authorization_code_adapter:
-         test_validated_refresh_credential(
+       adk_oidcc_adapter_policy:validated_refresh_credential(
            Token, ?CLIENT_ID, ?CLIENT_SECRET)).
 
 malformed_exchange_tokens_fail_closed() ->
@@ -254,8 +253,7 @@ malformed_exchange_tokens_fail_closed() ->
       fun(Token) ->
           ?assertEqual(
              {error, authorization_failed},
-             adk_oidcc_authorization_code_adapter:
-               test_validated_refresh_credential(
+             adk_oidcc_adapter_policy:validated_refresh_credential(
                  Token, ?CLIENT_ID, ?CLIENT_SECRET))
       end, InvalidTokens).
 

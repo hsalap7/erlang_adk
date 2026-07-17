@@ -4,12 +4,14 @@ const CLIENT_AUDIO = 1
 const CLIENT_AUDIO_STREAM_END = 2
 const CLIENT_ACK = 3
 
+const SERVER_INPUT_CONFIG = 128
 const SERVER_AUDIO = 129
 const SERVER_TRANSCRIPTION = 130
 const SERVER_LIFECYCLE = 131
 
-const INPUT_SAMPLE_RATE = 16_000
 const INPUT_CHANNELS = 1
+const INPUT_FORMAT_PCM_S16LE = 1
+const SUPPORTED_INPUT_SAMPLE_RATES = new Set([16_000, 24_000])
 const MAX_SERVER_FRAME_BYTES = 262_144
 const MAX_SOCKET_BUFFER_BYTES = 262_144
 const MAX_TRANSCRIPT_CHARS = 4_096
@@ -92,6 +94,8 @@ export const LiveVoice = {
     this.starting = false
     this.muted = false
     this.inputSequence = 0n
+    this.inputSampleRate = null
+    this.inputConfigWaiter = null
     this.lastServerSequence = 0n
     this.playbackCursor = 0
     this.transcripts = {input: "", output: ""}
@@ -156,6 +160,7 @@ export const LiveVoice = {
     this.starting = true
     this.muted = false
     this.inputSequence = 0n
+    this.inputSampleRate = null
     this.lastServerSequence = 0n
     this.playbackCursor = 0
     this.scheduledAudioSeconds = 0
@@ -181,6 +186,7 @@ export const LiveVoice = {
       this.socket = socket
 
       const socketReady = waitForSocket(socket)
+      const inputConfigReady = this.waitForInputConfig(generation, socket)
       socket.onmessage = (event) => {
         if (this.currentConnection(generation, socket)) this.handleServerMessage(event.data)
       }
@@ -197,6 +203,7 @@ export const LiveVoice = {
         audioContext.resume(),
         audioContext.audioWorklet.addModule(this.el.dataset.workletUrl),
         socketReady,
+        inputConfigReady,
       ]).then(
         () => ({ok: true}),
         (error) => ({ok: false, error}),
@@ -236,13 +243,17 @@ export const LiveVoice = {
       }
 
       this.sourceNode = audioContext.createMediaStreamSource(stream)
+      const inputSampleRate = this.inputSampleRate
+      if (!SUPPORTED_INPUT_SAMPLE_RATES.has(inputSampleRate)) {
+        throw new Error("voice input format was not negotiated")
+      }
       this.captureNode = new AudioWorkletNode(audioContext, "adk-pcm-capture", {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1],
         processorOptions: {
-          targetSampleRate: INPUT_SAMPLE_RATE,
-          chunkSamples: 320,
+          targetSampleRate: inputSampleRate,
+          chunkSamples: inputSampleRate / 50,
           maxInFlightChunks: 16,
         },
       })
@@ -304,6 +315,10 @@ export const LiveVoice = {
       this.protocolFailure("The microphone produced an invalid audio frame.")
       return
     }
+    if (!SUPPORTED_INPUT_SAMPLE_RATES.has(this.inputSampleRate)) {
+      this.protocolFailure("The voice input format was not negotiated.")
+      return
+    }
 
     this.inputSequence += 1n
     const frame = new ArrayBuffer(15 + message.buffer.byteLength)
@@ -311,7 +326,7 @@ export const LiveVoice = {
     view.setUint8(0, PROTOCOL_VERSION)
     view.setUint8(1, CLIENT_AUDIO)
     view.setBigUint64(2, this.inputSequence)
-    view.setUint32(10, INPUT_SAMPLE_RATE)
+    view.setUint32(10, this.inputSampleRate)
     view.setUint8(14, INPUT_CHANNELS)
     new Uint8Array(frame, 15).set(new Uint8Array(message.buffer))
     const socket = this.socket
@@ -331,6 +346,14 @@ export const LiveVoice = {
     try {
       const view = new DataView(data)
       if (view.getUint8(0) !== PROTOCOL_VERSION) throw new Error("version")
+      const type = view.getUint8(1)
+      if (type === SERVER_INPUT_CONFIG) {
+        this.handleInputConfigFrame(data, view)
+        return
+      }
+      if (!SUPPORTED_INPUT_SAMPLE_RATES.has(this.inputSampleRate)) {
+        throw new Error("input config required")
+      }
       if (data.byteLength < 10) throw new Error("sequence length")
 
       const incomingSequence = view.getBigUint64(2)
@@ -338,7 +361,6 @@ export const LiveVoice = {
         throw new Error("sequence")
       }
 
-      const type = view.getUint8(1)
       let result
 
       if (type === SERVER_AUDIO) {
@@ -370,6 +392,62 @@ export const LiveVoice = {
       if (error instanceof HandledVoiceError) return
       this.protocolFailure("The voice server returned an invalid frame.")
     }
+  },
+
+  waitForInputConfig(generation, socket, timeoutMs = 10_000) {
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        const waiter = this.inputConfigWaiter
+        if (waiter?.generation === generation && waiter.socket === socket) {
+          this.inputConfigWaiter = null
+          reject(new Error("voice input format negotiation timed out"))
+        }
+      }, timeoutMs)
+
+      this.inputConfigWaiter = {
+        generation,
+        socket,
+        resolve: (sampleRate) => {
+          window.clearTimeout(timer)
+          this.inputConfigWaiter = null
+          resolve(sampleRate)
+        },
+        reject: (error) => {
+          window.clearTimeout(timer)
+          this.inputConfigWaiter = null
+          reject(error)
+        },
+      }
+    })
+  },
+
+  handleInputConfigFrame(data, view) {
+    if (data.byteLength !== 8 || this.inputSampleRate !== null) {
+      throw new Error("input config")
+    }
+
+    const sampleRate = view.getUint32(2)
+    const channels = view.getUint8(6)
+    const format = view.getUint8(7)
+    if (
+      !SUPPORTED_INPUT_SAMPLE_RATES.has(sampleRate) ||
+      channels !== INPUT_CHANNELS ||
+      format !== INPUT_FORMAT_PCM_S16LE
+    ) {
+      throw new Error("input config format")
+    }
+
+    const waiter = this.inputConfigWaiter
+    if (
+      !waiter ||
+      waiter.generation !== this.generation ||
+      waiter.socket !== this.socket
+    ) {
+      throw new Error("unexpected input config")
+    }
+
+    this.inputSampleRate = sampleRate
+    waiter.resolve(sampleRate)
   },
 
   handleAudioFrame(data, view) {
@@ -604,6 +682,9 @@ export const LiveVoice = {
       this.sendControl(CLIENT_AUDIO_STREAM_END)
     }
 
+    if (this.inputConfigWaiter) {
+      this.inputConfigWaiter.reject(new Error("voice input format negotiation cancelled"))
+    }
     if (this.captureNode?.port) {
       this.captureNode.onprocessorerror = null
       this.captureNode.port.onmessage = null
@@ -626,6 +707,7 @@ export const LiveVoice = {
     this.sourceNode = null
     this.captureNode = null
     this.silentGain = null
+    this.inputSampleRate = null
     this.muted = false
     if (this.level) this.level.style.transform = "scaleX(0)"
   },
@@ -772,6 +854,9 @@ export const LiveVoice = {
     }
     if (event.code === 1013 && event.reason === "voice session not active") {
       return "The Live session is not active yet. Refresh before starting voice again."
+    }
+    if (event.code === 1013 && event.reason === "voice input format unavailable") {
+      return "The Live session does not expose a supported voice input format."
     }
     if (event.code === 1013 && event.reason === "voice session already in use") {
       return "This Live session already has a voice connection. Stop voice in the other tab first."
