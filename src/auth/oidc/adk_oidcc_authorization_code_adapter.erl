@@ -10,21 +10,10 @@
 
 -behaviour(adk_authorization_code_adapter).
 
--include_lib("oidcc/include/oidcc_token.hrl").
-
 -export([validate_context/1, authorization_uri/2, exchange_code/3]).
-
--ifdef(TEST).
--export([test_validated_refresh_credential/3]).
--endif.
 
 -define(MAX_CLIENT_ID_BYTES, 4096).
 -define(MAX_CLIENT_SECRET_BYTES, 16384).
--define(MAX_REFRESH_TOKEN_BYTES, 65536).
--define(MAX_ACCESS_TOKEN_BYTES, 131072).
--define(MAX_ID_TOKEN_BYTES, 131072).
--define(MAX_SUBJECT_BYTES, 4096).
--define(MAX_TOKEN_TERM_BYTES, 1048576).
 
 -spec validate_context(map()) -> ok | {error, invalid_adapter_context}.
 validate_context(#{provider_worker := Provider,
@@ -85,48 +74,14 @@ exchange_code(#{provider_worker := Provider,
     try oidcc:retrieve_token(
           Code, Provider, ClientId, ClientSecret, OidccOpts) of
         {ok, Token} ->
-            validated_refresh_credential(Token, ClientId, ClientSecret);
+            adk_oidcc_adapter_policy:validated_refresh_credential(
+              Token, ClientId, ClientSecret);
         {error, _Reason} ->
             {error, authorization_failed}
     catch
         _:_ -> {error, authorization_failed}
     end;
 exchange_code(_Context, _Code, _Opts) ->
-    {error, authorization_failed}.
-
-validated_refresh_credential(
-  Token = #oidcc_token{id = #oidcc_token_id{token = IdToken,
-                                            claims = Claims},
-                       access = #oidcc_token_access{token = AccessToken,
-                                                    type = TokenType},
-                       refresh = #oidcc_token_refresh{token = RefreshToken}},
-  ClientId, ClientSecret)
-  when is_map(Claims),
-       is_binary(IdToken), byte_size(IdToken) > 0,
-       byte_size(IdToken) =< ?MAX_ID_TOKEN_BYTES,
-       is_binary(AccessToken), byte_size(AccessToken) > 0,
-       byte_size(AccessToken) =< ?MAX_ACCESS_TOKEN_BYTES,
-       is_binary(TokenType), byte_size(TokenType) > 0,
-       byte_size(TokenType) =< 128,
-       is_binary(RefreshToken), byte_size(RefreshToken) > 0,
-       byte_size(RefreshToken) =< ?MAX_REFRESH_TOKEN_BYTES ->
-    %% Claims are trusted only because oidcc:retrieve_token/5 already
-    %% performed ID-token validation with the exact nonce passed above.
-    case {maps:get(<<"sub">>, Claims, undefined),
-          safe_external_size(Token)} of
-        {Subject, Size}
-          when is_binary(Subject), byte_size(Subject) > 0,
-               byte_size(Subject) =< ?MAX_SUBJECT_BYTES,
-               is_integer(Size), Size =< ?MAX_TOKEN_TERM_BYTES ->
-            {ok, #{kind => oauth_refresh_token,
-                   client_id => ClientId,
-                   client_secret => ClientSecret,
-                   refresh_token => RefreshToken,
-                   expected_subject => Subject}};
-        _ ->
-            {error, authorization_failed}
-    end;
-validated_refresh_credential(_Token, _ClientId, _ClientSecret) ->
     {error, authorization_failed}.
 
 resource_extension(Key, #{resource := Resource}, Opts)
@@ -153,11 +108,3 @@ safe_binary(Value) ->
     catch
         _:_ -> error
     end.
-
-safe_external_size(Term) ->
-    try erlang:external_size(Term) catch _:_ -> invalid end.
-
--ifdef(TEST).
-test_validated_refresh_credential(Token, ClientId, ClientSecret) ->
-    validated_refresh_credential(Token, ClientId, ClientSecret).
--endif.

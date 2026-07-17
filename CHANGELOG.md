@@ -3,20 +3,122 @@
 All notable changes to Erlang ADK are documented here. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Versions 0.3.0 through 0.6.0 below are frozen delivery milestones in the
+Versions 0.3.0 through 0.7.0 below are frozen delivery milestones in the
 development history; their presence does not claim that a package was
-published for each milestone. Version 0.7.0 is the cumulative release line.
-The detailed evidence and remaining limitations are in the corresponding
-documents under [`docs/`](docs/README.md).
+published for each milestone. Version 0.8.0 is the current cumulative release
+candidate. The detailed evidence and remaining limitations are in the
+corresponding documents under [`docs/`](docs/README.md).
 
-The `0.7.0` and `Unreleased` references at the end of this file intentionally
-target the prospective `v0.7.0` tag. They become usable only after the release
+The `0.8.0` and `Unreleased` references at the end of this file intentionally
+target the prospective `v0.8.0` tag. They become usable only after the release
 checklist is approved and that tag is created; this candidate does not claim
 the tag or Hex package already exists.
 
 ## [Unreleased]
 
 No changes have been assigned to the next release.
+
+## [0.8.0] - 2026-07-17
+
+### Added
+
+- Operator-owned model provider profiles with bounded binary profile/model
+  aliases, adapter and endpoint validation, structured HTTPS endpoints,
+  secret-free capabilities, and credential sources resolved only at the
+  trusted runtime boundary.
+- Generation-consistent profile/credential resolution using an opaque keyed
+  snapshot, so a concurrent profile replacement cannot mix old authority with
+  a new credential source.
+- A native OpenAI Responses adapter with bounded one-shot and incremental SSE
+  generation, canonical multimodal content, function call IDs and parallel
+  calls, structured output, and operator-owned organization/project/storage
+  settings.
+- A native Anthropic Messages adapter with bounded one-shot and incremental
+  SSE generation, canonical image/tool content, parallel tool blocks,
+  operator-owned API versioning, and GA structured-output encoding.
+- A deliberately narrow OpenAI-compatible Chat Completions adapter with a
+  trusted HTTPS endpoint, fixed operation path, bearer/x-api-key/keyless auth
+  modes, bounded content/tool/SSE handling, and an explicit structured-output
+  capability switch.
+- Shared model HTTP, Gun, header, and incremental SSE contracts with exact
+  origin policy, verified TLS, deadline-bounded DNS, redirects disabled,
+  private-address rejection by default, response limits, 64 KiB aggregate
+  header/trailer block caps in both synchronous and streaming paths, and
+  streaming flow control.
+- An OpenAI Realtime Live adapter, GA event codec, and fixed-origin verified-
+  TLS Gun WebSocket transport for bidirectional text/audio/image, audio/text
+  output, transcription, function calls/results, interruption, usage, and
+  rate-limit events.
+- Provider-neutral ordered multi-frame Live actions and an explicit no-op
+  action outcome, allowing one logical text/tool/manual-turn operation to be
+  admitted atomically without interleaving or duplicate audio-buffer commits;
+  once sending begins, a later priority action cannot splice into that batch.
+- Trusted Live input-rate status and voice format negotiation: Gemini uses
+  16 kHz PCM input and OpenAI Realtime uses 24 kHz, while the browser bridge
+  continues to receive native 24 kHz PCM output.
+- [`docs/PROVIDER_PROFILES.md`](docs/PROVIDER_PROFILES.md) and the
+  [`0.8.0 release contract`](docs/VERSION_0_8_0.md).
+
+### Changed
+
+- Binary provider IDs now select configured profiles; direct atom-module
+  provider maps remain a trusted-code compatibility path.
+- New native OpenAI and Anthropic environment keys are accepted only at their
+  exact official origins. A custom HTTPS origin requires a profile-resolved
+  explicit credential, and an authenticated compatible endpoint never reads
+  a process-wide ambient compatible key.
+- Profile callers may set only adapter-specific inference/runtime options.
+  Model IDs, endpoints, credentials, arbitrary headers, auth/storage/billing
+  settings, HTTP/Live transports, and audio rates remain operator-owned.
+- Anthropic `max_tokens` validation now enforces the provider-compatible
+  minimum of one for both direct and profile-selected requests.
+- Phoenix browser capture waits for the server's input-format frame and
+  resamples to the negotiated 16 or 24 kHz rate instead of assuming Gemini's
+  16 kHz input contract.
+- Source and test layout documentation now identifies the provider profile,
+  shared transport, native OpenAI/Anthropic, compatible, and Realtime
+  ownership directories.
+
+### Security
+
+- Credentials are absent from normalized profiles, public configuration,
+  errors, transport state diagnostics, model-visible content, and browser
+  frames. Literal profile sources project only their source type.
+- Custom endpoints are structured HTTPS configuration, not caller-provided
+  URL strings; fixed adapter paths, host/scheme allowlists, DNS address policy,
+  no redirects, and verified hostname/peer checks constrain credential
+  delivery.
+- Live binary profiles cannot select a transport module, endpoint, model ID,
+  credential handle, CA file, billing headers, or input sample rate.
+- Gun rejects an aggregate response-header or trailer block above 64 KiB in
+  both synchronous and streaming paths, and Live preserves an in-flight
+  multi-frame batch as one contiguous side-effect sequence even when a later
+  priority action arrives.
+
+### Verification and known limitations
+
+- The 2026-07-17 deterministic release gates passed 1,414 EUnit tests, six
+  Common Test cases, Dialyzer over 235 source modules with no warnings, 74.17% line
+  coverage, 244/244 focused provider/profile/Realtime tests, 34/34 README and
+  workflow tests, all three warning-as-error example compilations, and the
+  xref/escript/doctor/configuration/documentation/package checks. Common Test
+  intentionally skipped 22 opt-in paid cases in the deterministic command.
+- The seven-module post-audit repair regression set passed 67/67.
+- The Phoenix gate passed 103 ExUnit and 40 Node tests, production assets and
+  release assembly, and both trusted-proxy and direct-TLS smokes. Raw Hex audit
+  remained non-zero only for the two documented Cowlib advisories; the exact-
+  exception verifier passed.
+- The paid Gemini REST attempt reached Google but did not produce a pass: the
+  configured credential was rejected with HTTP 401 `UNAUTHENTICATED` /
+  `ACCESS_TOKEN_TYPE_UNSUPPORTED`. No v0.8 paid Gemini Live pass is recorded.
+  Focused REST header tests passed 29/29 and Live broker/transport tests passed
+  19/19; that deterministic evidence does not turn the remote credential
+  failure into a pass, skip, or product regression.
+- No paid OpenAI Responses, OpenAI Realtime, Anthropic, or compatible-vendor
+  result is claimed by deterministic fixtures.
+- Automatic routing/fallback, custom Live origins, OpenAI Realtime resumption,
+  blanket compatible-vendor parity, browser WebRTC/direct-provider tokens,
+  and distributed provider-profile rollout remain outside this release.
 
 ## [0.7.0] - 2026-07-15
 
@@ -225,7 +327,8 @@ No changes have been assigned to the next release.
 - Explicit process ownership and secret-isolation rules used by later
   releases.
 
-[Unreleased]: https://github.com/hsalap7/erlang_adk/compare/v0.7.0...version_0.7.0
+[Unreleased]: https://github.com/hsalap7/erlang_adk/compare/v0.8.0...version_0.8.0
+[0.8.0]: https://github.com/hsalap7/erlang_adk/tree/v0.8.0
 [0.7.0]: https://github.com/hsalap7/erlang_adk/tree/v0.7.0
 [0.6.0]: https://github.com/hsalap7/erlang_adk/tree/6448793
 [0.5.0]: https://github.com/hsalap7/erlang_adk/tree/b93a79b

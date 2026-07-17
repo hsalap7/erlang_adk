@@ -19,6 +19,12 @@ defmodule ErlangAdkUi.TestLiveGateway do
            :erlang_adk_ui
            |> Application.get_env(:test_live_voice_mode, :automatic)
            |> Atom.to_string(),
+         input_sample_rate:
+           Application.get_env(
+             :erlang_adk_ui,
+             :test_live_voice_input_sample_rate,
+             16_000
+           ),
          latest_sequence: 0,
          owner_digest: :crypto.hash(:sha256, principal)
        }
@@ -103,11 +109,26 @@ defmodule ErlangAdkUi.TestLiveGateway do
         bridge = spawn(fn -> voice_bridge_loop() end)
         token = make_ref()
 
+        input_sample_rate =
+          Application.get_env(:erlang_adk_ui, :test_live_voice_input_sample_rate, 16_000)
+
         voice_ref =
           {__MODULE__, :voice, requested_session_id, bridge, owner, identity.principal, token}
 
         notify({:voice_opened, requested_session_id, voice_ref, bridge})
-        {:ok, %{voice_ref: voice_ref, bridge: bridge}}
+
+        send(
+          owner,
+          {:adk_live_voice_frame, bridge,
+           <<1, 128, input_sample_rate::unsigned-big-integer-size(32), 1, 1>>}
+        )
+
+        {:ok,
+         %{
+           voice_ref: voice_ref,
+           bridge: bridge,
+           input_format: %{sample_rate: input_sample_rate, channels: 1, format: :pcm_s16le}
+         }}
     end
   end
 

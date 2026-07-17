@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-minimum_coverage="${ERLANG_ADK_MIN_COVERAGE:-73}"
+minimum_coverage="${ERLANG_ADK_MIN_COVERAGE:-74}"
 
 if [[ ! "${minimum_coverage}" =~ ^[0-9]+$ ]] ||
    (( minimum_coverage < 0 || minimum_coverage > 100 )); then

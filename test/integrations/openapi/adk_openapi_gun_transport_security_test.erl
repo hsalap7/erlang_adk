@@ -3,16 +3,46 @@
 -include_lib("eunit/include/eunit.hrl").
 
 openapi_gun_transport_security_test_() ->
-    [fun resolver_obeys_absolute_deadline/0,
+    [fun connection_options_bound_header_and_trailer_blocks/0,
+     fun resolver_obeys_absolute_deadline/0,
      fun resolver_dies_with_request_owner/0,
      fun resolver_heap_is_bounded/0,
+     fun resolver_accepts_address_component_boundaries/0,
+     fun resolver_accepts_exact_address_count_limit/0,
      fun resolver_result_count_is_bounded/0,
-     fun resolver_rejects_invalid_addresses/0,
+     fun resolver_rejects_malformed_results_fail_closed/0,
      fun private_override_preserves_explicit_loopback/0,
      fun embedded_and_transition_addresses_are_rejected/0,
      fun non_global_ipv4_ranges_are_rejected/0,
      fun non_global_ipv6_ranges_are_rejected/0,
      fun ordinary_global_addresses_are_accepted/0].
+
+connection_options_bound_header_and_trailer_blocks() ->
+    HttpOptions = adk_openapi_gun_transport:test_connection_options(
+                    #{scheme => <<"http">>}, 1000),
+    HttpsOptions = adk_openapi_gun_transport:test_connection_options(
+                     #{scheme => <<"https">>,
+                       host => <<"api.example.test">>}, 1000),
+    lists:foreach(
+      fun(Options) ->
+          ?assertEqual(
+             #{max_header_block_size => 65536,
+               max_trailer_block_size => 65536},
+             maps:get(http_opts, Options)),
+          ?assertEqual([http], maps:get(protocols, Options)),
+          ?assertEqual(0, maps:get(retry, Options)),
+          ?assert(maps:get(connect_timeout, Options) > 0)
+      end, [HttpOptions, HttpsOptions]),
+    ?assertEqual(tcp, maps:get(transport, HttpOptions)),
+    ?assertNot(maps:is_key(tls_opts, HttpOptions)),
+    ?assertEqual(tls, maps:get(transport, HttpsOptions)),
+    ?assert(maps:get(tls_handshake_timeout, HttpsOptions) > 0),
+    TlsOptions = maps:get(tls_opts, HttpsOptions),
+    ?assertEqual(verify_peer, proplists:get_value(verify, TlsOptions)),
+    ?assertEqual("api.example.test",
+                 proplists:get_value(server_name_indication, TlsOptions)),
+    ?assert(proplists:is_defined(customize_hostname_check, TlsOptions)),
+    ?assert(proplists:is_defined(cacerts, TlsOptions)).
 
 resolver_obeys_absolute_deadline() ->
     Parent = self(),
@@ -80,19 +110,62 @@ resolver_heap_is_bounded() ->
        adk_openapi_gun_transport:test_resolve_target(
          <<"heap.example">>, false, 1000, Resolver)).
 
+resolver_accepts_address_component_boundaries() ->
+    Addresses =
+        [{0, 0, 0, 0},
+         {255, 255, 255, 255},
+         {0, 0, 0, 0, 0, 0, 0, 0},
+         {16#ffff, 16#ffff, 16#ffff, 16#ffff,
+          16#ffff, 16#ffff, 16#ffff, 16#ffff}],
+    lists:foreach(
+      fun(Address) ->
+          ?assertEqual(
+             {ok, Address},
+             resolve(true, fun(_Host) -> [Address] end))
+      end, Addresses).
+
+resolver_accepts_exact_address_count_limit() ->
+    Addresses = [{8, 8, 8, Part} || Part <- lists:seq(1, 64)],
+    ?assertEqual(
+       {ok, {8, 8, 8, 1}},
+       resolve(false, fun(_Host) -> Addresses end)),
+    ?assertEqual(
+       {ok, {8, 8, 8, 8}},
+       resolve(false,
+               fun(_Host) -> lists:duplicate(64, {8, 8, 8, 8}) end)).
+
 resolver_result_count_is_bounded() ->
     Addresses = lists:duplicate(65, {8, 8, 8, 8}),
     ?assertEqual(
        {error, dns_resolution_failed},
        resolve(false, fun(_Host) -> Addresses end)).
 
-resolver_rejects_invalid_addresses() ->
+resolver_rejects_malformed_results_fail_closed() ->
+    InvalidResults =
+        [not_a_list,
+         <<"not a list">>,
+         #{address => {8, 8, 8, 8}},
+         [{8, 8, 8, 8} | invalid_tail],
+         [invalid_address],
+         [{8, 8, 8}],
+         [{8, 8, 8, 8, 8}],
+         [{-1, 8, 8, 8}],
+         [{256, 8, 8, 8}],
+         [{8.0, 8, 8, 8}],
+         [{8, 8, 8, invalid_part}],
+         [{-1, 0, 0, 0, 0, 0, 0, 1}],
+         [{16#10000, 0, 0, 0, 0, 0, 0, 1}],
+         [{16#2001, 0.0, 0, 0, 0, 0, 0, 1}],
+         [{16#2001, invalid_part, 0, 0, 0, 0, 0, 1}]],
+    lists:foreach(
+      fun(Result) ->
+          ?assertEqual(
+             {error, dns_resolution_failed},
+             resolve(true, fun(_Host) -> Result end))
+      end, InvalidResults),
     ?assertEqual(
        {error, dns_resolution_failed},
-       resolve(false, fun(_Host) -> [{999, 8, 8, 8}] end)),
-    ?assertEqual(
-       {error, dns_resolution_failed},
-       resolve(false, fun(_Host) -> [{8, 8, 8, 8} | invalid_tail] end)).
+       resolve(true, fun(_Host) -> [] end)).
 
 private_override_preserves_explicit_loopback() ->
     Loopback = fun(_Host) -> [{127, 0, 0, 1}] end,

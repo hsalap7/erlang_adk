@@ -46,7 +46,15 @@ reason_classification_contract_test() ->
     {adk_failure, MissingMetadata} =
         adk_failure:external(
           component, operation, {adk_failure, #{class => external}}),
-    ?assertEqual(failure, maps:get(reason, MissingMetadata)).
+    ?assertEqual(failure, maps:get(reason, MissingMetadata)),
+    Port = open_port({spawn_driver, "ram_file_drv"}, [binary]),
+    try
+        {adk_failure, PortMetadata} =
+            adk_failure:external(component, operation, Port),
+        ?assertEqual(port_failure, maps:get(reason, PortMetadata))
+    after
+        catch port_close(Port)
+    end.
 
 callback_and_sanitize_contract_test() ->
     Existing = adk_failure:external(component, operation, existing),
@@ -123,7 +131,24 @@ correlation_fingerprints_are_allowlisted_and_bounded_test() ->
         adk_failure:external(
           component, operation, [#{request_id => <<"kept">>} | tail]),
     ?assertMatch(#{request_id := _},
-                 maps:get(correlation, ImproperMetadata)).
+                 maps:get(correlation, ImproperMetadata)),
+
+    %% Exercise both accepted JSON spellings for every public correlation key.
+    AlternateSpellings =
+        #{task_ref => <<"task-atom">>,
+          correlation_id => <<"correlation-atom">>,
+          <<"invocation_id">> => <<"invocation-binary">>,
+          <<"call_id">> => <<"call-binary">>,
+          <<"request_id">> => <<"request-binary">>},
+    {adk_failure, AlternateMetadata} =
+        adk_failure:external(component, operation, AlternateSpellings),
+    AlternateCorrelation = maps:get(correlation, AlternateMetadata),
+    ?assertEqual(
+       lists:sort([task_ref, correlation_id, invocation_id,
+                   call_id, request_id]),
+       lists:sort(maps:keys(AlternateCorrelation))),
+    [?assertEqual(24, byte_size(Value))
+     || Value <- maps:values(AlternateCorrelation)].
 
 model_and_log_views_are_json_safe_test() ->
     Failure = adk_failure:external(

@@ -85,6 +85,8 @@ function hook() {
     starting: false,
     muted: false,
     inputSequence: 0n,
+    inputSampleRate: null,
+    inputConfigWaiter: null,
     lastServerSequence: 0n,
     transcripts: {input: "", output: ""},
     transcriptFinal: {input: true, output: true},
@@ -146,6 +148,25 @@ function lifecycleFrame(sequence, state) {
   view.setBigUint64(2, BigInt(sequence))
   view.setUint8(10, state)
   return frame
+}
+
+function inputConfigFrame(sampleRate, channels = 1, format = 1) {
+  const frame = new ArrayBuffer(8)
+  const view = new DataView(frame)
+  view.setUint8(0, 1)
+  view.setUint8(1, 128)
+  view.setUint32(2, sampleRate)
+  view.setUint8(6, channels)
+  view.setUint8(7, format)
+  return frame
+}
+
+function negotiateInput(voice, socket, sampleRate = 16_000) {
+  voice.socket = socket
+  const ready = voice.waitForInputConfig(voice.generation, socket, 1_000)
+  voice.handleServerMessage(inputConfigFrame(sampleRate))
+  assert.equal(voice.inputSampleRate, sampleRate)
+  return ready
 }
 
 function audioFrame(sequence, samples = 320, sampleRate = 24_000, channels = 1) {
@@ -233,6 +254,100 @@ test("a microphone granted after Stop is immediately released", async () => {
   assert.equal(voice.running, false)
 })
 
+test("server input config negotiates 24 kHz without consuming event sequence or ACK credit", async () => {
+  installBrowser(() => {}, async () => { throw new Error("unused") })
+  const voice = hook()
+  const socket = new FakeSocket()
+  socket.readyState = FakeSocket.OPEN
+  voice.socket = socket
+  voice.generation = 4
+  voice.starting = true
+  voice.inputSampleRate = null
+
+  const configured = voice.waitForInputConfig(4, socket, 1_000)
+  voice.handleServerMessage(inputConfigFrame(24_000))
+
+  assert.equal(await configured, 24_000)
+  assert.equal(voice.inputSampleRate, 24_000)
+  assert.equal(voice.lastServerSequence, 0n)
+  assert.equal(socket.sent.length, 0)
+})
+
+test("microphone frames carry the server-negotiated 24 kHz input rate", async () => {
+  installBrowser(() => {}, async () => { throw new Error("unused") })
+  const voice = hook()
+  const socket = new FakeSocket()
+  socket.readyState = FakeSocket.OPEN
+  const portMessages = []
+  voice.socket = socket
+  voice.running = true
+  assert.equal(await negotiateInput(voice, socket, 24_000), 24_000)
+  voice.captureNode = {
+    port: {postMessage: (message) => portMessages.push(message)},
+  }
+
+  voice.handleCapture({type: "pcm", buffer: new ArrayBuffer(480 * 2)})
+
+  assert.equal(socket.sent.length, 1)
+  const view = new DataView(socket.sent[0])
+  assert.equal(view.getUint8(1), 1)
+  assert.equal(view.getUint32(10), 24_000)
+  assert.equal(view.getUint8(14), 1)
+  assert.deepEqual(portMessages, [{type: "credit", count: 1}])
+})
+
+test("unsupported server input config fails closed", () => {
+  installBrowser(() => {}, async () => { throw new Error("unused") })
+  const voice = hook()
+  const socket = new FakeSocket()
+  socket.readyState = FakeSocket.OPEN
+  voice.socket = socket
+  voice.running = true
+  voice.inputSampleRate = null
+
+  voice.handleServerMessage(inputConfigFrame(48_000))
+
+  assert.equal(voice.running, false)
+  assert.equal(socket.readyState, FakeSocket.CLOSED)
+  assert.match(voice.status.textContent, /invalid frame/i)
+})
+
+test("server events before mandatory input config fail closed without ACK", () => {
+  installBrowser(() => {}, async () => { throw new Error("unused") })
+  const voice = hook()
+  const socket = new FakeSocket()
+  socket.readyState = FakeSocket.OPEN
+  voice.socket = socket
+  voice.running = true
+
+  voice.handleServerMessage(lifecycleFrame(1, 3))
+
+  assert.equal(socket.sent.length, 0)
+  assert.equal(voice.running, false)
+  assert.equal(socket.readyState, FakeSocket.CLOSED)
+  assert.match(voice.status.textContent, /invalid frame/i)
+})
+
+test("microphone chunks before mandatory input config fail closed without sending", () => {
+  installBrowser(() => {}, async () => { throw new Error("unused") })
+  const voice = hook()
+  const socket = new FakeSocket()
+  socket.readyState = FakeSocket.OPEN
+  voice.socket = socket
+  voice.running = true
+  voice.captureNode = {
+    port: {postMessage() {}, close() {}},
+    disconnect() {},
+  }
+
+  voice.handleCapture({type: "pcm", buffer: new ArrayBuffer(320 * 2)})
+
+  assert.equal(socket.sent.length, 0)
+  assert.equal(voice.running, false)
+  assert.equal(socket.readyState, FakeSocket.CLOSED)
+  assert.match(voice.status.textContent, /not negotiated/i)
+})
+
 for (const [state, expected] of [
   [5, "reconnecting"],
   [8, "session closed"],
@@ -248,6 +363,7 @@ for (const [state, expected] of [
     voice.audioContext.state = "running"
     voice.running = true
     voice.generation = 1
+    await negotiateInput(voice, socket)
 
     voice.handleServerMessage(lifecycleFrame(1, state))
     assert.equal(socket.sent.length, 1)
@@ -300,6 +416,7 @@ test("duplicate server sequences cannot apply transcript side effects", () => {
   socket.readyState = FakeSocket.OPEN
   voice.socket = socket
   voice.running = true
+  void negotiateInput(voice, socket)
 
   const transcriptionFrame = (sequence, text) => {
     const encoded = new TextEncoder().encode(text)
@@ -383,6 +500,7 @@ test("audio is not acknowledged when suspension races ahead of statechange deliv
   voice.audioContext = audioContext
   voice.running = true
   voice.generation = 4
+  void negotiateInput(voice, socket)
 
   voice.handleServerMessage(audioFrame(1))
 
@@ -441,6 +559,7 @@ test("a failed microphone send terminates without returning worklet credit", () 
     },
     disconnect() {},
   }
+  void negotiateInput(voice, socket)
 
   voice.handleCapture({type: "pcm", buffer: new ArrayBuffer(640), level: 0.25})
 
@@ -459,6 +578,7 @@ test("one long server audio frame is segmented without dropping its unscheduled 
   voice.socket = socket
   voice.audioContext = context
   voice.running = true
+  void negotiateInput(voice, socket)
 
   voice.handleServerMessage(audioFrame(1, 60_000))
 
@@ -505,6 +625,7 @@ test("bursty long replies remain continuous and bounded by deferred exact ACK cr
   voice.socket = socket
   voice.audioContext = context
   voice.running = true
+  void negotiateInput(voice, socket)
 
   for (let sequence = 1; sequence <= 28; sequence += 1) {
     voice.handleServerMessage(audioFrame(sequence, 2_400))
@@ -546,6 +667,7 @@ test("interruption releases canceled pending credit and cannot drain stale audio
   voice.socket = socket
   voice.audioContext = context
   voice.running = true
+  void negotiateInput(voice, socket)
 
   for (let sequence = 1; sequence <= 27; sequence += 1) {
     voice.handleServerMessage(audioFrame(sequence, 2_400))
@@ -576,6 +698,7 @@ test("terminal cleanup drops pending audio without stale ACKs before closing", a
   voice.audioContext = context
   voice.running = true
   voice.generation = 6
+  await negotiateInput(voice, socket)
 
   for (let sequence = 1; sequence <= 22; sequence += 1) {
     voice.handleServerMessage(audioFrame(sequence, 2_400))

@@ -5,22 +5,36 @@
 fixed_origin_and_strict_options_test() ->
     ApiKey = <<"key with ? and & delimiters">>,
     ?assertMatch({ok, _},
-                 adk_live_gun_transport:test_validate_options(
+                 adk_live_gun_transport:validate_options(
                    #{api_key => ApiKey})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => ApiKey,
            base_url => <<"wss://attacker.invalid">>})),
-    Path = adk_live_gun_transport:test_endpoint_path(ApiKey),
+    Path = adk_live_gun_transport:endpoint_path(ApiKey),
     [FixedPath, Query] = binary:split(Path, <<"?">>),
     ?assertEqual(
        <<"/ws/google.ai.generativelanguage.v1beta."
          "GenerativeService.BidiGenerateContent">>, FixedPath),
     ?assertEqual([{<<"key">>, ApiKey}], uri_string:dissect_query(Query)).
 
+handoff_and_policy_share_rejection_test() ->
+    Options = #{api_key => <<"test-key">>,
+                base_url => <<"wss://attacker.invalid">>},
+    Expected = adk_live_gun_transport:validate_options(Options),
+    ?assertEqual({error, invalid_transport_options}, Expected),
+    HandoffRef = make_ref(),
+    {ok, Awaiting} = adk_live_gun_transport:init(HandoffRef),
+    ?assertMatch(
+       {reply, Expected, Awaiting},
+       adk_live_gun_transport:handle_call(
+         {handoff, HandoffRef, self(), Options},
+         {self(), make_ref()}, Awaiting)),
+    ok = adk_live_gun_transport:terminate(normal, Awaiting).
+
 tls_retry_deadline_and_flow_options_test() ->
-    Options = adk_live_gun_transport:test_gun_options(
+    Options = gun_options(
                 #{api_key => <<"test-key">>,
                   connect_timeout_ms => 1200,
                   tls_handshake_timeout_ms => 1300,
@@ -45,50 +59,50 @@ tls_retry_deadline_and_flow_options_test() ->
 invalid_credentials_and_bounds_test() ->
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(#{})),
+       adk_live_gun_transport:validate_options(#{})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(#{api_key => <<>>})),
+       adk_live_gun_transport:validate_options(#{api_key => <<>>})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => "not-a-binary"})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>, credential_ref => make_ref()})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>, ws_flow => 0})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>,
            max_server_frame_bytes => 100000000})),
     ?assertMatch(
        {ok, _},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>, cacertfile => <<"/tmp/ca.pem">>})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>, cacertfile => <<>>})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>, cacertfile => [0]})),
     ?assertEqual(
        {error, invalid_transport_options},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{api_key => <<"key">>, cacertfile => invalid})),
-    BinaryCa = adk_live_gun_transport:test_gun_options(
+    BinaryCa = gun_options(
                  #{api_key => <<"key">>,
                    cacertfile => <<"/tmp/test-ca.pem">>}),
     ?assert(lists:member(
               {cacertfile, "/tmp/test-ca.pem"},
               maps:get(tls_opts, BinaryCa))),
-    ListCa = adk_live_gun_transport:test_gun_options(
+    ListCa = gun_options(
                #{api_key => <<"key">>,
                  cacertfile => "/tmp/test-ca.pem"}),
     ?assert(lists:member(
@@ -176,7 +190,7 @@ gun_up_resolves_credential_and_starts_strict_upgrade_test() ->
             ?assertEqual([{<<"key">>, Secret}],
                          uri_string:dissect_query(Query)),
             ?assert(lists:member(
-                      {<<"user-agent">>, <<"erlang-adk/0.7">>},
+                      {<<"user-agent">>, <<"erlang-adk/0.8">>},
                       Headers)),
             ?assertEqual(3, maps:get(flow, WsOptions)),
             ?assertEqual(false, maps:get(compress, WsOptions)),
@@ -262,7 +276,7 @@ opaque_credential_and_frame_end_event_test() ->
         adk_live_credential_broker:start(self(), Secret),
     ?assertMatch(
        {ok, _},
-       adk_live_gun_transport:test_validate_options(
+       adk_live_gun_transport:validate_options(
          #{credential_ref => CredentialRef})),
     {adk_live_credential, Broker, _Token} = CredentialRef,
     ?assertEqual(nomatch,
@@ -551,6 +565,11 @@ gun_event_handler_send_end_fallbacks_test() ->
        adk_live_gun_event_h:ws_send_frame_end(
          #{stream_ref => StreamRef}, NonPidOwner)),
     assert_no_gun_event().
+
+gun_options(Options) ->
+    {ok, Checked} = adk_live_gun_transport:validate_options(Options),
+    {ok, GunOptions} = adk_live_gun_transport:gun_options(Checked),
+    GunOptions.
 
 transport_state(Phase) ->
     #{phase => Phase,

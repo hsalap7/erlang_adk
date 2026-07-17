@@ -1,11 +1,16 @@
 import {StreamingPcmDownsampler, encodePcm16Le} from "./pcm_downsampler.mjs"
 
+const SUPPORTED_TARGET_SAMPLE_RATES = new Set([16_000, 24_000])
+
 class AdkPcmCaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super()
     const processorOptions = options.processorOptions || {}
     this.targetSampleRate = processorOptions.targetSampleRate || 16_000
-    this.chunkSamples = processorOptions.chunkSamples || 320
+    if (!SUPPORTED_TARGET_SAMPLE_RATES.has(this.targetSampleRate)) {
+      throw new RangeError("unsupported voice input sample rate")
+    }
+    this.chunkSamples = processorOptions.chunkSamples || this.targetSampleRate / 50
     const requestedCredit = Number(processorOptions.maxInFlightChunks)
     this.maxInFlightChunks =
       Number.isInteger(requestedCredit) && requestedCredit >= 1 && requestedCredit <= 50

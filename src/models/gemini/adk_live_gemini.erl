@@ -6,7 +6,7 @@
 -module(adk_live_gemini).
 -behaviour(adk_live_provider).
 
--export([model/0, capabilities/0, validate_config/1,
+-export([model/0, capabilities/0, validate_config/1, transport/0,
          setup_frame/1, resume_setup_frame/2,
          encode_client/2, decode_server/2]).
 
@@ -18,11 +18,18 @@
 -spec model() -> binary().
 model() -> ?MODEL.
 
+%% @doc Return the adapter-owned production transport. This keeps binary
+%% provider profiles from accepting caller-selected transport modules while
+%% preserving explicit transport injection for legacy deterministic tests.
+-spec transport() -> module().
+transport() -> adk_live_gun_transport.
+
 -spec capabilities() -> map().
 capabilities() ->
     #{live => true,
       model => ?MODEL,
       input_modalities => [text, audio, image],
+      input_audio_sample_rate => 16000,
       response_modalities => [audio],
       function_calling => synchronous,
       google_search => true,

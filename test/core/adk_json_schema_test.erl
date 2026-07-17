@@ -69,6 +69,25 @@ schema_keyword_rejection_contract_test() ->
     [assert_compile_error(Schema, Path, Reason)
      || {Schema, Path, Reason} <- Vectors].
 
+invalid_schema_validation_preserves_compile_error_test() ->
+    ?assertEqual(
+       {error, {invalid_json_schema, [<<"type">>], unknown_type}},
+       adk_json_schema:validate(
+         #{<<"type">> => <<"mystery">>}, ignored_value)),
+    ?assertEqual(
+       {error, {invalid_json_schema, [<<"type">>], unknown_type}},
+       adk_json_schema:compile(
+         #{<<"type">> => [<<"string">>, <<"mystery">>]})).
+
+schema_normalization_rejects_duplicate_canonical_keys_test() ->
+    ?assertEqual(
+       {error,
+        {invalid_json_schema, [],
+         {not_json_safe,
+          {duplicate_map_key, [], <<"atom_key">>}}}},
+       adk_json_schema:compile(
+         #{atom_key => true, <<"atom_key">> => false})).
+
 const_enum_and_composition_validation_test() ->
     ConstEnum = #{<<"const">> => <<"ready">>,
                   <<"enum">> => [<<"ready">>, <<"done">>]},

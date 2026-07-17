@@ -7,7 +7,7 @@ for installation and executable examples.
 ## Release and project documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — cumulative changes from 0.3.0 through
-  0.7.0, fixes, evidence, and visible release limitations.
+  the 0.8.0 release candidate, fixes, evidence, and visible limitations.
 - [`TESTING.md`](TESTING.md) — deterministic, paid-provider, Phoenix, browser,
   packaging, and audit gates.
 - [`TEST_LAYOUT.md`](TEST_LAYOUT.md) — test ownership, recursive discovery,
@@ -23,8 +23,9 @@ for installation and executable examples.
   and pull-request expectations.
 - [`FEATURE_PARITY.md`](FEATURE_PARITY.md) — current ADK behavior-family status
   with explicit partial and adapter-owned surfaces.
-- [`README_EXAMPLE_COVERAGE.md`](README_EXAMPLE_COVERAGE.md) — stable fence IDs
-  and the exact tests or prerequisites for every README example.
+- [`README_EXAMPLE_COVERAGE.md`](README_EXAMPLE_COVERAGE.md) — current README
+  recipes and sanity checks mapped to prerequisites, deterministic coverage,
+  and optional live validation.
 
 ## Runtime and workflow guides
 
@@ -52,6 +53,10 @@ for installation and executable examples.
 
 ## Providers, plugins, evaluation, and observability
 
+- [`PROVIDER_PROFILES.md`](PROVIDER_PROFILES.md) — recommended binary profile
+  configuration for Gemini, native OpenAI Responses, native Anthropic
+  Messages, compatible Chat Completions, Gemini Live, and OpenAI Realtime,
+  including credential and authority boundaries.
 - [`GEMINI_GROUNDING.md`](GEMINI_GROUNDING.md) — Google Search grounding,
   bounded provider metadata, streaming, and failure behavior.
 - [`PLUGINS_OBSERVABILITY_EVALUATION.md`](PLUGINS_OBSERVABILITY_EVALUATION.md)
@@ -77,6 +82,9 @@ not implicit release claims.
 - [`VERSION_0_7_0.md`](VERSION_0_7_0.md) — Gemini Live/multimodal sessions,
   plugins, evaluation, expanded observability, developer projections, and
   browser voice.
+- [`VERSION_0_8_0.md`](VERSION_0_8_0.md) — model provider profiles, native
+  OpenAI/Anthropic request adapters, compatible vendors, shared model
+  transport, and OpenAI Realtime bidirectional sessions.
 
 ## Model and test terminology
 
@@ -90,3 +98,11 @@ The project has two separate Gemini gates:
 Both require `GEMINI_API_KEY` in the same environment as Common Test. They use
 network access, quota, and billable API calls, so they skip unless explicitly
 enabled. A skip or quota failure is never counted as a deterministic pass.
+
+OpenAI Responses, Anthropic Messages, compatible Chat Completions, and OpenAI
+Realtime passed deterministic injected-transport/codec coverage in the 0.8
+release gate. The repository does not provide equivalent first-party paid
+Common Test suites for them. A configured key or passing fixture must not be
+reported as remote-provider success. The 2026-07-17 Gemini REST and Live
+attempts were external credential failures, recorded separately from passing
+deterministic evidence; see [`TESTING.md`](TESTING.md).

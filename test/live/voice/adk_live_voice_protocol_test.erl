@@ -4,9 +4,14 @@
 client_audio_and_control_frames_are_exact_test() ->
     Pcm = <<0, 0, 1, 0>>,
     ?assertEqual(
-       {ok, {audio, 1, Pcm}},
+       {ok, {audio, 1, 16000, Pcm}},
        adk_live_voice_protocol:decode_client(
          <<1, 1, 1:64/unsigned-big, 16000:32/unsigned-big, 1, Pcm/binary>>,
+         64)),
+    ?assertEqual(
+       {ok, {audio, 2, 24000, Pcm}},
+       adk_live_voice_protocol:decode_client(
+         <<1, 1, 2:64/unsigned-big, 24000:32/unsigned-big, 1, Pcm/binary>>,
          64)),
     ?assertEqual(
        {ok, audio_stream_end},
@@ -41,7 +46,8 @@ malformed_client_frames_are_rejected_test() ->
       end, Invalid),
     InvalidAudio =
       [<<1, 1, 0:64/unsigned-big, 16000:32/unsigned-big, 1, Pcm/binary>>,
-       <<1, 1, 1:64/unsigned-big, 24000:32/unsigned-big, 1, Pcm/binary>>,
+       <<1, 1, 1:64/unsigned-big, 8000:32/unsigned-big, 1, Pcm/binary>>,
+       <<1, 1, 1:64/unsigned-big, 48000:32/unsigned-big, 1, Pcm/binary>>,
        <<1, 1, 1:64/unsigned-big, 16000:32/unsigned-big, 2, Pcm/binary>>,
        <<1, 1, 1:64/unsigned-big, 16000:32/unsigned-big, 1>>,
        <<1, 1, 1:64/unsigned-big, 16000:32/unsigned-big, 1, 0>>],
@@ -65,6 +71,28 @@ oversized_audio_is_rejected_before_media_admission_test() ->
     ?assertEqual(
        {error, live_voice_audio_frame_too_large},
        adk_live_voice_protocol:decode_client(Frame, 64)).
+
+server_input_format_config_is_exact_and_unsequenced_test() ->
+    ?assertEqual(
+       {ok, <<1, 128, 16000:32/unsigned-big, 1, 1>>},
+       adk_live_voice_protocol:encode_input_config(
+         #{sample_rate => 16000, channels => 1, format => pcm_s16le})),
+    ?assertEqual(
+       {ok, <<1, 128, 24000:32/unsigned-big, 1, 1>>},
+       adk_live_voice_protocol:encode_input_config(
+         #{sample_rate => 24000, channels => 1, format => pcm_s16le})),
+    Invalid =
+      [#{sample_rate => 8000, channels => 1, format => pcm_s16le},
+       #{sample_rate => 16000, channels => 2, format => pcm_s16le},
+       #{sample_rate => 16000, channels => 1, format => pcm_f32le},
+       #{sample_rate => 16000, channels => 1, format => pcm_s16le,
+         untrusted => true}],
+    lists:foreach(
+      fun(Config) ->
+          ?assertEqual(
+             {error, invalid_live_voice_config},
+             adk_live_voice_protocol:encode_input_config(Config))
+      end, Invalid).
 
 server_audio_transcription_and_lifecycle_layout_test() ->
     Pcm = <<0, 0, 1, 0>>,

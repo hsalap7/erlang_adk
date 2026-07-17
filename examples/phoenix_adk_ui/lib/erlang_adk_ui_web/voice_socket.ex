@@ -182,6 +182,9 @@ defmodule ErlangAdkUiWeb.VoiceSocket do
   defp init_error({:error, :voice_session_not_active}),
     do: {:stop, :voice_session_not_active, {1013, "voice session not active"}, %{}}
 
+  defp init_error({:error, :voice_input_format_unavailable}),
+    do: {:stop, :voice_input_format_unavailable, {1013, "voice input format unavailable"}, %{}}
+
   defp init_error({:error, :live_voice_bridge_already_attached}),
     do: {:stop, :voice_busy, {1013, "voice session already in use"}, %{}}
 
@@ -203,6 +206,9 @@ defmodule ErlangAdkUiWeb.VoiceSocket do
     do: protocol_error(state)
 
   defp frame_error({:error, {:invalid_live_voice_audio, _reason}}, state),
+    do: protocol_error(state)
+
+  defp frame_error({:error, {:unexpected_live_voice_input_sample_rate, _expected}}, state),
     do: protocol_error(state)
 
   defp frame_error({:error, reason}, state)

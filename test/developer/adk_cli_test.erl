@@ -8,15 +8,24 @@ cli_test_() ->
     {setup,
      fun setup/0,
      fun cleanup/1,
-     [fun doctor_redacts_environment_case/0,
+     [fun command_dispatch_contract_case/0,
+      fun doctor_redacts_environment_case/0,
+      fun doctor_missing_credentials_case/0,
       fun checked_config_validation_case/0,
+      fun rich_gemini_config_translation_case/0,
+      fun native_provider_config_validation_case/0,
+      fun configured_profile_precedes_builtin_cli_alias_case/0,
+      fun config_error_contracts_case/0,
       fun checked_repository_examples_case/0,
       fun config_rejects_embedded_secret_case/0,
       fun deterministic_run_case/0,
       fun deterministic_console_case/0,
+      fun console_control_contracts_case/0,
       fun deterministic_evaluation_case/0,
       fun versioned_evaluation_case/0,
+      fun evaluation_validation_contracts_case/0,
       fun option_and_url_validation_case/0,
+      fun remote_command_validation_contracts_case/0,
       fun developer_connection_failure_is_structured_case/0,
       fun oversized_chunked_developer_success_is_bounded_case/0,
       fun oversized_chunked_developer_error_is_bounded_case/0,
@@ -29,16 +38,48 @@ setup() ->
 cleanup(_State) ->
     ok.
 
+command_dispatch_contract_case() ->
+    Usage = adk_cli:usage(),
+    ?assertEqual({ok, Usage}, adk_cli:command([])),
+    ?assertEqual({ok, Usage}, adk_cli:command(["help"])),
+    ?assertEqual({ok, Usage}, adk_cli:command(["--help"])),
+    ?assertNotEqual(nomatch, binary:match(Usage, <<"adk live send">>)),
+    ?assertNotEqual(nomatch, binary:match(Usage, <<"adk eval run">>)),
+    ?assertEqual({error, invalid_command},
+                 adk_cli:command(["not-a-command"])),
+    ?assertEqual({error, {unknown_option, "--bogus"}},
+                 adk_cli:command(["run", "--bogus", "value"])),
+    ?assertEqual({error, {missing_option_value, "--message"}},
+                 adk_cli:command(["run", "--message"])),
+    ?assertEqual({error, {missing_required_options, [config, message]}},
+                 adk_cli:command(["run"])),
+    ?assertEqual({error, {missing_required_options, [config, dataset]}},
+                 adk_cli:command(["evaluate"])),
+    ?assertEqual({error, {missing_required_options, [config, eval_set]}},
+                 adk_cli:command(["eval", "run"])).
+
 doctor_redacts_environment_case() ->
     ApiSecret = "cli-doctor-api-secret-61d9",
+    OpenAiSecret = "cli-doctor-openai-secret-77a1",
+    AnthropicSecret = "cli-doctor-anthropic-secret-29c4",
     DevSecret = "cli-doctor-dev-secret-43c7",
     OldApi = os:getenv("GEMINI_API_KEY"),
+    OldOpenAi = os:getenv("OPENAI_API_KEY"),
+    OldAnthropic = os:getenv("ANTHROPIC_API_KEY"),
     OldDev = os:getenv("ERLANG_ADK_DEV_TOKEN"),
     try
         true = os:putenv("GEMINI_API_KEY", ApiSecret),
+        true = os:putenv("OPENAI_API_KEY", OpenAiSecret),
+        true = os:putenv("ANTHROPIC_API_KEY", AnthropicSecret),
         true = os:putenv("ERLANG_ADK_DEV_TOKEN", DevSecret),
         {ok, Report} = adk_cli:command(["doctor"]),
         ?assertEqual(true, maps:get(gemini_api_key_configured, Report)),
+        ?assertEqual(true, maps:get(openai_api_key_configured, Report)),
+        ?assertEqual(true, maps:get(anthropic_api_key_configured, Report)),
+        Providers = maps:get(providers, Report),
+        ?assertEqual(available, maps:get(openai, Providers)),
+        ?assertEqual(available, maps:get(anthropic, Providers)),
+        ?assertEqual(available, maps:get(compatible, Providers)),
         ?assertEqual(true, maps:get(developer_token_configured, Report)),
         Dependencies = maps:get(dependencies, Report),
         ?assertEqual(available, maps:get(oidcc, Dependencies)),
@@ -48,10 +89,40 @@ doctor_redacts_environment_case() ->
         ?assertEqual(nomatch,
                      binary:match(Encoded, list_to_binary(ApiSecret))),
         ?assertEqual(nomatch,
+                     binary:match(Encoded, list_to_binary(OpenAiSecret))),
+        ?assertEqual(nomatch,
+                     binary:match(Encoded, list_to_binary(AnthropicSecret))),
+        ?assertEqual(nomatch,
                      binary:match(Encoded, list_to_binary(DevSecret)))
     after
         restore_env("GEMINI_API_KEY", OldApi),
+        restore_env("OPENAI_API_KEY", OldOpenAi),
+        restore_env("ANTHROPIC_API_KEY", OldAnthropic),
         restore_env("ERLANG_ADK_DEV_TOKEN", OldDev)
+    end.
+
+doctor_missing_credentials_case() ->
+    OldApi = os:getenv("GEMINI_API_KEY"),
+    OldDev = os:getenv("ERLANG_ADK_DEV_TOKEN"),
+    OldEnabled = application:get_env(erlang_adk, dev_enabled),
+    try
+        true = os:unsetenv("GEMINI_API_KEY"),
+        true = os:unsetenv("ERLANG_ADK_DEV_TOKEN"),
+        ok = application:set_env(erlang_adk, dev_enabled, true),
+        {ok, Report} = adk_cli:command(["doctor"]),
+        ?assertEqual(false, maps:get(gemini_api_key_configured, Report)),
+        ?assertEqual(false, maps:get(developer_token_configured, Report)),
+        Warnings = maps:get(warnings, Report),
+        ?assert(lists:member(
+                  <<"GEMINI_API_KEY is not configured; live model calls will fail">>,
+                  Warnings)),
+        ?assert(lists:member(
+                  <<"dev_enabled is true but ERLANG_ADK_DEV_TOKEN is missing">>,
+                  Warnings))
+    after
+        restore_env("GEMINI_API_KEY", OldApi),
+        restore_env("ERLANG_ADK_DEV_TOKEN", OldDev),
+        restore_application_env([{dev_enabled, OldEnabled}])
     end.
 
 checked_config_validation_case() ->
@@ -89,6 +160,185 @@ checked_config_validation_case() ->
     after
         _ = file:delete(Path)
     end.
+
+rich_gemini_config_translation_case() ->
+    Path = temp_path("rich-gemini-agent"),
+    Config =
+        #{<<"name">> => <<"CliRichGemini">>,
+          <<"provider">> => <<"gemini">>,
+          <<"model">> => <<"gemini-3.1-flash-lite">>,
+          <<"instructions">> => <<"Use the complete checked surface.">>,
+          <<"global_instruction">> => <<"Keep credentials private.">>,
+          <<"input_schema">> => #{<<"type">> => <<"object">>},
+          <<"output_schema">> => #{<<"type">> => <<"string">>},
+          <<"output_key">> => <<"answer">>,
+          <<"include_contents">> => <<"include">>,
+          <<"history_policy">> => <<"exclude">>,
+          <<"temperature">> => 0.1,
+          <<"top_p">> => 0.9,
+          <<"top_k">> => 20,
+          <<"max_tokens">> => 256,
+          <<"candidate_count">> => 1,
+          <<"seed">> => 7,
+          <<"presence_penalty">> => 0.0,
+          <<"frequency_penalty">> => 0.0,
+          <<"stop_sequences">> => [<<"STOP">>],
+          <<"response_mime_type">> => <<"application/json">>,
+          <<"response_schema">> => #{<<"type">> => <<"object">>},
+          <<"thinking_config">> =>
+              #{<<"thinking_budget">> => 64,
+                <<"include_thoughts">> => false},
+          <<"safety_settings">> =>
+              [#{<<"category">> => <<"HARM_CATEGORY_HATE_SPEECH">>,
+                 <<"threshold">> => <<"BLOCK_ONLY_HIGH">>}],
+          <<"builtin_tools">> => [<<"google_search">>],
+          <<"required_capabilities">> =>
+              [<<"streaming">>, <<"function_calling">>,
+               <<"structured_output">>, <<"generation_config">>,
+               <<"multimodal">>, <<"thinking">>,
+               <<"safety_settings">>, <<"content_streaming">>,
+               <<"google_search_grounding">>],
+          <<"instruction_timeout_ms">> => 1000,
+          <<"artifact_timeout_ms">> => 1000,
+          <<"max_instruction_bytes">> => 4096,
+          <<"request_timeout">> => 2000,
+          <<"generation_config">> =>
+              #{<<"temperature">> => 0.2,
+                <<"top_p">> => 0.8,
+                <<"top_k">> => 10,
+                <<"max_output_tokens">> => 128,
+                <<"candidate_count">> => 1,
+                <<"seed">> => 8,
+                <<"presence_penalty">> => 0.1,
+                <<"frequency_penalty">> => 0.1,
+                <<"stop_sequences">> => [<<"END">>],
+                <<"response_mime_type">> => <<"text/plain">>,
+                <<"thinking_config">> =>
+                    #{<<"thinking_level">> => <<"low">>,
+                      <<"include_thoughts">> => true},
+                <<"safety_settings">> =>
+                    [#{<<"category">> =>
+                           <<"HARM_CATEGORY_DANGEROUS_CONTENT">>,
+                       <<"threshold">> => <<"BLOCK_MEDIUM_AND_ABOVE">>}]},
+          <<"runner_options">> =>
+              #{<<"run_timeout">> => 2000,
+                <<"max_llm_calls">> => 4,
+                <<"max_tool_rounds">> => 3,
+                <<"service_timeout">> => 1500,
+                <<"tool_execution">> => <<"serial">>}},
+    try
+        ok = file:write_file(Path, jsx:encode(Config)),
+        {ok, Result} = adk_cli:command(["config", "validate", Path]),
+        ?assertEqual(valid, maps:get(status, Result)),
+        ?assertEqual(<<"gemini">>, maps:get(provider, Result)),
+        ?assertEqual(<<"gemini-3.1-flash-lite">>, maps:get(model, Result))
+    after
+        _ = file:delete(Path)
+    end.
+
+native_provider_config_validation_case() ->
+    Cases = [
+        {"openai", #{<<"name">> => <<"CliOpenAI">>,
+                     <<"provider">> => <<"openai">>,
+                     <<"model">> => <<"gpt-test">>,
+                     <<"instructions">> => <<"Be concise.">>,
+                     <<"max_output_tokens">> => 128}},
+        {"anthropic", #{<<"name">> => <<"CliAnthropic">>,
+                        <<"provider">> => <<"anthropic">>,
+                        <<"model">> => <<"claude-test">>,
+                        <<"instructions">> => <<"Be concise.">>,
+                        <<"max_tokens">> => 128}}
+    ],
+    lists:foreach(
+      fun({Suffix, Config}) ->
+          Path = temp_path("native-provider-" ++ Suffix),
+          try
+              ok = file:write_file(Path, jsx:encode(Config)),
+              {ok, Result} = adk_cli:command(
+                               ["config", "validate", Path]),
+              ?assertEqual(valid, maps:get(status, Result)),
+              ?assertEqual(maps:get(<<"provider">>, Config),
+                           maps:get(provider, Result))
+          after
+              _ = file:delete(Path)
+          end
+      end, Cases).
+
+configured_profile_precedes_builtin_cli_alias_case() ->
+    Saved = save_application_env([provider_profiles]),
+    Path = temp_path("compatible-profile-agent"),
+    Profile =
+        #{request_adapter => adk_llm_compatible,
+          endpoint => #{scheme => https,
+                        host => <<"models.vendor.example">>,
+                        port => 443,
+                        base_path => <<"/v1">>},
+          models => #{<<"chat">> => <<"vendor-chat-model">>},
+          credential => none,
+          request_options => #{auth_scheme => none}},
+    Config =
+        #{<<"name">> => <<"CliCompatibleProfile">>,
+          <<"provider">> => <<"compatible">>,
+          <<"model">> => <<"chat">>,
+          <<"instructions">> => <<"Use the trusted profile.">>},
+    try
+        ok = application:set_env(
+               erlang_adk, provider_profiles,
+               #{<<"compatible">> => Profile}),
+        ok = file:write_file(Path, jsx:encode(Config)),
+        {ok, Result} = adk_cli:command(["config", "validate", Path]),
+        ?assertEqual(valid, maps:get(status, Result)),
+        ?assertEqual(<<"compatible">>, maps:get(provider, Result)),
+        ?assertEqual(<<"chat">>, maps:get(model, Result))
+    after
+        _ = file:delete(Path),
+        restore_application_env(Saved)
+    end.
+
+config_error_contracts_case() ->
+    assert_config_result("config-array", [],
+                         {error, agent_config_must_be_object}),
+    assert_config_bytes("config-invalid-json", <<"{not-json">>,
+                        {error, invalid_json}),
+    assert_config_result(
+      "config-unknown-key", #{<<"unexpected">> => true},
+      {error, {unknown_agent_config_keys, [<<"unexpected">>]}}),
+    assert_config_result("config-empty-name", #{<<"name">> => <<>>},
+                         {error, invalid_agent_name}),
+    assert_config_result("config-provider-type", #{<<"provider">> => 42},
+                         {error, invalid_provider_name}),
+    assert_config_result(
+      "config-provider-unknown", #{<<"provider">> => <<"unknown-vendor">>},
+      {error, {unknown_provider, <<"unknown-vendor">>}}),
+    assert_config_result("config-tools-shape", #{<<"tools">> => #{}},
+                         {error, tools_must_be_array}),
+    assert_config_result("config-tool-name", #{<<"tools">> => [42]},
+                         {error, invalid_tool_name}),
+    assert_config_result(
+      "config-tool-unknown", #{<<"tools">> => [<<"no_such_cli_tool">>]},
+      {error, {unknown_tool_module, <<"no_such_cli_tool">>}}),
+    assert_config_result(
+      "config-tool-callbacks", #{<<"tools">> => [<<"lists">>]},
+      {error, {invalid_tool_module, <<"lists">>}}),
+    assert_config_result(
+      "config-runner-shape", #{<<"runner_options">> => []},
+      {error, runner_options_must_be_object}),
+    assert_config_result(
+      "config-runner-unknown",
+      #{<<"runner_options">> => #{<<"surprise">> => 1}},
+      {error, {unknown_runner_options, [<<"surprise">>]}}),
+    assert_config_result(
+      "config-runner-value",
+      #{<<"runner_options">> => #{<<"run_timeout">> => 0}},
+      {error, {invalid_runner_option, <<"run_timeout">>}}),
+    assert_config_result(
+      "config-parallel-policy",
+      #{<<"runner_options">> =>
+            #{<<"tool_execution">> =>
+                  #{<<"mode">> => <<"parallel">>,
+                    <<"max_concurrency">> => 0,
+                    <<"tool_timeout">> => 1000}}},
+      {error, invalid_parallel_tool_policy}).
 
 checked_repository_examples_case() ->
     {ok, ConfigResult} = adk_cli:command(
@@ -207,6 +457,67 @@ deterministic_console_case() ->
               <<"adk-cli">>, <<"cli-console-user">>, FirstSession),
         _ = erlang_adk_session:delete_session(
               <<"adk-cli">>, <<"cli-console-user">>, SecondSession)
+    end.
+
+console_control_contracts_case() ->
+    Path = temp_path("console-controls-agent"),
+    InitialSession = unique_binary(<<"cli-console-controls">>),
+    InputKey = {console_control_inputs, make_ref()},
+    OutputKey = {console_control_outputs, make_ref()},
+    Config = #{<<"name">> => unique_binary(<<"CliConsoleControls">>),
+               <<"provider">> => <<"adk_llm_probe">>,
+               <<"response">> => <<"unused">>},
+    put(InputKey,
+        [<<"\n">>, <<"/help\n">>, <<"/inspect\n">>, <<"/new\n">>,
+         <<"/resume {}\n">>, <<"/unknown\n">>, <<"/quit\n">>]),
+    put(OutputKey, []),
+    Io = #{read => fun(_Prompt) ->
+                         case get(InputKey) of
+                             [Line | Rest] ->
+                                 put(InputKey, Rest),
+                                 {ok, Line};
+                             [] -> eof
+                         end
+                     end,
+           write => fun(Text) ->
+                          put(OutputKey, [Text | get(OutputKey)]),
+                          ok
+                      end},
+    try
+        ok = file:write_file(Path, jsx:encode(Config)),
+        {ok, Result} = adk_cli:command(
+                         ["console", "--config", Path,
+                          "--session", binary_to_list(InitialSession),
+                          "--timeout", "2000"], Io),
+        ?assertEqual(closed, maps:get(outcome, Result)),
+        ?assertEqual(0, maps:get(turns, Result)),
+        ?assertMatch(<<"session-", _/binary>>,
+                     maps:get(session_id, Result)),
+        Output = iolist_to_binary(lists:reverse(get(OutputKey))),
+        ?assertNotEqual(nomatch, binary:match(Output, <<"/session SESSION_ID">>)),
+        ?assertNotEqual(nomatch, binary:match(Output, <<"not_found">>)),
+        ?assertNotEqual(nomatch, binary:match(Output, <<"no_paused_run">>)),
+        ?assertNotEqual(nomatch,
+                        binary:match(Output, <<"unknown_console_command">>)),
+        ?assertEqual(
+           {error, invalid_console_io},
+           adk_cli:command(["console", "--config", Path], #{})),
+        BadInputIo = #{read => fun(_Prompt) -> unexpected end,
+                       write => fun(_Text) -> ok end},
+        ?assertEqual(
+           {error, {console_io_failed, <<"invalid_console_input">>}},
+           adk_cli:command(["console", "--config", Path], BadInputIo)),
+        EofIo = #{read => fun(_Prompt) -> eof end,
+                  write => fun(_Text) -> erlang:error(write_failed) end},
+        {ok, EofResult} = adk_cli:command(
+                            ["console", "--config", Path], EofIo),
+        ?assertEqual(eof, maps:get(outcome, EofResult))
+    after
+        erase(InputKey),
+        erase(OutputKey),
+        _ = file:delete(Path),
+        _ = erlang_adk_session:delete_session(
+              <<"adk-cli">>, <<"local-user">>, InitialSession)
     end.
 
 deterministic_evaluation_case() ->
@@ -336,6 +647,141 @@ versioned_evaluation_case() ->
         _ = file:delete(MarkdownPath)
     end.
 
+evaluation_validation_contracts_case() ->
+    AgentPath = temp_path("eval-validation-agent"),
+    DatasetPath = temp_path("eval-validation-dataset"),
+    SetPath = temp_path("eval-validation-set"),
+    CriteriaPath = temp_path("eval-validation-criteria"),
+    BaselinePath = temp_path("eval-validation-baseline"),
+    TolerancesPath = temp_path("eval-validation-tolerances"),
+    AgentConfig = #{<<"name">> => unique_binary(<<"CliEvalValidation">>),
+                    <<"provider">> => <<"adk_llm_probe">>,
+                    <<"response">> => <<"ERLANG">>},
+    BaseArgs = ["eval", "run", "--config", AgentPath,
+                "--eval-set", SetPath],
+    try
+        ok = file:write_file(AgentPath, jsx:encode(AgentConfig)),
+        ok = file:write_file(SetPath, jsx:encode(versioned_eval_set(<<"ERLANG">>))),
+        ok = file:write_file(DatasetPath, jsx:encode([])),
+
+        ?assertEqual(
+           {error, {invalid_positive_integer, timeout}},
+           adk_cli:command(["evaluate", "--config", AgentPath,
+                            "--dataset", DatasetPath, "--timeout", "0"])),
+        ?assertEqual(
+           {error, {invalid_positive_integer, concurrency}},
+           adk_cli:command(["evaluate", "--config", AgentPath,
+                            "--dataset", DatasetPath,
+                            "--concurrency", "many"])),
+        ?assertEqual({error, invalid_eval_report_format},
+                     adk_cli:command(BaseArgs ++ ["--format", "yaml"])),
+        ?assertEqual(
+           {error, invalid_eval_output_path},
+           adk_cli:command(BaseArgs ++ ["--output", "bad" ++ [0] ++ "path"])),
+        ?assertEqual(
+           {error, {invalid_positive_integer, samples}},
+           adk_cli:command(BaseArgs ++ ["--samples", "0"])),
+        ?assertEqual(
+           {error, {invalid_fraction, pass_rate_threshold}},
+           adk_cli:command(BaseArgs ++ ["--pass-rate-threshold", "1.1"])),
+        ?assertEqual(
+           {error, {invalid_fraction, sample_pass_rate_threshold}},
+           adk_cli:command(
+             BaseArgs ++ ["--sample-pass-rate-threshold", "not-a-number"])),
+        ?assertEqual(
+           {error, {invalid_empty_criteria_policy, empty_criteria}},
+           adk_cli:command(BaseArgs ++ ["--empty-criteria", "ignore"])),
+        ?assertEqual(
+           {error, {invalid_boolean, capture_events}},
+           adk_cli:command(BaseArgs ++ ["--capture-events", "yes"])),
+        ?assertEqual(
+           {error, baseline_required_for_comparison_options},
+           adk_cli:command(BaseArgs ++ ["--max-pass-rate-drop", "0.1"])),
+
+        ok = file:write_file(DatasetPath, jsx:encode(#{})),
+        ?assertEqual(
+           {error, dataset_must_be_array},
+           adk_cli:command(["evaluate", "--config", AgentPath,
+                            "--dataset", DatasetPath])),
+        lists:foreach(
+          fun({Value, Expected}) ->
+              ok = file:write_file(DatasetPath, jsx:encode(Value)),
+              ?assertEqual(
+                 Expected,
+                 adk_cli:command(["evaluate", "--config", AgentPath,
+                                  "--dataset", DatasetPath]))
+          end,
+          [{[42], {error, {invalid_dataset_row, 1}}},
+           {[#{<<"input">> => <<"x">>, <<"expected">> => <<"x">>,
+                <<"extra">> => true}],
+            {error, {invalid_dataset_row, 1}}}]),
+
+        ok = file:write_file(SetPath, jsx:encode([])),
+        ?assertEqual({error, eval_set_must_be_object},
+                     adk_cli:command(BaseArgs)),
+        ok = file:write_file(SetPath, jsx:encode(#{})),
+        ?assertMatch({error, {invalid_eval_set, _}},
+                     adk_cli:command(BaseArgs)),
+        ok = file:write_file(SetPath, jsx:encode(versioned_eval_set(<<"ERLANG">>))),
+
+        ok = file:write_file(CriteriaPath, jsx:encode(#{})),
+        ?assertEqual({error, eval_criteria_must_be_array},
+                     adk_cli:command(BaseArgs ++ ["--criteria", CriteriaPath])),
+        ok = file:write_file(
+               CriteriaPath,
+               jsx:encode(#{<<"criteria">> => [], <<"extra">> => true})),
+        ?assertEqual(
+           {error, {unknown_eval_criteria_keys, [<<"extra">>]}},
+           adk_cli:command(BaseArgs ++ ["--criteria", CriteriaPath])),
+        ok = file:write_file(CriteriaPath, jsx:encode([42])),
+        ?assertEqual({error, {invalid_eval_criterion, 0}},
+                     adk_cli:command(BaseArgs ++ ["--criteria", CriteriaPath])),
+        ok = file:write_file(
+               CriteriaPath,
+               jsx:encode([#{<<"id">> => <<"bad">>,
+                             <<"criterion">> => <<"exact_response">>,
+                             <<"unknown">> => true}])),
+        ?assertEqual(
+           {error, {unknown_eval_criterion_keys, 0, [<<"unknown">>]}},
+           adk_cli:command(BaseArgs ++ ["--criteria", CriteriaPath])),
+        lists:foreach(
+          fun(Name) ->
+              Invalid = [#{<<"id">> => <<"criterion">>,
+                           <<"criterion">> => Name,
+                           <<"threshold">> => 2}],
+              ok = file:write_file(CriteriaPath, jsx:encode(Invalid)),
+              ?assertEqual(
+                 {error, {invalid_eval_criterion, 0}},
+                 adk_cli:command(BaseArgs ++ ["--criteria", CriteriaPath]))
+          end,
+          [<<"trajectory_exact">>, <<"trajectory_in_order">>,
+           <<"trajectory_any_order">>, <<"trajectory_subset">>,
+           <<"tool_trajectory">>, <<"not-a-criterion">>]),
+
+        ok = file:write_file(BaselinePath, jsx:encode([])),
+        ok = file:write_file(TolerancesPath, jsx:encode([])),
+        ?assertEqual(
+           {error, metric_tolerances_must_be_object},
+           adk_cli:command(BaseArgs ++ ["--baseline", BaselinePath,
+                                        "--metric-tolerances", TolerancesPath])),
+        ok = file:write_file(TolerancesPath,
+                             jsx:encode(#{<<"response">> => 2})),
+        ?assertEqual(
+           {error, invalid_metric_tolerances},
+           adk_cli:command(BaseArgs ++ ["--baseline", BaselinePath,
+                                        "--metric-tolerances", TolerancesPath])),
+        ok = file:write_file(TolerancesPath,
+                             jsx:encode(#{<<"response">> => 0.1})),
+        ?assertEqual(
+           {error, eval_baseline_must_be_object},
+           adk_cli:command(BaseArgs ++ ["--baseline", BaselinePath,
+                                        "--metric-tolerances", TolerancesPath]))
+    after
+        lists:foreach(fun(Path) -> _ = file:delete(Path) end,
+                      [AgentPath, DatasetPath, SetPath, CriteriaPath,
+                       BaselinePath, TolerancesPath])
+    end.
+
 versioned_eval_set(Expected) ->
     #{<<"schema_version">> => 2,
       <<"id">> => <<"cli-versioned">>,
@@ -362,6 +808,111 @@ option_and_url_validation_case() ->
        adk_cli:command(
          ["inspect", "run", "run-1",
           "--url", "http://example.invalid"])).
+
+remote_command_validation_contracts_case() ->
+    OldToken = os:getenv("ERLANG_ADK_DEV_TOKEN"),
+    try
+        true = os:unsetenv("ERLANG_ADK_DEV_TOKEN"),
+        ?assertEqual(
+           {error, {missing_required_options, [text]}},
+           adk_cli:command(["live", "send", "live-1"])),
+        ?assertEqual(
+           {error, invalid_live_text_command},
+           adk_cli:command(["live", "send", "", "--text", ""])),
+        ?assertEqual(
+           {error, {missing_required_options, [model]}},
+           adk_cli:command(["inspect", "context-lifecycle",
+                            "app", "user", "session"])),
+        ?assertEqual(
+           {error, invalid_context_cache_model},
+           adk_cli:command(["inspect", "context-lifecycle",
+                            "app", "user", "session", "--model", ""])),
+        ?assertEqual(
+           {error, {missing_required_options, [model, confirm_json]}},
+           adk_cli:command(["context-cache", "invalidate",
+                            "app", "user", "session"])),
+        ?assertEqual(
+           {error, invalid_resource_limit},
+           adk_cli:command(["inspect", "artifacts", "app", "user", "session",
+                            "--limit", "1001"])),
+        ?assertEqual(
+           {error, invalid_resource_cursor},
+           adk_cli:command(["inspect", "artifacts", "app", "user", "session",
+                            "--cursor", ""])),
+        ?assertEqual(
+           {error, {missing_required_options, [name]}},
+           adk_cli:command(["inspect", "artifact", "app", "user", "session"])),
+        ?assertEqual(
+           {error, invalid_artifact_name},
+           adk_cli:command(["inspect", "artifact", "app", "user", "session",
+                            "--name", ""])),
+        ?assertEqual(
+           {error, invalid_resource_cursor},
+           adk_cli:command(["inspect", "artifact", "app", "user", "session",
+                            "--name", "report", "--cursor", "0"])),
+        ?assertEqual(
+           {error, {missing_required_options, [query]}},
+           adk_cli:command(["memory", "search", "app", "user"])),
+        ?assertEqual(
+           {error, invalid_memory_query},
+           adk_cli:command(["memory", "search", "app", "user",
+                            "--query", ""])),
+        ?assertEqual(
+           {error, memory_filter_must_be_object},
+           adk_cli:command(["memory", "search", "app", "user",
+                            "--query", "term", "--filter-json", "[]"])),
+        ?assertEqual(
+           {error, invalid_artifact_selector},
+           adk_cli:command(["artifact", "delete", "app", "user", "session",
+                            "report", "0", "--confirm-json", "{}"])),
+        ?assertEqual(
+           {error, confirmation_does_not_match_target},
+           adk_cli:command(["artifact", "delete", "app", "user", "session",
+                            "report", "latest", "--confirm-json", "{}"])),
+        lists:foreach(
+          fun(Args) ->
+              ?assertEqual({error, confirmation_does_not_match_target},
+                           adk_cli:command(Args))
+          end,
+          [["memory", "erase", "app", "user", "entry", "entry-1",
+            "--confirm-json", "{}"],
+           ["memory", "erase", "app", "user", "session", "session-1",
+            "--confirm-json", "{}"],
+           ["memory", "erase", "app", "user", "user",
+            "--confirm-json", "{}"]]),
+        ?assertEqual(
+           {error, state_delta_must_be_nonempty_object},
+           adk_cli:command(["session", "state", "app", "user", "session",
+                            "--delta-json", "{}"])),
+        ?assertEqual(
+           {error, {missing_required_options, [response_json]}},
+           adk_cli:command(["resume", "run-1"])),
+        ?assertEqual(
+           {error, invalid_json},
+           adk_cli:command(["resume", "run-1", "--response-json", "{"])),
+        ?assertEqual(
+           {error, invalid_port},
+           adk_cli:command(["serve", "--port", "65536"])),
+        ?assertEqual(
+           {error, missing_developer_token},
+           adk_cli:command(["serve", "--ip", "::1", "--port", "8080"])),
+        ?assertEqual(
+           {error, invalid_base_url},
+           adk_cli:command(["inspect", "agents", "--url", "ftp://localhost"])),
+        ?assertEqual(
+           {error, invalid_base_url},
+           adk_cli:command(["inspect", "agents",
+                            "--url", "https://example.com?query=1"])),
+        ?assertEqual(
+           {error, missing_developer_token},
+           adk_cli:command(["inspect", "agents",
+                            "--url", "http://localhost:18080/"])),
+        true = os:putenv("ERLANG_ADK_DEV_TOKEN", "short"),
+        ?assertEqual({error, developer_token_too_short},
+                     adk_cli:command(["serve", "--port", "8080"]))
+    after
+        restore_env("ERLANG_ADK_DEV_TOKEN", OldToken)
+    end.
 
 developer_connection_failure_is_structured_case() ->
     Port = free_port(),
@@ -743,6 +1294,19 @@ temp_path(Prefix) ->
       Prefix ++ "-" ++
           integer_to_list(erlang:unique_integer([positive, monotonic])) ++
           ".json").
+
+assert_config_result(Prefix, Value, Expected) ->
+    assert_config_bytes(Prefix, jsx:encode(Value), Expected).
+
+assert_config_bytes(Prefix, Bytes, Expected) ->
+    Path = temp_path(Prefix),
+    try
+        ok = file:write_file(Path, Bytes),
+        ?assertEqual(Expected,
+                     adk_cli:command(["config", "validate", Path]))
+    after
+        _ = file:delete(Path)
+    end.
 
 unique_binary(Prefix) ->
     Suffix = integer_to_binary(

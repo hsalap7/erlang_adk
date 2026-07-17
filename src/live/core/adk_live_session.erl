@@ -17,6 +17,9 @@
          subscribe/3, subscribe/4, subscribe_voice/4, ack/3, ack/4,
          unsubscribe/2, unsubscribe/3,
          status/2, status/3, close/3]).
+%% Internal policy boundary used by the supervised handoff path. Exported so
+%% deterministic tests exercise the release-build implementation.
+-export([prepare_config/1]).
 -export([init/1, callback_mode/0, handle_event/4,
          terminate/3, code_change/4, format_status/1]).
 
@@ -56,12 +59,12 @@ handoff(_Pid, _HandoffRef, _SessionId, _Principal, _Config) ->
     {error, invalid_live_session_handoff}.
 
 -spec send_text(pid(), binary(), binary()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 send_text(Pid, Principal, Text) ->
     api_call(Pid, Principal, {send, text, {text, Text}}).
 
 -spec send_audio(pid(), binary(), adk_live_media:media()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 send_audio(Pid, Principal, Media) ->
     api_call(Pid, Principal, {send, audio, {audio, Media}}).
 
@@ -69,7 +72,7 @@ send_audio(Pid, Principal, Media) ->
 %% Checking it inside the same gen_statem call that admits input prevents an
 %% old bridge from writing after a reconnect has already completed.
 -spec send_voice_audio(pid(), binary(), reference(), adk_live_media:media()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 send_voice_audio(Pid, Principal, Continuity, Media)
   when is_reference(Continuity) ->
     api_call(Pid, Principal,
@@ -78,27 +81,27 @@ send_voice_audio(_Pid, _Principal, _Continuity, _Media) ->
     {error, invalid_live_session_call}.
 
 -spec send_video_frame(pid(), binary(), adk_live_media:media()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 send_video_frame(Pid, Principal, Media) ->
     api_call(Pid, Principal, {send, video, {video_frame, Media}}).
 
 -spec activity_start(pid(), binary()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 activity_start(Pid, Principal) ->
     api_call(Pid, Principal, {send, control, activity_start}).
 
 -spec activity_end(pid(), binary()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 activity_end(Pid, Principal) ->
     api_call(Pid, Principal, {send, control, activity_end}).
 
 -spec audio_stream_end(pid(), binary()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 audio_stream_end(Pid, Principal) ->
     api_call(Pid, Principal, {send, control, audio_stream_end}).
 
 -spec voice_activity_start(pid(), binary(), reference()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 voice_activity_start(Pid, Principal, Continuity)
   when is_reference(Continuity) ->
     api_call(Pid, Principal,
@@ -107,7 +110,7 @@ voice_activity_start(_Pid, _Principal, _Continuity) ->
     {error, invalid_live_session_call}.
 
 -spec voice_activity_end(pid(), binary(), reference()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 voice_activity_end(Pid, Principal, Continuity)
   when is_reference(Continuity) ->
     api_call(Pid, Principal,
@@ -116,7 +119,7 @@ voice_activity_end(_Pid, _Principal, _Continuity) ->
     {error, invalid_live_session_call}.
 
 -spec voice_audio_stream_end(pid(), binary(), reference()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 voice_audio_stream_end(Pid, Principal, Continuity)
   when is_reference(Continuity) ->
     api_call(Pid, Principal,
@@ -125,7 +128,7 @@ voice_audio_stream_end(_Pid, _Principal, _Continuity) ->
     {error, invalid_live_session_call}.
 
 -spec send_tool_response(pid(), binary(), binary(), binary(), map()) ->
-    {ok, pos_integer()} | {error, term()}.
+    {ok, pos_integer() | no_op} | {error, term()}.
 send_tool_response(Pid, Principal, Id, Name, Response) ->
     api_call(Pid, Principal,
              {send, tool_response,
@@ -360,9 +363,7 @@ code_change(_OldVsn, State, Data, _Extra) ->
 
 accept_handoff(From, SessionId, Principal, Config) ->
     case validate_handoff(SessionId, Principal, Config) of
-        {ok, Checked0} ->
-            case prepare_session_credential(Checked0) of
-                {ok, Checked} ->
+        {ok, Checked} ->
             ProviderConfig = maps:get(provider_config, Checked),
             Model = maps:get(model, ProviderConfig),
             case adk_live_observability:new(
@@ -410,8 +411,6 @@ accept_handoff(From, SessionId, Principal, Config) ->
                 {error, _} ->
                     release_credential(Checked),
                     reply(From, {error, invalid_live_observability})
-            end;
-                {error, _} = Error -> reply(From, Error)
             end;
         {error, _} = Error ->
             reply(From, Error)
@@ -479,6 +478,13 @@ send_resume_setup_frame(Frame, Data0) ->
 process_setup_frame(Frame, Data0) ->
     {Decoded, Data} = decode_provider_frame_observed(Frame, Data0),
     case Decoded of
+        {ok, []} ->
+            %% OpenAI emits `session.created' before the acknowledgement for
+            %% our `session.update'. It carries no provider-neutral event and
+            %% must not complete setup or refresh the original bounded setup
+            %% timeout.
+            transport_consumed(Data),
+            {keep_state, Data};
         {ok, [#{kind := setup_complete}]} ->
             transport_consumed(Data),
             Resumed = maps:get(resume_pending, Data, false),
@@ -737,7 +743,10 @@ admit_encoded_input(Kind, Action, Data) ->
     Provider = maps:get(provider, Data),
     Config = maps:get(provider_config, Data),
     try Provider:encode_client(Action, Config) of
+        ignored -> {ok, no_op, Data};
         {ok, Frame} when is_binary(Frame) -> enqueue_input(Kind, Frame, Data);
+        {ok, Frames} when is_list(Frames) ->
+            enqueue_input_frames(Kind, Frames, Data);
         {error, Reason} -> {error, Reason};
         _ -> {error, invalid_provider_result}
     catch
@@ -761,17 +770,117 @@ enqueue_input(Kind, Frame, Data) ->
                       input_sequence => InputSequence,
                       generation_epoch => maps:get(generation_epoch, Data)},
             Queue0 = maps:get(ingress, Data),
-            Queue = case Kind of
-                control -> queue:in_r(Entry, Queue0);
-                {tool_response, _CallId} -> queue:in_r(Entry, Queue0);
-                _ -> queue:in(Entry, Queue0)
-            end,
+            Queue = enqueue_single(Kind, Entry, Queue0, Data),
             {ok, InputSequence,
              Data#{ingress => Queue,
                    ingress_messages => Messages + 1,
                    ingress_bytes => QueuedBytes + Bytes,
                    input_sequence => InputSequence}}
     end.
+
+%% A logical provider action may need several ordered WebSocket frames. The
+%% complete batch is validated and capacity-checked before allocating any
+%% sequence or mutating the queue, so backpressure is all-or-nothing.
+enqueue_input_frames(Kind, Frames, Data) ->
+    MaxMessages = maps:get(max_ingress_messages, Data),
+    MaxBytes = maps:get(max_ingress_bytes, Data),
+    case validate_input_frames(Frames, MaxMessages) of
+        {ok, Count, Bytes} ->
+            Messages = maps:get(ingress_messages, Data),
+            QueuedBytes = maps:get(ingress_bytes, Data),
+            case Messages + Count =< MaxMessages
+                 andalso Bytes =< MaxBytes
+                 andalso QueuedBytes + Bytes =< MaxBytes of
+                false -> {error, ingress_backpressure};
+                true ->
+                    FirstSequence = maps:get(input_sequence, Data) + 1,
+                    Generation = maps:get(generation_epoch, Data),
+                    BatchRef = make_ref(),
+                    Entries = input_frame_entries(
+                                Frames, Kind, FirstSequence,
+                                Generation, BatchRef, []),
+                    LastSequence = FirstSequence + Count - 1,
+                    Batch = queue:from_list(Entries),
+                    Queue0 = maps:get(ingress, Data),
+                    Queue = enqueue_batch(
+                              Kind, Entries, Batch, Queue0, Data),
+                    {ok, LastSequence,
+                     Data#{ingress => Queue,
+                           ingress_messages => Messages + Count,
+                           ingress_bytes => QueuedBytes + Bytes,
+                           input_sequence => LastSequence}}
+            end;
+        {error, _} = Error -> Error
+    end.
+
+validate_input_frames(Frames, MaxMessages) ->
+    validate_input_frames(Frames, MaxMessages, 0, 0).
+
+validate_input_frames([], _MaxMessages, 0, _Bytes) ->
+    {error, invalid_provider_result};
+validate_input_frames([], _MaxMessages, Count, Bytes) ->
+    {ok, Count, Bytes};
+validate_input_frames([_Frame | _Rest], MaxMessages, Count, _Bytes)
+  when Count >= MaxMessages ->
+    {error, ingress_backpressure};
+validate_input_frames([Frame | Rest], MaxMessages, Count, Bytes)
+  when is_binary(Frame) ->
+    validate_input_frames(Rest, MaxMessages, Count + 1,
+                          Bytes + byte_size(Frame));
+validate_input_frames([_Invalid | _Rest], _MaxMessages, _Count, _Bytes) ->
+    {error, invalid_provider_result};
+validate_input_frames(_Improper, _MaxMessages, _Count, _Bytes) ->
+    {error, invalid_provider_result}.
+
+input_frame_entries([], _Kind, _Sequence, _Generation, _BatchRef, Acc) ->
+    lists:reverse(Acc);
+input_frame_entries([Frame | Rest], Kind, Sequence, Generation, BatchRef,
+                    Acc) ->
+    Entry = #{kind => Kind,
+              frame => Frame,
+              bytes => byte_size(Frame),
+              input_sequence => Sequence,
+              generation_epoch => Generation,
+              batch_ref => BatchRef},
+    input_frame_entries(Rest, Kind, Sequence + 1, Generation, BatchRef,
+                        [Entry | Acc]).
+
+%% Priority applies between complete logical actions. If the first frame of a
+%% multi-frame action is already awaiting transport acknowledgement, retain
+%% that action's queued suffix ahead of a newly admitted priority batch. This
+%% prevents commit/response pairs (and other provider batches) from being
+%% interleaved while preserving the established queue-front behavior whenever
+%% no batch is currently in flight.
+enqueue_single(control, Entry, Queue0, Data) ->
+    enqueue_priority_entries([Entry], Queue0, Data);
+enqueue_single({tool_response, _CallId}, Entry, Queue0, Data) ->
+    enqueue_priority_entries([Entry], Queue0, Data);
+enqueue_single(_Kind, Entry, Queue0, _Data) ->
+    queue:in(Entry, Queue0).
+
+enqueue_batch(control, Entries, _Batch, Queue0, Data) ->
+    enqueue_priority_entries(Entries, Queue0, Data);
+enqueue_batch({tool_response, _CallId}, Entries, _Batch, Queue0, Data) ->
+    enqueue_priority_entries(Entries, Queue0, Data);
+enqueue_batch(_Kind, _Entries, Batch, Queue0, _Data) ->
+    queue:join(Queue0, Batch).
+
+enqueue_priority_entries(Entries, Queue0, Data) ->
+    case maps:get(outbound_pending, Data, undefined) of
+        #{entry := #{batch_ref := PendingBatchRef}} ->
+            QueueEntries = queue:to_list(Queue0),
+            {PendingSuffix, Remaining} =
+                split_batch_prefix(QueueEntries, PendingBatchRef, []),
+            queue:from_list(PendingSuffix ++ Entries ++ Remaining);
+        _ ->
+            queue:join(queue:from_list(Entries), Queue0)
+    end.
+
+split_batch_prefix([#{batch_ref := BatchRef} = Entry | Rest], BatchRef,
+                   Acc) ->
+    split_batch_prefix(Rest, BatchRef, [Entry | Acc]);
+split_batch_prefix(Remaining, _BatchRef, Acc) ->
+    {lists:reverse(Acc), Remaining}.
 
 drain_ingress(Data) ->
     case maps:get(outbound_pending, Data, undefined) of
@@ -1349,8 +1458,21 @@ purge_subscriber_audio_queue(Sub, Generation) ->
 validate_handoff(SessionId, Principal, Config) ->
     case valid_identity(SessionId, 256) andalso valid_identity(Principal, 4096) of
         false -> {error, invalid_live_session_identity};
-        true -> validate_session_config(Config)
+        true -> prepare_config(Config)
     end.
+
+%% @private
+%% Validate and prepare the runtime configuration through the same credential
+%% boundary used by a real session handoff. This function is deliberately
+%% present in release builds; there is no alternate TEST implementation.
+-spec prepare_config(term()) -> {ok, map()} | {error, term()}.
+prepare_config(Config) when is_map(Config) ->
+    case validate_session_config(Config) of
+        {ok, Checked} -> prepare_session_credential(Checked);
+        {error, _} = Error -> Error
+    end;
+prepare_config(_Config) ->
+    {error, invalid_live_session_config}.
 
 validate_session_config(Config) ->
     Allowed = [provider, provider_config, transport, transport_opts,
@@ -1368,7 +1490,6 @@ validate_session_config(Config) ->
 validate_session_config_fields(Config) ->
     Provider = maps:get(provider, Config, adk_live_gemini),
     ProviderConfig = maps:get(provider_config, Config, #{}),
-    Transport = maps:get(transport, Config, undefined),
     TransportOpts = maps:get(transport_opts, Config, #{}),
     Values = #{max_ingress_messages =>
                    maps:get(max_ingress_messages, Config,
@@ -1397,37 +1518,219 @@ validate_session_config_fields(Config) ->
                reconnect_backoff_ms =>
                    maps:get(reconnect_backoff_ms, Config,
                             ?DEFAULT_RECONNECT_BACKOFF_MS)},
-    case is_atom(Provider) andalso is_atom(Transport)
-         andalso is_map(ProviderConfig) andalso is_map(TransportOpts)
-         andalso valid_limit_values(Values)
-         andalso provider_available(Provider)
-         andalso transport_available(Transport) of
+    case is_map(ProviderConfig) andalso is_map(TransportOpts)
+         andalso valid_limit_values(Values) of
         false -> {error, invalid_live_session_config};
         true ->
-            case Provider:validate_config(ProviderConfig) of
-                {ok, CheckedProviderConfig} ->
+            case resolve_live_selection(
+                   Provider, ProviderConfig, TransportOpts, Config) of
+                {ok, Selection} ->
+                    validate_live_selection(Selection, Values, Config);
+                {error, _} = Error -> Error
+            end
+    end.
+
+resolve_live_selection(Provider, ProviderConfig, TransportOpts, Config)
+  when is_atom(Provider) ->
+    case provider_available(Provider) of
+        false -> {error, invalid_live_session_config};
+        true ->
+            case legacy_transport(Provider, Config) of
+                {ok, Transport, ProviderOwned} ->
+                    case transport_available(Transport) of
+                        true ->
+                            {ok, #{provider => Provider,
+                                   provider_config => ProviderConfig,
+                                   transport => Transport,
+                                   transport_opts => TransportOpts,
+                                   provider_owned_transport =>
+                                       ProviderOwned}};
+                        false -> {error, invalid_live_session_config}
+                    end;
+                {error, _} = Error -> Error
+            end
+    end;
+resolve_live_selection(ProfileId, ProviderConfig, TransportOpts, Config)
+  when is_binary(ProfileId) ->
+    case maps:is_key(transport, Config) of
+        true -> {error, provider_profile_override_not_allowed};
+        false ->
+            case adk_provider_registry:resolve_live_config(
+                   ProfileId, ProviderConfig) of
+                {ok, #{adapter := Provider, endpoint := Endpoint,
+                       model := Model, options := ProviderOptions,
+                       profile_snapshot := ProfileSnapshot,
+                       transport := Transport}} ->
+                    case profile_transport_options(
+                           Provider, TransportOpts) of
+                        {ok, SafeTransportOpts} ->
+                            case provider_available(Provider) andalso
+                                 transport_available(Transport) of
+                                true ->
+                                    {ok, #{provider => Provider,
+                                           provider_config =>
+                                               ProviderOptions#{model => Model},
+                                           transport => Transport,
+                                           transport_opts =>
+                                               SafeTransportOpts,
+                                           provider_owned_transport => true,
+                                           credential_profile => ProfileId,
+                                           credential_profile_snapshot =>
+                                               ProfileSnapshot,
+                                           provider_endpoint => Endpoint}};
+                                false ->
+                                    {error, invalid_live_session_config}
+                            end;
+                        {error, _} = Error -> Error
+                    end;
+                {error, _} = Error -> Error
+            end
+    end;
+resolve_live_selection(_Provider, _ProviderConfig, _TransportOpts, _Config) ->
+    {error, invalid_live_session_config}.
+
+legacy_transport(Provider, Config) ->
+    case maps:find(transport, Config) of
+        {ok, Transport} when is_atom(Transport) ->
+            {ok, Transport, false};
+        {ok, _Invalid} ->
+            {error, invalid_live_session_config};
+        error ->
+            provider_default_transport(Provider)
+    end.
+
+provider_default_transport(Provider) ->
+    case erlang:function_exported(Provider, transport, 0) of
+        false -> {error, invalid_live_session_config};
+        true ->
+            try Provider:transport() of
+                Transport when is_atom(Transport), Transport =/= undefined ->
+                    {ok, Transport, true};
+                _ -> {error, invalid_live_session_config}
+            catch
+                _:_ -> {error, invalid_live_session_config}
+            end
+    end.
+
+profile_transport_options(Provider, Options) ->
+    Allowed = profile_transport_option_allowlist(Provider),
+    Prohibited = [api_key, credential_ref, model, cacertfile,
+                  endpoint, host, port, path, base_path, base_url, url,
+                  transport, adapter, provider_module, module, headers,
+                  tls_opts, ssl_options, organization, project],
+    Keys = maps:keys(Options),
+    Authority = [Key || Key <- Keys,
+                         lists:member(Key, Prohibited) orelse
+                         adk_context_guard:sensitive_key(Key)],
+    Unknown = Keys -- Allowed,
+    case {Authority, Unknown} of
+        {[_ | _], _} ->
+            {error, provider_profile_override_not_allowed};
+        {[], [Key | _]} ->
+            {error, {invalid_live_transport_option, Key}};
+        {[], []} -> {ok, Options}
+    end.
+
+profile_transport_option_allowlist(adk_live_openai) ->
+    [safety_identifier,
+     connect_timeout_ms, tls_handshake_timeout_ms,
+     upgrade_timeout_ms, send_timeout_ms, ws_flow,
+     max_client_frame_bytes, max_server_frame_bytes];
+profile_transport_option_allowlist(adk_live_gemini) ->
+    [connect_timeout_ms, tls_handshake_timeout_ms,
+     upgrade_timeout_ms, send_timeout_ms, ws_flow,
+     max_server_frame_bytes];
+profile_transport_option_allowlist(_Provider) -> [].
+
+validate_live_selection(Selection0, Values, Config) ->
+    Provider = maps:get(provider, Selection0),
+    ProviderConfig = maps:get(provider_config, Selection0),
+    case Provider:validate_config(ProviderConfig) of
+        {ok, CheckedProviderConfig} ->
+            case finalize_transport_options(
+                   Selection0, CheckedProviderConfig) of
+                {ok, Selection} ->
                     case {validate_tool_execution(
                             maps:get(tool_execution, Config, disabled),
                             CheckedProviderConfig,
                             maps:get(max_ingress_bytes, Values)),
                           adk_live_observability:validate_config(
-                            maps:get(observability, Config, disabled))} of
-                        {{ok, ToolExecution}, {ok, Observability}} ->
-                            {ok, Values#{
-                                   provider => Provider,
-                                   provider_config => CheckedProviderConfig,
-                                   transport => Transport,
-                                   transport_opts => TransportOpts,
-                                   tool_execution => ToolExecution,
-                                   observability => Observability}};
-                        {{error, _} = Error, _} -> Error;
-                        {_, {error, _} = Error} -> Error
+                            maps:get(observability, Config, disabled)),
+                          trusted_input_audio_sample_rate(Provider)} of
+                        {{ok, ToolExecution}, {ok, Observability},
+                         {ok, InputAudioSampleRate}} ->
+                            Runtime = maps:without(
+                                        [provider_owned_transport,
+                                         provider_endpoint], Selection),
+                            {ok, maps:merge(
+                                   Values,
+                                   Runtime#{
+                                     provider_config => CheckedProviderConfig,
+                                     input_audio_sample_rate =>
+                                         InputAudioSampleRate,
+                                     tool_execution => ToolExecution,
+                                     observability => Observability})};
+                        {{error, _} = Error, _, _} -> Error;
+                        {_, {error, _} = Error, _} -> Error;
+                        {_, _, {error, _} = Error} -> Error
                     end;
                 {error, _} = Error -> Error
-            end
+            end;
+        {error, _} = Error -> Error
     end.
 
+finalize_transport_options(
+  #{provider_owned_transport := true,
+    provider := adk_live_openai,
+    transport := adk_live_openai_gun_transport,
+    transport_opts := Options} = Selection,
+  #{model := Model}) ->
+    case maps:find(model, Options) of
+        error ->
+            {ok, Selection#{transport_opts => Options#{model => Model}}};
+        {ok, Model} -> {ok, Selection};
+        {ok, _ConflictingModel} ->
+            {error, conflicting_live_transport_model}
+    end;
+finalize_transport_options(Selection, _ProviderConfig) ->
+    {ok, Selection}.
+
+trusted_input_audio_sample_rate(Provider) ->
+    try Provider:capabilities() of
+        Capabilities when is_map(Capabilities) ->
+            Rate = maps:get(input_audio_sample_rate, Capabilities,
+                            default_input_audio_sample_rate(Provider)),
+            case bounded(Rate, 8000, 192000) of
+                true -> {ok, Rate};
+                false -> {error, invalid_live_provider_capabilities}
+            end;
+        _ -> {error, invalid_live_provider_capabilities}
+    catch
+        _:_ -> {error, invalid_live_provider_capabilities}
+    end.
+
+default_input_audio_sample_rate(adk_live_openai) -> 24000;
+default_input_audio_sample_rate(_Provider) -> 16000.
+
+prepare_session_credential(
+  #{credential_profile := ProfileId,
+    credential_profile_snapshot := ProfileSnapshot} = Checked) ->
+    Sanitized = maps:without(
+                  [credential_profile, credential_profile_snapshot],
+                  Checked),
+    case adk_provider_credential:resolve_snapshot(
+           ProfileId, ProfileSnapshot) of
+        {ok, none} -> prepare_transport_credential(Sanitized);
+        {ok, ApiKey} when is_binary(ApiKey) ->
+            Options = maps:get(transport_opts, Sanitized),
+            prepare_transport_credential(
+              Sanitized#{transport_opts => Options#{api_key => ApiKey}});
+        {error, _} = Error -> Error
+    end;
 prepare_session_credential(Checked) ->
+    prepare_transport_credential(Checked).
+
+prepare_transport_credential(Checked) ->
     Options = maps:get(transport_opts, Checked),
     case {maps:find(api_key, Options),
           maps:find(credential_ref, Options)} of
@@ -1759,6 +2062,8 @@ status_map(State, Data) ->
       model => maps:get(model, ProviderConfig),
       automatic_activity_detection =>
           maps:get(automatic_activity_detection, ProviderConfig, undefined),
+      input_audio_sample_rate =>
+          maps:get(input_audio_sample_rate, Data, 16000),
       started_at => maps:get(started_at, Data),
       latest_sequence => maps:get(sequence, Data),
       input_queue_messages => maps:get(ingress_messages, Data),

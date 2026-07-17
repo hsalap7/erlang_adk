@@ -8,8 +8,9 @@ Security reports are welcome and should be handled privately.
 
 | Version | Security support |
 | --- | --- |
-| 0.7.x | Supported release line |
-| 0.3.x-0.6.x | Historical development milestones; upgrade to 0.7.x |
+| 0.8.x | Current supported release line |
+| 0.7.x | Previous release line; upgrade to 0.8.x for provider-profile and transport hardening |
+| 0.3.x-0.6.x | Historical development milestones; upgrade to 0.8.x |
 | Earlier | Unsupported |
 
 The repository may contain development branches for older milestones. A
@@ -48,6 +49,13 @@ The release relies on these invariants:
 - Provider, OAuth/OIDC, tool, and protocol credentials remain server-side and
   never enter prompts, ordinary state, browser assigns, public events,
   telemetry metadata, evaluation input, or structural errors.
+- Public model selection uses bounded binary profile/model aliases. Adapter
+  modules, concrete model IDs, endpoints, API-version/auth/storage/billing
+  settings, transports, and credential sources are operator-owned; credential
+  lookup is bound to the selected profile generation. Custom request origins
+  are structured HTTPS,
+  redirects are disabled, and ambient native-vendor keys are accepted only at
+  their exact official origin.
 - Authentication proves an issuer-bound identity. A separate default-deny
   authorizer checks each exact operation and resource. Authentication alone
   does not grant agent, run, Live, observability, or evaluation access.
@@ -61,18 +69,26 @@ The release relies on these invariants:
   production identity systems.
 - Untrusted JSON, tool arguments, model calls, protocol headers, media, and
   callback results are validated and bounded before a side effect.
+- Model Gun transports cap each aggregate response-header or trailer block at
+  64 KiB in both synchronous and streaming paths.
+- Native Anthropic requests reject `max_tokens` values below one before
+  transport admission.
+- A Live action's admitted multi-frame provider batch remains contiguous once
+  sending starts; a later priority action cannot splice into its side effects.
 - Dynamic untrusted names are not converted into atoms. Application modules,
   provider profiles, evaluator modules, filesystem roots, and credential
   resolvers come from trusted server configuration, never browser input.
 
 The detailed runtime rules are in
-[`docs/RUNTIME_SAFETY.md`](docs/RUNTIME_SAFETY.md), and the production web
+[`docs/RUNTIME_SAFETY.md`](docs/RUNTIME_SAFETY.md), model selection and
+credential authority are documented in
+[`docs/PROVIDER_PROFILES.md`](docs/PROVIDER_PROFILES.md), and the production web
 boundary is documented in the
 [`Phoenix companion guide`](examples/phoenix_adk_ui/README.md).
 
 ## Runtime security baseline
 
-Version 0.7 requires Erlang/OTP 27.3.4.14 or a later security-supported OTP
+Version 0.8 requires Erlang/OTP 27.3.4.14 or a later security-supported OTP
 release. In particular, OTP 27.3.4.14 carries SSL 11.2.12.10, which fixes
 [CVE-2026-54891](https://cna.erlef.org/cves/CVE-2026-54891.html), a TLS-client
 plaintext-injection vulnerability affecting earlier OTP 27 patch levels. This

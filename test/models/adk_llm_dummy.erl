@@ -1,6 +1,8 @@
 -module(adk_llm_dummy).
 -behaviour(adk_llm).
--export([generate/3, stream/4]).
+-export([generate/3, stream/4, profile_request_option_allowlist/0]).
+
+profile_request_option_allowlist() -> [temperature].
 
 generate(_Config, History, _Tools) ->
     case length(History) > 0 of

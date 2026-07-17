@@ -376,6 +376,67 @@ resolver_dies_with_request_owner_test() ->
     after 500 -> error(orphaned_resolver_worker)
     end.
 
+resolver_normalizes_valid_addresses_test() ->
+    V4A = {8, 8, 4, 4},
+    V4B = {8, 8, 8, 8},
+    V6 = {16#2001, 16#4860, 16#4860, 0, 0, 0, 0, 16#8888},
+    Addresses = [V6, V4B, V4A, V4B, V6],
+    ?assertEqual(
+       {ok, lists:usort(Addresses)},
+       adk_a2a_v1_client:test_resolve_addresses(
+         <<"normalize.example">>, 1000,
+         fun(<<"normalize.example">>) -> Addresses end)).
+
+resolver_address_count_boundary_test() ->
+    Address = {8, 8, 8, 8},
+    AtLimit = lists:duplicate(64, Address),
+    AboveLimit = lists:duplicate(65, Address),
+    ?assertEqual(
+       {ok, [Address]},
+       adk_a2a_v1_client:test_resolve_addresses(
+         <<"limit.example">>, 1000, fun(_Host) -> AtLimit end)),
+    ?assertEqual(
+       {error, a2a_dns_resolution_failed},
+       adk_a2a_v1_client:test_resolve_addresses(
+         <<"limit.example">>, 1000, fun(_Host) -> AboveLimit end)),
+    ?assertEqual(
+       {error, a2a_dns_resolution_failed},
+       adk_a2a_v1_client:test_resolve_addresses(
+         <<"empty.example">>, 1000, fun(_Host) -> [] end)).
+
+resolver_rejects_malformed_results_without_crashing_test() ->
+    V4 = {8, 8, 8, 8},
+    InvalidResults =
+        [not_a_list,
+         #{address => V4},
+         {ok, [V4]},
+         [V4 | improper_tail],
+         [{-1, 8, 8, 8}],
+         [{256, 8, 8, 8}],
+         [{8, 8, 8, not_an_integer}],
+         [{8, 8, 8}],
+         [{-1, 0, 0, 0, 0, 0, 0, 1}],
+         [{16#10000, 0, 0, 0, 0, 0, 0, 1}],
+         [{16#2001, 0, 0, 0, 0, 0, 0, not_an_integer}]],
+    lists:foreach(
+      fun(Result) ->
+          ?assertEqual(
+             {error, a2a_dns_resolution_failed},
+             adk_a2a_v1_client:test_resolve_addresses(
+               <<"malformed.example">>, 1000,
+               fun(_Host) -> Result end))
+      end, InvalidResults),
+    ?assertEqual(
+       {error, a2a_dns_resolution_failed},
+       adk_a2a_v1_client:test_resolve_addresses(
+         <<"throw.example">>, 1000,
+         fun(_Host) -> error(resolver_failed) end)),
+    ?assertEqual(
+       {error, a2a_dns_resolution_failed},
+       adk_a2a_v1_client:test_resolve_addresses(
+         <<"exit.example">>, 1000,
+         fun(_Host) -> exit(resolver_failed) end)).
+
 resolver_heap_and_result_are_bounded_test() ->
     HeapResolver = fun(_Host) -> consume_heap([]) end,
     ?assertEqual(

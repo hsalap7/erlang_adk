@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-package_path="${1:-${repo_root}/_build/default/lib/erlang_adk/hex/erlang_adk-0.7.0.tar}"
+package_path="${1:-${repo_root}/_build/default/lib/erlang_adk/hex/erlang_adk-0.8.0.tar}"
 
 if [[ ! -f "${package_path}" ]]; then
   echo "Hex package not found: ${package_path}" >&2
@@ -26,8 +26,10 @@ required_files=(
   "README.md"
   "CHANGELOG.md"
   "SECURITY.md"
+  "docs/PROVIDER_PROFILES.md"
   "docs/RELEASING.md"
   "docs/TEST_LAYOUT.md"
+  "docs/VERSION_0_8_0.md"
   "examples/readme_weather_tool.erl"
   "examples/phoenix_adk_ui/README.md"
   "examples/phoenix_adk_ui/assets/js/live_voice.js"
@@ -37,6 +39,7 @@ required_files=(
   "src/README.md"
   "src/auth/core/adk_authorizer.erl"
   "src/auth/credentials/adk_token_manager.erl"
+  "src/auth/credentials/adk_provider_credential.erl"
   "src/auth/integrations/a2a/adk_a2a_v1_oidc_auth.erl"
   "src/auth/integrations/openapi/adk_openapi_auth_manager.erl"
   "src/auth/oauth/adk_authorization_flow.erl"
@@ -59,9 +62,18 @@ required_files=(
   "src/memory/outbox/adk_memory_outbox_processor.erl"
   "src/models/adk_llm.erl"
   "src/models/adk_safety_settings.erl"
+  "src/models/anthropic/adk_llm_anthropic.erl"
+  "src/models/compatible/adk_llm_compatible.erl"
   "src/models/gemini/adk_live_gemini.erl"
   "src/models/gemini/adk_live_gun_transport.erl"
   "src/models/gemini/adk_llm_gemini.erl"
+  "src/models/openai/adk_llm_openai.erl"
+  "src/models/openai/realtime/adk_live_openai.erl"
+  "src/models/profiles/adk_provider_profile.erl"
+  "src/models/profiles/adk_provider_registry.erl"
+  "src/models/transport/adk_model_http_client.erl"
+  "src/models/transport/adk_model_http_headers.erl"
+  "src/models/transport/adk_model_sse_decoder.erl"
   "src/plugins/adk_plugin.erl"
   "src/protocols/a2a/v1/adk_a2a_v1_card.erl"
   "src/protocols/a2a/legacy/erlang_adk_a2a_client.erl"
@@ -154,8 +166,8 @@ if [[ -n "${unexpected_root_source}" ]]; then
   exit 1
 fi
 
-if ! grep -Fq '{<<"version">>,<<"0.7.0">>}.' "${outer_dir}/metadata.config"; then
-  echo "Hex metadata does not declare version 0.7.0" >&2
+if ! grep -Fq '{<<"version">>,<<"0.8.0">>}.' "${outer_dir}/metadata.config"; then
+  echo "Hex metadata does not declare version 0.8.0" >&2
   exit 1
 fi
 
@@ -205,4 +217,4 @@ cd "${contents_dir}"
 "${repo_root}/rebar3" compile
 cd "${original_dir}"
 
-echo "Verified erlang_adk 0.7.0 package contents and clean extracted compile"
+echo "Verified erlang_adk 0.8.0 package contents and clean extracted compile"

@@ -12,6 +12,7 @@ defmodule ErlangAdkUiWeb.VoiceSocketTest do
       Application.delete_env(:erlang_adk_ui, :test_live_voice_mode)
       Application.delete_env(:erlang_adk_ui, :test_live_voice_state)
       Application.delete_env(:erlang_adk_ui, :test_live_voice_error)
+      Application.delete_env(:erlang_adk_ui, :test_live_voice_input_sample_rate)
     end)
 
     :ok
@@ -112,6 +113,15 @@ defmodule ErlangAdkUiWeb.VoiceSocketTest do
              VoiceSocket.handle_in({oversized, opcode: :binary}, socket)
 
     refute_receive {:live_gateway, {:voice_frame, _identity, _voice_ref, _frame}}
+    VoiceSocket.terminate(:normal, socket)
+  end
+
+  test "the trusted 24 kHz input config is the first unacknowledged binary frame" do
+    Application.put_env(:erlang_adk_ui, :test_live_voice_input_sample_rate, 24_000)
+    {initial, _handle, context} = voice_state()
+    {:ok, socket} = VoiceSocket.init(initial)
+
+    assert_voice_open(context.identity, socket)
     VoiceSocket.terminate(:normal, socket)
   end
 
@@ -236,6 +246,7 @@ defmodule ErlangAdkUiWeb.VoiceSocketTest do
           :invalid_live_voice_frame_limit,
           :unknown_live_voice_event_sequence,
           {:out_of_order_live_voice_audio, 2},
+          {:unexpected_live_voice_input_sample_rate, 24_000},
           {:invalid_live_voice_audio, :invalid_audio_size}
         ] do
       failing = %{socket | voice_ref: {:force_error, reason}}
@@ -383,6 +394,16 @@ defmodule ErlangAdkUiWeb.VoiceSocketTest do
 
     assert voice_ref == socket.voice_ref
     assert bridge == socket.bridge
+
+    input_sample_rate =
+      Application.get_env(:erlang_adk_ui, :test_live_voice_input_sample_rate, 16_000)
+
+    assert_receive {:adk_live_voice_frame, ^bridge,
+                    <<1, 128, ^input_sample_rate::unsigned-big-integer-size(32), 1, 1>> =
+                      config_frame}
+
+    assert {:push, {:binary, ^config_frame}, ^socket} =
+             VoiceSocket.handle_info({:adk_live_voice_frame, bridge, config_frame}, socket)
   end
 
   defp websocket_headers(conn, origin) do

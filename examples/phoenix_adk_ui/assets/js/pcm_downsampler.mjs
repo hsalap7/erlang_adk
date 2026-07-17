@@ -15,7 +15,8 @@ function sinc(value) {
 function lowPassCoefficients(sourceSampleRate, targetSampleRate, taps) {
   const midpoint = (taps - 1) / 2
   const normalizedCutoff =
-    (targetSampleRate * CUTOFF_FRACTION_OF_TARGET_RATE) / sourceSampleRate
+    (Math.min(sourceSampleRate, targetSampleRate) * CUTOFF_FRACTION_OF_TARGET_RATE) /
+    sourceSampleRate
   const coefficients = new Float64Array(taps)
   let total = 0
 
@@ -82,9 +83,6 @@ export class StreamingPcmDownsampler {
     this.targetSampleRate = checkedInteger(targetSampleRate, "targetSampleRate", 1)
     this.chunkSamples = checkedInteger(chunkSamples, "chunkSamples", 1)
 
-    if (this.sourceSampleRate < this.targetSampleRate) {
-      throw new RangeError("sourceSampleRate must be greater than or equal to targetSampleRate")
-    }
     if (this.sourceSampleRate > MAXIMUM_SOURCE_SAMPLE_RATE) {
       throw new RangeError(
         `sourceSampleRate must be less than or equal to ${MAXIMUM_SOURCE_SAMPLE_RATE}`,

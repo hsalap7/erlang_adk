@@ -12,13 +12,12 @@
 -behaviour(gen_server).
 
 -export([open/2, send/2, close/2, consumed/2]).
+%% Internal transport policy. These release-build functions are exported so
+%% deterministic tests inspect the exact validation, endpoint and TLS options
+%% used by the connection state machine.
+-export([validate_options/1, endpoint_path/1, gun_options/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3, format_status/1]).
-
--ifdef(TEST).
--export([test_validate_options/1, test_endpoint_path/1,
-         test_gun_options/1]).
--endif.
 
 -define(HOST, "generativelanguage.googleapis.com").
 -define(PORT, 443).
@@ -172,7 +171,7 @@ handle_info({gun_up, Connection, http},
                           silence_pings => true},
             StreamRef = gun:ws_upgrade(
                           Connection, Path,
-                          [{<<"user-agent">>, <<"erlang-adk/0.7">>}],
+                          [{<<"user-agent">>, <<"erlang-adk/0.8">>}],
                           WsOptions),
             UpgradeTimer = phase_timer(
                              maps:get(upgrade_timeout_ms, State), upgrading),
@@ -477,12 +476,3 @@ format_status(Status) ->
          (reason, _Reason) -> adk_secret_redactor:marker();
          (_Key, _Value) -> adk_secret_redactor:marker()
       end, Status).
-
--ifdef(TEST).
-test_validate_options(Options) -> validate_options(Options).
-test_endpoint_path(ApiKey) -> endpoint_path(ApiKey).
-test_gun_options(Options) ->
-    {ok, Checked} = validate_options(Options),
-    {ok, GunOptions} = gun_options(Checked),
-    GunOptions.
--endif.

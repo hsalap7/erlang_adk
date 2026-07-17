@@ -270,7 +270,7 @@ endpoint_url(#{scheme := Scheme, host := Host, port := Port}, Path) ->
 fixed_headers() ->
     [{<<"content-type">>, <<"application/json">>},
      {<<"accept">>, <<"application/json">>},
-     {<<"user-agent">>, <<"erlang-adk-otlp-http-json/0.7.0">>}].
+     {<<"user-agent">>, <<"erlang-adk-otlp-http-json/0.8.0">>}].
 
 bounded_response_headers(Headers) when is_list(Headers), length(Headers) =< 128 ->
     bounded_response_headers(Headers, [], 0);

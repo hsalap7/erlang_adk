@@ -1,4 +1,4 @@
-# Phoenix production UI companion (v0.7)
+# Phoenix production UI companion (v0.8)
 
 This is a Phoenix 1.8 companion application for Erlang ADK. It runs Phoenix,
 `erlang_adk`, the authenticated gateway, and supervised agent runs on the same
@@ -8,10 +8,11 @@ package.
 
 The UI provides OIDC login, a server-owned agent catalog, scoped authorization,
 text runs, bounded event rendering, credit/ack backpressure, reconnect by
-server-side cursor, cancellation, and typed human approval. The v0.7 `/live`
+server-side cursor, cancellation, and typed human approval. The `/live`
 console adds principal-scoped discovery of server-owned ADK Live sessions,
 future-only attach/detach, realtime text input, bounded Live event credit/ack,
-an authenticated binary full-duplex voice bridge, read-only observability
+an authenticated binary full-duplex voice bridge with v0.8 server-negotiated
+16/24 kHz input, read-only observability
 snapshots, and pure evaluation report and baseline-comparison panels. Browser
 input never selects an ADK user ID,
 application name, runner, provider, model, evaluator module, or filesystem
@@ -40,8 +41,8 @@ and then runs ExUnit; the
 suite verifies that `/assets/css/app.css` is served with the expected content
 type. `mix precommit` checks formatting, compiles with warnings as errors, and
 runs the deterministic suite. The suite uses fake identity, agent, and Live gateway
-providers; it does not spend Gemini quota. The final 2026-07-15 gate passes all
-101 ExUnit tests and 31 browser-audio tests;
+providers; it does not spend Gemini quota. The final v0.8 2026-07-17 gate
+passes all 103 ExUnit tests and 40 browser-audio tests;
 production asset compilation and release assembly also pass. The assembled
 release boots in both test-only trusted-proxy and direct-TLS configurations,
 serves `GET /health` with HTTP 200 on loopback (with the repository test CA for
@@ -217,8 +218,16 @@ credit. An ambiguous timed-out input/ACK terminates the bridge rather than
 permitting a duplicate retry. Refresh after the session returns to `active`,
 then start a new voice bridge.
 
+Before accepting microphone media, the core bridge sends one exact v1 input
+configuration frame: `<<1, 128, Rate:32/big, 1, 1>>`. It derives `Rate` from
+trusted Live-session status (16 kHz for Gemini or 24 kHz for OpenAI Realtime),
+not from a browser option or model-name heuristic. This frame has no event
+sequence, consumes no subscriber credit, and is never acknowledged. The browser
+fails closed if it is missing, duplicated, malformed, or outside that allowlist.
+
 The browser captures through an AudioWorklet, applies a streaming anti-alias
-filter, resamples 44.1/48/96 kHz device contexts to 16 kHz mono PCM s16le, and
+filter, resamples tested 16/44.1/48/96 kHz device contexts to the negotiated 16
+or 24 kHz mono PCM s16le rate (including safe 16-to-24 kHz interpolation), and
 sends exact 20 ms chunks. A 16-chunk worklet-to-main credit window bounds a
 stalled browser thread; overflow closes the generation instead of silently
 dropping speech. Web Audio plays the native

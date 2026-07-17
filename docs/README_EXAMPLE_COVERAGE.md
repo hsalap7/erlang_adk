@@ -1,304 +1,117 @@
-# README example coverage
+# README recipe coverage
 
-This ledger maps every fenced example in `README.md` to its validation layer.
-F01-F78 retain their v0.6 stable IDs so historical evidence remains
-traceable. New v0.7 fences use F79-F88 and name their section explicitly;
-when a fence is inserted, removed, or materially changed, update this ledger
-in the same change.
+This document maps the current root [`README.md`](../README.md) recipes to
+their prerequisites and validation. It intentionally follows named README
+sections instead of assigning fence numbers, so examples can be simplified or
+reordered without breaking an artificial identifier scheme.
 
-Classifications:
+Prerequisite labels have the following meanings:
 
-- **Literal deterministic**: the literal example, apart from generated names,
-  ports, timeouts, or a deterministic test provider, runs in the Rebar3 gate.
-- **Deterministic equivalent**: the same public API and behavior run with a
-  local probe, fake transport, or offline protocol fixture.
-- **Dedicated fixture**: focused EUnit or Common Test covers protocol,
-  persistence, failure, security, or lifecycle behavior that is unsuitable for
-  the README smoke suite.
-- **Repository deterministic**: a checked companion project is compiled and
-  tested by its own locked toolchain rather than by Rebar3.
-- **Billable REST**: the historically named `readme_live_gemini_SUITE` sends
-  real REST requests using `gemini-3.1-flash-lite`; it is not Gemini Live.
-- **Gemini Live**: the separate `gemini_live_SUITE` uses the bidirectional
-  WebSocket API and `gemini-3.1-flash-live-preview`.
-- **Companion syntax**: configuration belongs to a consumer or another
-  toolchain and is reviewed, but is not compiled by this repository.
-- **Adapter-dependent**: application credentials, infrastructure, or an
-  application-owned adapter are required before the literal example can run.
-- **Conceptual continuation**: the fence intentionally starts with a value
-  produced by a preceding flow, such as a run ID, pause event, policy, or
-  provider callback result.
+- **Local** — no remote model or service is needed. A writable temporary
+  directory, local Mnesia database, or loopback socket may still be used.
+- **Provider key** — the literal recipe makes a remote model request and needs
+  the matching key, network access, quota, and an enabled model.
+- **External service** — the complete integration needs a service such as an
+  OIDC issuer, MCP server, OpenAPI endpoint, OTLP collector, or public A2A peer.
+- **Application adapter** — the application must provide trusted code or
+  configuration, such as a sandbox, credential source, resource resolver, or
+  authorization policy.
 
-`Billable REST`, `Gemini Live`, and `adapter-dependent` examples must still
-have deterministic wire or contract coverage. A provider pass supplements
-rather than replaces those tests. This ledger names the evidence for each
-fence. The completed 0.4 clean gate
-passed 654 EUnit tests, four deterministic Common Test scenarios, and Dialyzer
-over 134 project files; that is inherited baseline evidence, not a 0.5 release
-result. On the 0.5 branch, the focused README suite passed 29 tests, the
-developer HTTP suite passed nine, the cache lifecycle core passed ten, and the
-exact-scope artifact/memory sharding suite passed 12.
-An earlier combined 14-module artifact/memory/context snapshot passed 90
-before subsequent Runner/lifecycle tests landed. The final v0.5 clean
-deterministic gate superseded that snapshot with 765 EUnit tests, six Common
-Test scenarios, and warning-free Dialyzer over 160 project files. The final
-v0.6 clean gate passed 899 EUnit tests and six deterministic Common Test cases
-with no failures, and Dialyzer reported no warnings across 170 project files.
-Escript packaging, doctor, checked-config validation, all 29 focused README
-examples, all four focused workflow examples, the 1,000-run concurrency case,
-both v0.5 resource/context stress cases, 46 Phoenix tests, production assets,
-Phoenix release assembly, and loopback production-release health checks in
-trusted-proxy and direct-TLS modes also passed. The clean command did not
-enable paid provider tests, so all 16 billable REST cases were skipped there
-and are not counted as passes. The checked-in
-REST suite includes real Runner explicit-cache create/reuse and model-selected
-exact-scope memory/artifact cases. The full 2026-07-14 billable REST run against
-`gemini-3.1-flash-lite` passed 14 cases and failed two, with no skips. The data
-case passed. Google Search grounding and context-cache creation each received
-HTTP 429 after the one bounded ten-second retry; those are explicit quota/rate-
-limit failures, not implementation passes. These v0.5/v0.6 results are
-historical evidence, not a v0.7 release result. REST and Gemini Live evidence
-supplements rather than replaces deterministic contracts in this ledger. The
-final 2026-07-16 v0.7 clean Erlang gate passes 1,176 EUnit tests, six
-deterministic Common Test cases, 73.88% aggregate Erlang line coverage, and
-warning-free Dialyzer analysis over 210 project files. Escript
-packaging, CLI checks, 29 README tests, four workflow tests, three example
-runtime smokes, 193 focused v0.7 tests, and both 1,000-run stress suites pass.
-Phoenix and paid-provider evidence is recorded separately because neither a
-skipped billable case nor an unrelated companion gate is an Erlang-core pass.
-The final paid runs pass all five Gemini Live cases and 15 of 17 REST cases
-with no skips; Search grounding and context-cache creation fail explicitly on
-HTTP 429 after the one bounded retry, while the new rubric judge passes.
+Deterministic tests use probes, fake transports, loopback fixtures, and local
+stores. They validate Erlang ADK behavior without spending provider quota.
+Live provider checks supplement these tests; they never replace them.
 
-## Installation and provider examples
+## User recipes
 
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F01 | Installation: Git dependency declaration | Erlang | Companion syntax | The project itself is compiled by the complete Rebar3 gate; no separate consumer project is created. | Requires Git/network access and the immutable `v0.7.0` tag. The literal `deps` term belongs in a consumer `rebar.config`; after Hex publication `{erlang_adk, "0.7.0"}` is equivalent. |
-| F02 | Installation: start the application | Erlang | Literal deterministic | `readme_examples_test:setup/0`; `erlang_adk_startup_test` | The application must be compiled first. |
-| F03 | Installation: export `GEMINI_API_KEY` | Bash | Billable REST; Gemini Live | `readme_live_gemini_SUITE:init_per_suite/1` and `gemini_live_SUITE:init_per_suite/1` verify their independent opt-in flag and key. | Must run in the same shell as F77/F78 or F87. The key is never supplied to deterministic tests. |
-| F04 | Quickstart: weather tool and direct agent | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:example_modules_compile_and_load/0`, `direct_agent_and_provider_error/0`; `readme_live_gemini_SUITE:weather_tool_round_trip/1` | REST execution needs F03, network access, and quota. The deterministic path substitutes `adk_llm_probe`. |
-| F05 | Quickstart: provider capabilities and config validation | Erlang | Literal deterministic | `readme_examples_test:provider_capability_contract/0`; `adk_llm_test`; `adk_llm_gemini_test:test_strict_config/1` | No API key or network. |
-| F06 | Google Search grounding request | Erlang | Deterministic equivalent; Billable REST | `adk_llm_gemini_test:test_google_search_grounding/1`, `test_grounded_tool_call_event/1`; `readme_live_gemini_SUITE:google_search_grounding/1` | REST Search use is model-selected and needs F03. The deterministic fixture proves request shape and metadata decoding. The final 2026-07-15 REST case received HTTP 429 after one bounded retry, so it failed as rate-limited and is not counted as passed. |
-| F07 | Grounding provider-metadata event projection | Erlang | Dedicated fixture | `adk_provider_result_test`; `adk_llm_gemini_test:test_grounding_event_persistence/1`, `test_stream_grounding_agent_event/1` | This is a projected map fragment, not a standalone shell expression with locally bound `GroundingMetadata`. |
-| F08 | Gemini thinking configuration | Erlang | Deterministic equivalent; Billable REST | `adk_llm_gemini_test:test_thinking_payload/1`, `test_thought_summary_response/1`, `test_stream_thought_summary/1`; `readme_live_gemini_SUITE:thinking_configuration/1` | REST execution needs F03. |
-| F09 | Gemini safety settings | Erlang | Literal deterministic; Dedicated fixture | `readme_examples_test:provider_capability_contract/0`; `adk_llm_gemini_test:test_safety_payload/1` | Validation is local; no API key or network. |
+| Recipe and README section | Prerequisites | Deterministic coverage | Live validation |
+| --- | --- | --- | --- |
+| Compile, start the application, and add it as a dependency — [Installation](../README.md#installation) | Local; dependency download requires network on a fresh checkout | `erlang_adk_startup_test`; complete compile/package gates below | None |
+| Create and prompt a Gemini agent — [Your first agent](../README.md#your-first-agent) | Provider key | `readme_examples_test:direct_agent_and_provider_error/0`; `adk_llm_test`; `adk_llm_gemini_test` | [Gemini REST](#gemini-rest) |
+| Configure Gemini, OpenAI, Anthropic, and compatible profiles — [Choose a model provider](../README.md#choose-a-model-provider) | Local for validation; provider key for a remote call; external service for a compatible endpoint | `readme_examples_test:multi_provider_profile_contract/0`; `adk_provider_profile_test`; `adk_provider_registry_test`; `adk_provider_registry_live_test`; `adk_provider_credential_test`; provider request/stream codec tests | Gemini profiles: [Gemini REST](#gemini-rest). OpenAI, Anthropic, and compatible providers have no first-party paid suite |
+| Load an Erlang tool and let an agent call it — [Add an Erlang tool](../README.md#add-an-erlang-tool) | Provider key for model selection; Local for schema and execution checks | `readme_examples_test:example_modules_compile_and_load/0`; `adk_json_schema_test`; `adk_tool_call_test`; `adk_runner_tools_test` | `weather_tool_round_trip` in [Gemini REST](#gemini-rest) |
+| Run agents sequentially, in parallel, by delegation, or as sub-agents — [Run multiple agents](../README.md#run-multiple-agents) | Provider key for the literal agents | `readme_examples_test:correlated_async_delegation/0`, `sequential_parallel_and_loop/0`, `sub_agent_and_agent_as_tool/0`; `erlang_adk_orchestrator_test`; `adk_agent_tree_test`; `adk_sub_agents_test`; `adk_concurrency_stress_SUITE` | Delegation, orchestration, and sub-agent cases in [Gemini REST](#gemini-rest) |
+| Compile and run an application-controlled workflow — [Run a workflow](../README.md#run-a-workflow) | Local | `readme_workflow_examples_test`; `adk_workflow_test`; `adk_workflow_graph_test`; `adk_workflow_public_contract_test`; `adk_workflow_contract_ledger`; `adk_durable_workflow_test` | None; the README workflow is deliberately provider-independent |
+| Run an agent with events, sessions, stable run IDs, cancellation, and background triggers — [Use the Runner](../README.md#use-the-runner) | Provider key for the literal run; Local for deterministic probes | `readme_examples_test:sync_and_async_runner/0`, `supervised_run_api/0`, `ambient_background_runtime/0`; `adk_runner_test`; `adk_run_test`; `adk_ambient_test`; `adk_ambient_concurrency_SUITE` | Runner cases in [Gemini REST](#gemini-rest) |
+| Pause for confirmation or long-running work and resume it — [Human approval and long-running work](../README.md#human-approval-and-long-running-work) | Local; provider key only for the optional model-driven path | `readme_examples_test:tool_confirmation_contract/0`, `suspension_and_pkce_contract/0`; `adk_tool_confirmation_test`; `adk_direct_confirmation_test`; `adk_hitl_test`; `adk_hitl_mnesia_restart_test`; `adk_suspension_test` | `human_approval` in [Gemini REST](#gemini-rest) |
+| Stream UTF-8 text — [Streaming and multimodal input](../README.md#streaming-and-multimodal-input) | Provider key | `readme_examples_test:deterministic_streaming/0`, `runner_provider_streaming/0`; `adk_streaming_test`; provider stream codec tests | `streaming` in [Gemini REST](#gemini-rest) |
+| Send canonical text and image content — [Streaming and multimodal input](../README.md#streaming-and-multimodal-input) | Provider key | `readme_examples_test:multimodal_content_contract/0`, `supervised_content_streaming/0`; `adk_content_test`; Gemini, OpenAI, Anthropic, and compatible content/request tests | `multimodal_content` in [Gemini REST](#gemini-rest) |
+| Start a Gemini Live session and use audio, image, tools, transcription, and browser framing — [Realtime sessions and browser voice](../README.md#realtime-sessions-and-browser-voice) | Provider key | `adk_live_public_api_test`; `adk_live_session_test`; `adk_live_media_test`; `adk_live_gemini_codec_test`; `adk_live_gun_transport_test`; `adk_live_tool_execution_test`; `adk_live_voice_protocol_test`; `adk_live_voice_bridge_test` | [Gemini Live](#gemini-live) |
+| Start an OpenAI Realtime session — [Realtime sessions and browser voice](../README.md#realtime-sessions-and-browser-voice) | Provider key | `adk_live_session_profile_test`; `adk_live_session_multi_frame_test`; `adk_live_openai_codec_test`; `adk_live_openai_gun_transport_test`; voice protocol and bridge tests | No first-party paid suite; run an application-owned smoke against the configured Realtime model |
+| Use ETS or Mnesia sessions and query, branch, or rewind history — [Sessions, artifacts, memory, and context](../README.md#sessions-artifacts-memory-and-context) | Local | `readme_examples_test:session_scopes_and_temp_state/0`, `session_query_pagination_and_rewind/0`; `adk_session_service_test`; `adk_state_scoping_test`; `adk_session_query_test`; `erlang_adk_session_mnesia_test` | `mnesia_runner` in [Gemini REST](#gemini-rest) |
+| Store immutable artifacts in ETS or the filesystem — [Sessions, artifacts, memory, and context](../README.md#sessions-artifacts-memory-and-context) | Local; writable storage for the filesystem adapter | `readme_examples_test:memory_and_artifacts/0`; `adk_artifact_conformance_test`; `adk_artifact_ets_test`; `adk_artifact_fs_test`; `adk_context_capability_test`; `adk_context_runner_test` | `artifact_and_memory_tools` in [Gemini REST](#gemini-rest) |
+| Retrieve and ingest exact-user memory — [Sessions, artifacts, memory, and context](../README.md#sessions-artifacts-memory-and-context) | Local; provider key for model-selected retrieval | `readme_examples_test:memory_and_artifacts/0`; `adk_memory_conformance_test`; `adk_memory_v2_ets_test`; `adk_memory_mnesia_test`; `adk_memory_outbox_test`; `adk_context_runner_test` | `artifact_and_memory_tools` in [Gemini REST](#gemini-rest) |
+| Select, compact, and cache provider request context — [Sessions, artifacts, memory, and context](../README.md#sessions-artifacts-memory-and-context) | Local for policy and cache behavior; provider key for a real provider cache | `adk_context_policy_test`; `adk_context_envelope_test`; `adk_context_compaction_test`; `adk_context_cache_test`; `adk_context_cache_gemini_test`; `adk_context_runner_test` | `context_cache` in [Gemini REST](#gemini-rest) |
+| Turn an OpenAPI operation into agent tools — [Integrations](../README.md#integrations) | External service; provider key when a model selects the tool; application adapter for protected credentials | `readme_examples_test:openapi_toolset_as_agent_tools/0`; `adk_openapi_schema_test`; `adk_openapi_toolset_test`; `adk_openapi_toolset_boundaries_test`; `adk_openapi_production_adapters_test`; `adk_openapi_gun_transport_security_test` | Run an application-owned smoke against the selected OpenAPI endpoint and provider |
+| Connect to or expose MCP tools — [Integrations](../README.md#integrations) | Local for repository fixtures; external service for a real MCP peer | `readme_examples_test:mcp_stdio_fixture/0`, `mcp_streamable_http_fixture/0`; `adk_mcp_test`; `adk_mcp_streamable_http_SUITE` | Run an application-owned stdio or HTTPS MCP interoperability smoke |
+| Execute model-requested code through an external sandbox — [Integrations](../README.md#integrations) | Application adapter and external service | `adk_code_toolset_test`; normal tool policy, timeout, and cancellation tests | Run the owning application's sandbox conformance and isolation checks |
+| Expose or call agents through A2A 1.0 — [Integrations](../README.md#integrations) | Application adapter for public authentication; external service for a real peer; provider key only when the backing agent calls a model | `adk_a2a_v1_codec_test`; `adk_a2a_v1_server_test`; `adk_a2a_v1_http_test`; `adk_a2a_v1_client_security_test`; `adk_a2a_v1_auth_test`; `adk_a2a_v1_agent_executor_test` | Run an application-owned authenticated HTTPS peer smoke |
+| Add plugins, callbacks, metrics, traces, and OTLP export — [Plugins, observability, and evaluation](../README.md#plugins-observability-and-evaluation) | Local for pipelines and telemetry; application adapter and external service for a real exporter/collector | `readme_examples_test:callbacks_and_telemetry/0`, `plugins_observability_and_eval_sets/0`; `adk_plugin_pipeline_test`; `adk_plugin_runner_integration_test`; `adk_plugin_builtin_test`; `adk_plugin_stateful_test`; `adk_observability_v2_test`; `adk_observability_runner_test`; `adk_trace_context_test`; `adk_otlp_json_test`; `adk_otlp_http_json_exporter_test` | Send a smoke trace to the deployment's configured OTLP endpoint |
+| Evaluate an agent and render or compare reports — [Plugins, observability, and evaluation](../README.md#plugins-observability-and-evaluation) | Provider key for the checked CLI agent; Local for criteria and report fixtures | `readme_examples_test:plugins_observability_and_eval_sets/0`, `lightweight_evaluation/0`; `adk_eval_set_test`; `adk_eval_criteria_test`; `adk_eval_v2_test`; `adk_eval_dev_view_test`; `adk_eval_llm_judge_test`; `adk_cli_test` | Evaluation and rubric-judge cases in [Gemini REST](#gemini-rest) |
+| Validate inbound OIDC/JWT and obtain outbound OAuth credentials — [Authentication](../README.md#authentication) | External service and application adapter | `adk_oidc_security_test`; `adk_oidcc_adapters_test`; `adk_auth_test`; `adk_auth_bounds_test`; `adk_auth_rotation_test`; `adk_authorization_flow_test`; `adk_suspension_test` | Run an application-owned issuer discovery, login, refresh, revocation, and scope smoke |
+| Build the CLI, validate configuration, run once, or use the console — [CLI and local developer UI](../README.md#cli-and-local-developer-ui) | Local for `doctor` and validation; provider key for `run`, `console`, and model-backed evaluation | `adk_cli_test`; checked `examples/agent.json` and `examples/eval.json` | Use the literal `adk run`, `console`, or `evaluate` command in the README |
+| Start the authenticated loopback developer UI — [CLI and local developer UI](../README.md#cli-and-local-developer-ui) | Local; provider key for model calls; application adapter for artifact, memory, context, or Live panels | `adk_cli_test`; `adk_dev_http_test`; `adk_dev_v05_http_test`; `adk_dev_v07_http_test`; `erlang_adk_startup_test` | Start `adk serve` as shown in the README and exercise the required panel/API from a second process |
+| Start the Phoenix companion with local authentication — [Phoenix UI](../README.md#phoenix-ui) | External service for first dependency download; provider key for model/Live calls | `mix precommit`, including Phoenix ExUnit and browser/audio Node tests with fake providers | Start Phoenix as shown in the README; follow its guide to create a Live session and test browser voice |
+| Use Phoenix with OIDC or in a production release — [Phoenix UI](../README.md#phoenix-ui) | External service and application adapter | Phoenix auth/controller/gateway/LiveView tests; production asset, release, audit, and smoke gates in `RELEASING.md` | Run an application-owned OIDC login and authenticated agent/Live smoke over the deployed TLS boundary |
 
-## Agents, tools, and orchestration
+## Check mapping
 
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F10 | Agent contracts, scoped instructions, schema, and `output_key` | Erlang | Deterministic equivalent | `readme_examples_test:agent_contracts_and_context_policy/0`; `adk_agent_spec_test`; `adk_agent_runtime_spec_test:invocation_output_key_uses_caller_session_scope/0`; `adk_global_instruction_test` | The deterministic test substitutes `adk_llm_agent_spec_probe` while preserving the public Runner/session API. Invocation-scoped writes are checked against the caller session rather than the reusable agent's configured default. |
-| F11 | `readme_weather_tool` module | Erlang | Literal deterministic | `readme_examples_test:example_modules_compile_and_load/0` compiles `examples/readme_weather_tool.erl`; `adk_runner_tools_test` | The fence is a module body and is compiled as the repository example file, not pasted into the shell. |
-| F12 | External-sandbox code toolset | Erlang | Adapter-dependent; Dedicated fixture | `adk_code_toolset_test:compile_and_schema_test/0`, `resolved_call_is_bounded_and_context_is_minimal_test/0`, `request_policy_rejects_unsafe_or_oversized_values_test/0` | `my_sandbox_adapter` and `SandboxHandle` are application-owned placeholders. No in-process executor is provided by Erlang ADK. |
-| F13 | OpenAPI Petstore toolset and agent | Erlang | Deterministic equivalent; Adapter-dependent | `readme_examples_test:openapi_toolset_as_agent_tools/0`; `adk_openapi_toolset_test`; `adk_openapi_production_adapters_test` | The literal example contacts Petstore and Gemini. Tests use the same checked schema with local fake/Gun transports and out-of-band auth. |
-| F14 | Correlated asynchronous delegation | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:correlated_async_delegation/0`; `readme_live_gemini_SUITE:async_delegation/1` | REST execution needs F03. |
-| F15 | Sequential and parallel multi-agent execution | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:sequential_parallel_and_loop/0`; `readme_live_gemini_SUITE:concurrent_orchestration/1`; `adk_concurrency_stress_SUITE` | REST execution needs F03. Stress coverage validates isolation and cleanup at larger scale. |
-| F16 | Bounded writer/reviewer loop | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:sequential_parallel_and_loop/0`; `readme_live_gemini_SUITE:concurrent_orchestration/1`; `erlang_adk_orchestrator_test` | REST natural-language review is nondeterministic; the deterministic reviewer returns exact `APPROVED`. |
-| F17 | Sub-agent and agent-as-tool | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:sub_agent_and_agent_as_tool/0`; `readme_live_gemini_SUITE:sub_agent_and_agent_tool/1`; `adk_sub_agents_test`; `adk_agent_tree_test`; `adk_agent_mailbox_test`; `adk_global_instruction_test` | Focused tests cover strict tree identity/ownership/cycle/depth bounds, fresh delegated history, the private runtime path through direct and dynamically resolved local modules, allowlisted child scope, root global-instruction propagation, and restart-by-name. |
-| F18 | Sequential and bounded-parallel declarative workflows | Erlang | Literal deterministic | `readme_workflow_examples_test:sequential_and_parallel_workflows/0`; `adk_workflow_test` | Covers output-to-successor propagation, deterministic parallel output maps, root schemas, per-action timeout/retry, and sequential nested-child resume. Retry attempts are not a durable checkpoint ledger; top-level parallel nested-child pause remains unsupported. |
-| F19 | Loop, transfer, and dynamically routed graph workflows | Erlang | Literal deterministic | `readme_workflow_examples_test:loop_transfer_and_graph_workflows/0`; `adk_workflow_test`; `adk_workflow_graph_test`, including `workflow_agent_registry_alias_mismatch_fails_closed/0` | Loop exhaustion is normal bounded completion with the last output. A typed agent resolves a supervised replacement but verifies its canonical runtime identity before dispatch. Nested-child pause remains unsupported in top-level loop bodies and transfer members. |
-| F20 | Graph fork/join and pause/resume | Erlang | Literal deterministic | `readme_workflow_examples_test:graph_fork_join_and_pause_resume/0`; `adk_workflow_graph_test` | Tests cover versioned branch output/delta records, deterministic join input, ordinary paused-branch output, and nested workflow resume without replaying the paused child. A concurrent sibling cancelled before commit is deliberately tested as at-least-once and reruns after resume. Resume input is supplied in the same fence. |
-| F21 | Durable Mnesia workflow invocation | Erlang | Literal deterministic; Dedicated fixture | `readme_workflow_examples_test:graph_fork_join_and_pause_resume/0`; `adk_durable_workflow_test` | Uses local Mnesia. Coordinator, application, Mnesia, and worker recovery are covered by the dedicated suite; see `DURABLE_INVOCATIONS.md`. |
-| F22 | Workflow checkpoint, cancellation, and resume | Erlang | Literal deterministic | `readme_workflow_examples_test:workflow_cancel_checkpoint_and_resume/0`; `adk_workflow_test` | The example owns its temporary worker processes and checkpoint. |
-| F23 | Explicit planning and bounded replanning | Erlang | Literal deterministic | `readme_examples_test:explicit_planning_runtime/0` compiles the two example adapters; `adk_planning_runtime_test`; `erlang_adk_planning_test` | Planner and executor modules are trusted application code. |
-| F24 | Legacy graph helper | Erlang | Literal deterministic | `readme_examples_test:bounded_graph_workflow/0`; `erlang_adk_orchestrator_test`; `adk_graph_node_test` for the adjacent event-node helpers | No provider, key, or network. |
+| README check | Prerequisites | What it validates |
+| --- | --- | --- |
+| [Quick check while developing](../README.md#quick-check-while-developing) | Local | Compilation plus the focused README and workflow EUnit modules |
+| [Core checks before opening a pull request](../README.md#core-checks-before-opening-a-pull-request) | Local; loopback sockets must be permitted | Clean compile, complete EUnit and deterministic Common Test, Dialyzer, fresh aggregate coverage, and Xref |
+| [If README examples changed](../README.md#if-readme-examples-changed) | Local | Focused recipe behavior plus warning-as-error compilation of checked example modules |
+| [If the Phoenix application changed](../README.md#if-the-phoenix-application-changed) | External service for the initial dependency/tool download | Locked dependencies, formatting, warning-free compilation, assets, browser/audio JavaScript, ExUnit, and the exact dependency-audit policy |
+| [Documentation, CLI, and package checks](../README.md#documentation-cli-and-package-checks) | Local after dependencies are present | CLI assembly and smoke checks, ExDoc, Hex package assembly, package contents, and clean extracted-package compilation |
+| [Optional paid Gemini checks](../README.md#optional-paid-gemini-checks) | Provider key | Real Gemini REST and Gemini Live interoperability; these commands are deliberately outside the deterministic gate |
 
-## Runner, background work, and suspension
-
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F25 | Event Runner configuration and synchronous run | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:sync_and_async_runner/0`, `runner_provider_streaming/0`; `readme_live_gemini_SUITE:runner_sync_async/1`; `adk_runner_test`; `adk_context_policy_test`; `adk_context_envelope_test`; `adk_context_runner_test` | The deterministic path substitutes local providers but retains admission, complete-envelope budgeting, policy, context, streaming, and session contracts. |
-| F26 | Admission-control `sys.config` fragment | Erlang | Companion syntax; Dedicated fixture | `adk_admission_control_test`; `adk_runtime_policy_test`; `adk_runner_safety_test`; `erlang_adk_startup_test` | This is application environment configuration and must be installed before startup. |
-| F27 | Stable run subscription and terminal outcome | Erlang | Literal deterministic; Dedicated fixture | `readme_examples_test:supervised_run_api/0`; `adk_run_test:late_subscriber_receives_bounded_replay_case/0`, `terminal_is_emitted_exactly_once_case/0` | The push subscription is for a local process that continuously drains its mailbox. |
-| F28 | Resume a stable paused run | Erlang | Conceptual continuation; Dedicated fixture; Billable REST | `adk_run_test:paused_run_resumes_as_new_supervised_run_case/0`; `adk_hitl_test`; `readme_live_gemini_SUITE:human_approval/1` | `PausedRunId` comes from F32 or another retained paused run; the REST supplement needs F03. |
-| F29 | Ambient trigger registration and submission | Erlang | Literal deterministic | `readme_examples_test:ambient_background_runtime/0`; `adk_ambient_test`; `adk_ambient_concurrency_SUITE` | The deterministic test uses a probe Runner; cloud delivery adapters remain application integrations. |
-| F30 | Fixed-delay schedule trigger | Erlang | Literal deterministic | `readme_examples_test:ambient_background_runtime/0`; `adk_ambient_test` | The one-hour timer is started and stopped without waiting for a tick. |
-| F31 | Lower-level Runner mailbox drain | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:sync_and_async_runner/0`; `readme_live_gemini_SUITE:runner_sync_async/1`; `adk_runner_test` | `Runner` and `RunnerAgentPid` are established by F25. |
-| F32 | Generic tool confirmation plus human-approval pause and correlated resume | Erlang | Literal deterministic; Billable REST | `readme_examples_test:tool_confirmation_contract/0`; `adk_tool_confirmation_test`; `adk_direct_confirmation_test`; `adk_hitl_test:test_pause_and_resume_same_invocation/0`, `test_two_paused_invocations_are_independently_resumable/0`, `test_concurrent_resume_is_single_use/0`; `readme_live_gemini_SUITE:human_approval/1` | The checked `readme_release_tool` requires the exact `confirmed` boolean contract for production and bypasses it for dry runs. The older long-running approval tool has a distinct application response. REST execution needs F03 and may complete without a pause, which the example handles explicitly. |
-| F33 | Generic long-running suspension constructor | Erlang | Literal deterministic | `readme_examples_test:suspension_and_pkce_contract/0`; `adk_suspension_test:long_running_progress_and_terminal_resume_case/0` | The constructor throws the documented suspension signal for Runner/tool handling. |
-| F34 | Long-running progress update and terminal resume | Erlang | Conceptual continuation; Dedicated fixture | `adk_suspension_test:long_running_progress_and_terminal_resume_case/0`, `stable_run_rejects_invalid_completion_before_linking_case/0` | `PauseEvent` and `Runner` come from a prior paused operation; `export-42` must match that continuation. |
-
-## Sessions, callbacks, content, and streaming
-
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F35 | ETS session scopes and temp-state lifecycle | Erlang | Literal deterministic | `readme_examples_test:session_scopes_and_temp_state/0`; `adk_session_service_test`; `adk_state_scoping_test` | No provider, key, or network. Concurrent create/update behavior is covered by `adk_state_scoping_test`. |
-| F36 | Mnesia-backed Runner | Erlang | Deterministic equivalent; Billable REST | `erlang_adk_session_mnesia_test:test_runner_integration/0`; `readme_live_gemini_SUITE:mnesia_runner/1` | Requires writable local Mnesia storage; REST execution also needs F03. |
-| F37 | Configure Mnesia as the startup backend | Erlang | Dedicated fixture | `erlang_adk_startup_test:configured_mnesia_startup/1`; `erlang_adk_session_mnesia_test` | Must be set before application startup; the fixture supplies an isolated Mnesia directory. |
-| F38 | Session query, HMAC cursor, pagination, and rewind | Erlang | Literal deterministic | `readme_examples_test:session_query_pagination_and_rewind/0`; `adk_session_query_test` | `QuerySecret` is generated for the example; production nodes need a shared secret from application secret storage. |
-| F39 | `readme_audit_callback` module | Erlang | Literal deterministic | `readme_examples_test:example_modules_compile_and_load/0` compiles `examples/readme_audit_callback.erl`; `adk_callbacks_isolation_test` | The `persistent_term` observer is an example/test notification hook and must be cleared. Callback arguments are credential-free projections. |
-| F40 | Attach callbacks to an agent | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:callbacks_and_telemetry/0`; `readme_live_gemini_SUITE:callbacks_telemetry_and_eval/1`; `adk_callbacks_isolation_test` | REST execution needs F03. F39 must be compiled and its observer cleared after use. |
-| F41 | Prompt telemetry handler | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:callbacks_and_telemetry/0`; `readme_live_gemini_SUITE:callbacks_telemetry_and_eval/1`; `adk_observability_test` | REST execution needs F03. The handler ID is detached before and after use. |
-| F42 | Multimodal one-shot content | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:multimodal_content_contract/0`; `adk_content_test`; `adk_llm_gemini_test:test_multimodal_request/1`, `test_multimodal_response/1`; `readme_live_gemini_SUITE:multimodal_content/1` | REST execution needs F03. The deterministic fixture validates canonical encoding/decoding and limits. |
-| F43 | Gemini canonical content stream | Erlang | Deterministic equivalent; Billable REST | `adk_llm_gemini_test:test_stream_content/1`; `adk_streaming_test`; `readme_live_gemini_SUITE:multimodal_content/1` | `MultimodalPrompt` comes from F42. REST execution needs F03. |
-| F44 | Runner content streaming and retained replay | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:supervised_content_streaming/0`; `adk_streaming_test`; `readme_live_gemini_SUITE:multimodal_content/1` | `MultimodalPrompt` comes from F42. The deterministic provider emits canonical content frames. |
-| F45 | Gemini UTF-8 text streaming | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:deterministic_streaming/0`; `adk_llm_gemini_test:test_stream_text/1`, `test_stream_tool_call/1`; `readme_live_gemini_SUITE:streaming/1` | REST execution needs F03. |
-
-## MCP, plugins, evaluation, storage, and HTTP protocols
-
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F46 | MCP stdio client fixture | Erlang | Literal deterministic | `readme_examples_test:mcp_stdio_fixture/0`; `adk_mcp_test` | Requires the repository fixture `test/mcp_stdio_fixture.sh` to be executable. The HTTP session-loss retry rule does not apply to stdio transport. |
-| F47 | MCP Streamable HTTP loopback server/client | Erlang | Literal deterministic; Dedicated fixture | `readme_examples_test:mcp_streamable_http_fixture/0`; `adk_mcp_test`; `adk_mcp_streamable_http_SUITE` | Uses loopback, an ephemeral port, the explicit clear-loopback client opt-in, and a placeholder token only inside the fixture. Security cases cover HTTPS-by-default destination policy, dynamic origin authorization, DNS/IP validation, absolute deadlines, principal-bound sessions, version negotiation, and non-replay of mutating calls. No public bind or external TLS is attempted by the literal fence. |
-| F48 | Runner plugin and synchronous observability exporter | Erlang | Deterministic equivalent | `readme_examples_test:plugins_observability_and_eval_sets/0`; `adk_plugin_pipeline_test`; `adk_plugin_runner_integration_test`; `adk_plugin_builtin_test`; `adk_observability_test`; `adk_observability_runner_test` | The example modules are compiled by `readme_examples_test:setup/0`; the deterministic path substitutes a probe provider. F82-F84 cover the new stateful, asynchronous, and W3C examples. |
-| F49 | Versioned multi-turn eval set v2 | Erlang | Deterministic equivalent | `readme_examples_test:plugins_observability_and_eval_sets/0`; `adk_eval_set_test`; `adk_eval_criteria_test`; `adk_eval_v2_test` | The literal provider is Gemini; the deterministic test uses the same adapter/criterion contract with a probe agent. Each agent-adapter case/sample owns a fresh runtime. F85/F86 cover reporting and CLI. |
-| F50 | Legacy lightweight evaluation | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:lightweight_evaluation/0`; `adk_eval_test`; `readme_live_gemini_SUITE:callbacks_telemetry_and_eval/1` | REST execution needs F03. Rows share the supplied agent history by design. |
-| F51 | Retry with bounded backoff | Erlang | Literal deterministic | `readme_examples_test:deterministic_retry/0`; `adk_retry_test` | No provider, key, or network. |
-| F52 | Scoped ETS memory with Runner preload, ingestion, and model-selected search | Erlang | Deterministic equivalent; Billable REST | `readme_examples_test:memory_and_artifacts/0`; `adk_memory_conformance_test`; `adk_memory_v2_ets_test`; `adk_context_runner_test:memory_v2_preload_is_exactly_scoped/0`, `model_selected_memory_load_is_exactly_scoped/0`; `adk_context_capability_test`; `adk_llm_gemini_test:test_json_schema_tool_payload/1`; `readme_live_gemini_SUITE:artifact_and_memory_tools/1` | The deterministic path substitutes a probe provider and proves the exact `{user, App, User}` scope for both preload and the built-in `adk_load_memory_tool`, including rejection of cross-user data. Its strict declaration uses Gemini `parametersJsonSchema`. The targeted REST case passed on 2026-07-15 and needs F03; the full REST suite remains separate. |
-| F53 | Immutable paginated ETS artifacts | Erlang | Literal deterministic; Billable REST | `readme_examples_test:memory_and_artifacts/0`; `adk_artifact_conformance_test`; `adk_artifact_ets_test`; `adk_context_capability_test`; `adk_context_runner_test:artifact_attachment_is_ephemeral_and_effect_is_durable/0`; `adk_llm_gemini_test:test_json_schema_tool_payload/1`; `readme_live_gemini_SUITE:artifact_and_memory_tools/1` | Conformance tests cover bounded `list_names` with exact scope provenance; hostile capability coverage rejects a valid-name page carrying a foreign scope. Runner coverage proves one-request model attachment, metadata-only effects, and absence of bytes from durable events. Its strict declaration uses Gemini `parametersJsonSchema`. The literal storage example needs no provider; the targeted REST model-selection supplement passed on 2026-07-15 and needs F03. |
-| F54 | Durable filesystem artifacts | Erlang | Literal deterministic | `readme_examples_test:memory_and_artifacts/0`; `adk_artifact_conformance_test`; `adk_artifact_fs_test:lifetime_version_capacity_fails_before_scan_exhaustion_test/0`, `lifetime_scope_and_name_capacity_preserve_bounded_listing_test/0` and the full module | Requires a writable temporary directory; the 15 focused tests remove isolated roots and cover publication, repair, corruption, deadline, pagination, multi-instance-safe scope/name/version lifetime admission before scan exhaustion, and the fact that deletion/restart does not restore allocation capacity. |
-| F55 | A2A 1.0 Agent Card, server, and client | Erlang | Deterministic equivalent; Adapter-dependent | `adk_a2a_v1_codec_test`; `adk_a2a_v1_server_test`; `adk_a2a_v1_http_test`; `adk_a2a_v1_client_security_test`; `erlang_adk_startup_test:supervised_a2a_v1_is_discoverable/0` | The literal fence uses fixed port 8080 and Gemini. Fixtures use loopback/ephemeral ports and deterministic task work, including encoded byte/count caps, slow-subscriber detachment, absolute deadlines, redirect/DNS/private-address policy, card/interface origin validation, and separate discovery/RPC credentials. |
-| F56 | A2A OIDC authentication hook and direct-TLS listener | Erlang | Conceptual continuation; Adapter-dependent; Dedicated fixture | `adk_a2a_v1_http_test`; `adk_a2a_v1_client_security_test`; `adk_a2a_v1_auth_test`; `adk_oidc_security_test`; `erlang_adk_startup_test` | `JwtPolicy` is produced by F67 or equivalent trusted application configuration. The fence stops the prior listener, configures and starts the dedicated public listener, and requires real certificate paths and issuer/JWKS access. Fixtures prove fail-closed public bind/auth/TLS policy plus bounded auth callbacks. |
-| F57 | Legacy `/a2a/prompt` endpoint | Erlang | Deterministic equivalent; Billable REST | `erlang_adk_tests`; `erlang_adk_startup_test:legacy_listener_is_always_loopback/0`, `supervised_http_is_bounded/0`; `readme_live_gemini_SUITE:http_endpoint/1` | REST execution needs F03. Tests use loopback and isolated ports. Startup rejects every non-loopback `a2a_ip` with `legacy_a2a_server_must_bind_loopback`; the A2A v1 public-bind and trusted-TLS-proxy opt-ins do not weaken this legacy route. |
-
-## Integrated developer tooling, authentication, and Phoenix
-
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F58 | Export the developer bearer token | Bash | Companion syntax | `adk_dev_http_test:auth_case/1`; `adk_cli_test:doctor_redacts_environment_case/0`; `erlang_adk_startup_test:supervised_dev_listener_is_authenticated/0` validate consumption and redaction. | Must be exported before startup or `adk serve`; use a dedicated local token of at least 16 bytes. |
-| F59 | Configure and bound the developer listener | Erlang | Dedicated fixture | `adk_dev_http_test:sse_config_validation_case/0`; `adk_dev_v05_http_test:provider_config_case/0`; `adk_dev_v07_http_test:live_config_validation_case/0`; `erlang_adk_startup_test:supervised_dev_listener_is_authenticated/0`; `adk_runtime_policy_test` | Listener and diagnostic/resource configuration is read at startup, including the exact binary `dev_live_principal` and bounded `dev_live_credit`. This fence intentionally does not start the application; resource-enabled startup occurs only after F60/F61. |
-| F60 | Exact-scope developer resource-provider module | Erlang | Deterministic equivalent; Adapter-dependent | `adk_dev_v05_resource_provider`; `adk_dev_v05_http_test:provider_config_case/0`, `artifact_case/1`, `memory_case/1`, `resource_scope_mismatch_fails_closed/1`; `erlang_adk_startup_test:supervised_dev_listener_is_authenticated/0` | `my_dev_resource_provider` is an application-owned module; the checked fixture implements the same `resolve/3` contract. The HTTP projection rejects artifact name pages, artifact versions, or memory hits whose embedded scope differs from the requested path. |
-| F61 | Start fresh developer resources/cache, configure exact scopes, then start the application | Erlang | Deterministic equivalent; Dedicated fixture; Adapter-dependent | `adk_dev_v05_http_test:context_lifecycle_case/1`; `adk_context_cache_test`; `erlang_adk_startup_test:supervised_dev_listener_is_authenticated/0` | Requires the application-owned F60 module. The fence deliberately creates new local services because F52/F53 stopped theirs, adds private Runner cache configuration, then seeds data/session only after startup. Production services should be supervised by the owning application. Configuration precedes listener startup; handles never enter HTTP diagnostics. |
-| F62 | Checked CLI agent JSON | JSON | Literal deterministic | `adk_cli_test:checked_repository_examples_case/0`, `checked_config_validation_case/0`, `config_rejects_embedded_secret_case/0` validate the checked-in `examples/agent.json`; the release gate builds the same file into the CLI workflow. | Model execution needs F03; local schema and secret validation do not. `examples/eval.json` supplies the companion evaluation dataset. |
-| F63 | Build the `adk` CLI and run local commands | Bash | Deterministic equivalent; Billable REST | `adk_cli_test:checked_repository_examples_case/0`, `doctor_redacts_environment_case/0`, `checked_config_validation_case/0`, `deterministic_run_case/0`, `deterministic_console_case/0`, `deterministic_evaluation_case/0`, `versioned_evaluation_case/0`; `./rebar3 escriptize` in the release gate | `examples/agent.json` and `examples/eval.json` are checked in. Gemini REST-backed `run`, `console`, and legacy `evaluate` need F03; `adk eval run` has its own v2 inputs and CI exit contract in F86. |
-| F64 | Start the blocking developer server | Bash | Deterministic equivalent; Dedicated fixture | `adk_cli_test:successful_developer_commands_case/0`; `erlang_adk_startup_test:supervised_dev_listener_is_authenticated/0`; packaged-escript loopback smoke test | Requires F58 and a free loopback port. The literal command uses the Gemini agent in F62; the fixture substitutes a deterministic provider. Leave this process running for the agent/run/session subset of F65. |
-| F65 | Inspect runs, sessions, context/lifecycle, artifacts, memory, observability, and Live through a developer server | Bash | Deterministic equivalent; Conceptual continuation | `adk_cli_test:successful_developer_commands_case/0`, `developer_connection_failure_is_structured_case/0`; `adk_dev_http_test`; `adk_dev_v05_http_test:diagnostics_and_context_case/1`, `context_lifecycle_case/1`, `artifact_case/1`, `memory_case/1`, `cli_case/1`; `adk_dev_v07_http_test:observability_case/1`, `live_discovery_case/1`, `live_text_case/1`, `live_sse_case/1`, `cli_v07_case/1` | Live commands require F59's exact principal and a separately started server-owned Live session; plain `adk serve` supplies neither. Live SSE is future-only; observability is metadata-only. A refused connection returns bounded `developer_api_unavailable` JSON. Resource commands still require F59-F61. |
-| F66 | Confirmed artifact deletion, scoped memory erasure, and cache-scope invalidation | Bash | Deterministic equivalent; Conceptual continuation | `adk_dev_v05_http_test:artifact_case/1`, `memory_case/1`, `context_lifecycle_case/1`, `cli_case/1`; `adk_context_cache_test` | Target the resource/cache-enabled F59-F61 VM, not plain F64. Tests reject non-exact confirmations and omit content/metadata/handles. The session anchors cache authorization/confirmation, while invalidation deliberately removes the exact configured provider/app/user/model/policy scope across sessions, prefixes, and TTLs. |
-| F67 | OIDC provider and inbound JWT access-token policy | Erlang | Adapter-dependent; Dedicated fixture | `adk_oidc_security_test`; `erlang_adk_startup_test:invalid_oidc_clock_skew_fails_startup/0` | `identity.example.com` and `RequestHeaders` are application placeholders. Production discovery/JWKS requires a real HTTPS issuer. Access-token mode binds the resource through `aud` and scopes without confusing OIDC client `azp` with the resource; explicit ID-token mode retains OIDC authorized-party rules. |
-| F68 | Outbound OAuth client credentials and token manager | Erlang | Adapter-dependent; Dedicated fixture | `adk_auth_test`; `adk_auth_bounds_test`; `adk_oidc_security_test`; `adk_auth_rotation_test`; `adk_openapi_production_adapters_test` | Requires environment credentials, a principal from F67, and a configured provider worker. Offline fixtures prove immutable profiles, RFC 8707 forwarding, private bounded storage/cache/admission, CAS rotation, invalidation, deadlines, size limits, and secret-free status/errors. |
-| F69 | Configure the supervised authorization-code profile loader | Erlang | Adapter-dependent; Dedicated fixture | `adk_authorization_flow_test`; `erlang_adk_startup_test` | `my_auth_profiles` is trusted application code. The child specification retains only its module/function reference, never client secrets or raw profiles. |
-| F70 | Begin an S256 authorization-code flow | Erlang | Conceptual continuation; Dedicated fixture | `adk_authorization_flow_test`; `adk_suspension_test` | `Principal` is the issuer-bound identity from F67. The manager owns the bounded state lifecycle/replay claim, nonce, verifier, redirect, resource, scopes, expiry, and pending opaque credential reference; state itself is intentionally carried by the authorization redirect and is not confidential. |
-| F71 | Complete and atomically claim an authorization-code flow | Erlang | Conceptual continuation; Dedicated fixture | `adk_authorization_flow_test`; `adk_authorization_flow_fake_adapter`; `adk_suspension_test` | `State`, `FlowRef`, and the bounded callback code come from F70 and the exact HTTPS callback. Tests cover one winner under callback races, replay/mix-up/expiry/cancel rejection, internal exchange, subject binding, and cleanup. |
-| F72 | Configure and start the checked Phoenix companion with OIDC | Bash | Adapter-dependent; Dedicated fixture | The checked `examples/phoenix_adk_ui` project is compiled and tested by its locked Mix gate; Erlang gateway behavior is covered by `adk_web_gateway_test`; `auth_controller_test.exs`, `provider_call_test.exs`, `login_flow_store_test.exs`, and `session_store_test.exs` cover the bounded browser/OIDC boundary with deterministic providers. | Requires an application-owned OIDC issuer/client whose exact callback, audience, signing algorithms, and scopes match the server configuration. A public client omits its secret but still uses S256 PKCE. F03 is required only when executing the Gemini REST agent after login. Use F90 instead when no local identity provider is available. |
-| F73 | Phoenix format, compile, test, assets, release, and dependency audit | Bash | Repository deterministic | On v0.7, format, warnings-as-errors compilation, all 101 ExUnit tests, all 31 dependency-free browser-audio tests, production assets, and production release assembly pass. The packaged release returns HTTP 200 from loopback `/health` in trusted-proxy and certificate-verified direct-TLS modes, then stops cleanly. The conventional favicon redirect and digested favicon/robots targets are also served. `mix hex.audit` must always run and retain its status. | The current audit is non-zero only for the two documented Cowlib 2.18.0 advisories; the exception remains visible. |
-| F74 | Start the Phoenix release with direct TLS | Bash | Adapter-dependent | `examples/phoenix_adk_ui/config/runtime.exs`; Phoenix endpoint/auth/controller/LiveView tests; production release construction in F73 | Certificate/key paths, OIDC issuer/client, hostname, and generated `SECRET_KEY_BASE` are deployment secrets/configuration. The trusted-proxy alternative is explicit and must be network-isolated from arbitrary clients. |
-
-## v0.7 Live, plugin, observability, evaluation, and local-UI additions
-
-F79-F90 are stable IDs assigned to fences added in v0.7. Their section names
-identify their position in the README while preserving the historical
-F01-F78 mapping.
-
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F79 | Gemini Live: start, subscribe, send text, receive transcription, and close | Erlang | Deterministic equivalent; Gemini Live | `adk_live_public_api_test`; `adk_live_session_test:setup_gating_authorization_and_input_case/0`, `starter_death_does_not_own_live_session_case/0`; `adk_live_gemini_codec_test`; paid `gemini_live_SUITE:text_audio_transcription/1` | Requires F03 for the paid path. The production transport uses the fixed Google v1beta WebSocket endpoint and explicit `gemini-3.1-flash-live-preview`; the exact binary principal is required for every operation. Subscribe before waiting for `ready`, acknowledge each event, and close the independently supervised session explicitly. The real paid path passes; a separate local CA-controlled TLS WebSocket harness remains open. |
-| F80 | Gemini Live: PCM audio and JPEG/PNG video input | Erlang | Conceptual continuation; Deterministic equivalent; Gemini Live | `adk_live_media_test`; `adk_live_gemini_codec_test:realtime_input_and_vad_legality_test/0`; `adk_live_session_test`; paid `gemini_live_SUITE:audio_input/1`, `image_input/1` | `LiveSession`, `LivePrincipal`, `Pcm16KhzS16le`, and `JpegBytes` come from the surrounding application. Input is PCM s16le mono 16 kHz; output is PCM s16le mono 24 kHz. The current v1beta wire fields are `realtimeInput.audio` and `realtimeInput.video`. |
-| F81 | Gemini Live: declared and allowlisted automatic tool execution | Erlang | Literal deterministic; Gemini Live supplement | Direct warning-as-error compilation of `examples/readme_weather_tool.erl` and `examples/readme_live_weather_executor.erl`; `adk_live_tool_execution_test`; `adk_live_gemini_codec_test`; paid `gemini_live_SUITE:synchronous_tool_round_trip/1` covers the manual correlated-response path | The tool is provider-declared, application-allowlisted, and executed only when `tool_execution.enabled` is explicitly true. Manual correlated response remains the default. Reconnect cancels workers and never replays tool effects. |
-| F82 | Runner plugins: supervised stateful counter instance | Erlang | Literal deterministic; Dedicated fixture | Direct warning-as-error compilation/runtime smoke of `examples/readme_stateful_counter_plugin.erl`; `adk_plugin_stateful_test`; `adk_plugin_builtin_test` | The example instance is stopped explicitly. Actor serialization and deadline/owner fences prevent late state commits. |
-| F83 | Observability: supervised asynchronous OTLP/HTTP JSON delivery | Erlang | Adapter-dependent; Dedicated fixture | `adk_observability_v2_test`; `adk_observability_runner_test`; `adk_otlp_json_test`; `adk_otlp_http_json_exporter_test` | Requires a loopback OTLP collector at the example endpoint. The bus owns retry, batches, and drops; the exporter makes one bounded no-redirect attempt. Restart the application after changing application environment. |
-| F84 | Observability: strict W3C parent/child Trace Context | Erlang | Literal deterministic | `adk_trace_context_test`; `adk_observability_v2_test:operation_span_uses_execution_time_and_parentage_test/0` | No provider, key, or network. Malformed/all-zero context fails closed; semantic attributes remain metadata-only. |
-| F85 | Evaluation v2: stable JSON report and baseline comparison | Erlang | Conceptual continuation; Literal deterministic | `adk_eval_v2_test:baseline_and_stable_reports_test/0`; `adk_eval_dev_view_test` | `EvalResult` comes from F49 and `BaselineResult` is a prior schema-v2 result. Baseline policy has explicit pass-drop and metric tolerances. |
-| F86 | Evaluation v2: non-interactive `adk eval run` | Bash | Deterministic equivalent; Adapter-dependent | `adk_cli_test:versioned_evaluation_case/0`; `adk_eval_criteria_test`; `adk_eval_v2_test` | Agent/eval/criteria JSON paths are deployment inputs. Omitted criteria means exact-response; exit 0 passes, 2 is a completed evaluation failure, and 1 is configuration/runtime failure. |
-| F88 | Evaluation v2: explicit bounded rubric/LLM judge | Erlang | Deterministic equivalent; Billable REST | `adk_eval_llm_judge_test` covers structured scores, exact metadata, secret pruning/redaction, strict configuration/prompt/output limits, owner/deadline cleanup, fail-closed errors, evaluator accounting, and concurrent provider calls; paid `readme_live_gemini_SUITE:llm_rubric_judge/1` targets `gemini-3.1-flash-lite` | Continues from F49's `EvalAdapter` and `EvalSet`. Requires F03 for the paid path. Provider injection is trusted Erlang configuration only; it is not accepted from datasets/browser/CLI criteria. Rationale is bounded report content and must be protected as evaluated data. |
-| F89 | Gemini Live: owner-bound browser voice bridge | Erlang | Conceptual continuation; Literal deterministic; Gemini Live supplement | `adk_live_voice_protocol_test`; `adk_live_voice_bridge_test`; paid `gemini_live_SUITE:browser_voice_bridge/1` | `LiveSession` and `LivePrincipal` continue from F79, and the session must already be active. The literal stream-end frame assumes automatic activity detection. Tests cover exact binary framing, monotonic input, synchronous backpressure, exact event ACK credit, exclusive per-session leases, reconnect fencing, ambiguous outcomes, owner death, and explicit stop. |
-| F90 | Start the Phoenix companion with loopback-only local authentication | Bash | Repository deterministic; Adapter-dependent | The checked Phoenix Mix gate covers the application and assets; `local_dev_test.exs` and `local_auth_controller_test.exs` cover the fixed server-owned identity, CSRF-protected POST, session rotation, and fail-closed provider behavior. | `ADK_UI_LOCAL_AUTH=true` is accepted only in `MIX_ENV=dev`, binds exact IPv4 loopback, and does not read `OIDC_*`. Production rejects the flag. Dependency setup and a free loopback port are required; F03 is required only when executing the Gemini agent after local login. |
-
-## Verification commands
-
-| ID | README fence | Language | Classification | Exact validation | Prerequisites and continuation notes |
-| --- | --- | --- | --- | --- | --- |
-| F75 | Complete deterministic Erlang release and packaging gates | Bash | Literal deterministic | `./rebar3 do clean, compile, eunit, ct, dialyzer`; `./scripts/coverage.sh`; Xref; `./rebar3 escriptize`; `adk doctor`; checked agent-config validation; warning-free ExDoc; `./rebar3 hex build`; and `scripts/verify_hex_package.sh`. F63 covers the CLI-specific assertions. | The final 2026-07-16 v0.7 gate passes 1,176 EUnit tests, six deterministic Common Test cases, 73.88% aggregate Erlang line coverage against the enforced 73% floor, warning-free Dialyzer over 210 project files, Xref, escript packaging, doctor, checked config validation, docs generation, and an inspected clean-compiling Hex archive. No provider flag is required. |
-| F76 | Focused README and 1,000-run stress gates | Bash | Literal deterministic | `readme_examples_test`; `readme_workflow_examples_test`; the focused v0.7 module set below; `adk_concurrency_stress_SUITE`; `adk_v05_stress_SUITE` | Current documentation checks pass 29 README tests, four workflow tests, warning-as-error compilation/runtime smoke for all three new example modules, 193 focused v0.7 tests, and both 1,000-run stress suites. No provider key is required. |
-| F77 | Opt-in billable Gemini REST suite | Bash | Billable REST | `readme_live_gemini_SUITE`, including `context_cache/1`, `artifact_and_memory_tools/1`, and `llm_rubric_judge/1` | Requires F03 and `ERLANG_ADK_GEMINI_REST=1` in the same shell, network access, quota, and billable API permission. Despite its historical filename, this is GenerateContent REST with `gemini-3.1-flash-lite`, not Gemini Live. The final v0.7 run passes 15/17 with no skips; Search and cache creation fail on explicit HTTP 429 after one retry. `ERLANG_ADK_LIVE_GEMINI=1` remains a compatibility alias. |
-| F78 | Billable Gemini REST suite without request pacing | Bash | Billable REST | `readme_live_gemini_SUITE`; pacing is parsed by `request_interval_ms/0` | `ERLANG_ADK_GEMINI_REST_INTERVAL_MS=0` disables pacing. The historical `ERLANG_ADK_LIVE_GEMINI_INTERVAL_MS` alias remains accepted. Keep the default interval on constrained projects. |
-| F87 | Opt-in paid Gemini Live WebSocket suite | Bash | Gemini Live | `gemini_live_SUITE`: text/audio output plus transcription, PCM input, PNG image input, synchronous tool round trip, and owner-bound browser voice framing/ACK | Requires F03 and `ERLANG_ADK_GEMINI_LIVE=1` in the same shell, network access, quota, and billable API permission. The complete five-case suite passed against `gemini-3.1-flash-live-preview` on 2026-07-15; a future provider failure must be reported rather than converted into a skip/pass. |
-
-## Cross-cutting behavior claims
-
-Some material README claims span several fences. These tests keep those claims
-auditable without pretending that one shell snippet proves a concurrency,
-security, or restart invariant.
-
-| Behavior claim | Exact validation |
-| --- | --- |
-| Gemini Live is a distinct, server-owned runtime pinned to the current v1beta WebSocket endpoint and `gemini-3.1-flash-live-preview`; it accepts text, PCM audio, and JPEG/PNG through current `realtimeInput` fields, emits 24 kHz PCM audio/transcription, requires exact principals and bounded credit, and never replays ingress, output, or tool effects across reconnect | `adk_live_public_api_test`; `adk_live_session_test`; `adk_live_media_test`; `adk_live_gemini_codec_test`; `adk_live_gun_transport_test`; `adk_live_tool_execution_test`; `gemini_live_SUITE` |
-| Runner-global plugins distinguish amend-and-continue from early return, retain `{replace, Value}` only as an early-return compatibility alias, route phase-specific failures, and support supervised stateful actors plus bounded opt-in built-ins | `adk_plugin_pipeline_test`; `adk_plugin_runner_integration_test`; `adk_plugin_builtin_test`; `adk_plugin_stateful_test` |
-| Operation observability uses actual model/tool/Live boundaries, strict W3C context, the pinned metadata-only GenAI mapping, bounded-cardinality metrics, and synchronous or supervised bounded-best-effort asynchronous delivery; OTLP/HTTP JSON performs one bounded, no-redirect attempt while the bus owns delayed retry/drop accounting | `adk_observability_v2_test`; `adk_observability_runner_test`; `adk_live_observability_test`; `adk_trace_context_test`; `adk_otlp_json_test`; `adk_otlp_http_json_exporter_test` |
-| Evaluation v2 validates full-case response/trajectory criteria, repeated samples and thresholds, creates a fresh agent/Runner/guardian per case/sample, renders stable JSON/Markdown, and compares explicit baseline tolerances; `adk eval run` reports pass/fail/error with exits 0/2/1 | `adk_eval_set_test`; `adk_eval_criteria_test`; `adk_eval_v2_test`; `adk_eval_dev_view_test`; `adk_cli_test:versioned_evaluation_case/0` |
-| Developer and Phoenix Live surfaces authorize exact scopes/principal on every operation, discover only server-owned sessions, attach future-only subscriptions, omit media/signatures/content, and expose only bounded observability/evaluation projections from server configuration | `adk_dev_v07_http_test`; `adk_cli_test`; `examples/phoenix_adk_ui/test/erlang_adk_ui/live_gateway/local_test.exs`; `live_projection_test.exs`; `live_session_live_test.exs` |
-| Direct turns retain a stateful FIFO while fresh invocations serialize only within an exact app/user/session lane; different ready lanes are admitted fairly up to the configured bound; stop, caller death, timeout, and worker crash reap work | `adk_agent_mailbox_test`; `adk_agent_behavior_test`; `adk_concurrency_stress_SUITE` |
-| Agent trees have strict model-visible names, one owner per child, tree-wide uniqueness, cycle/node/depth/walk bounds, and a private delegation path through configured or dynamically resolved local module tools; delegated calls use fresh history, caller-scoped state service, and allowlisted child scope | `adk_agent_tree_test`; `adk_sub_agents_test`; `adk_agent_mailbox_test`; `adk_agent_runtime_spec_test:invocation_output_key_uses_caller_session_scope/0`; `adk_global_instruction_test` |
-| Agent supervisor reports and runtime status do not expose explicit provider credentials | `adk_agent_mailbox_test:supervisor_and_status_never_expose_agent_secret/0`; `adk_auth_test`; `adk_oidc_security_test` |
-| Invocation and workflow dynamic child specifications contain only opaque launch references; one-shot handoff, diagnostics, failures, checkpoints, and persisted terminal records do not expose seeded request/state/ledger secrets | `adk_invocation_security_test`; `adk_workflow_failure_security_test` |
-| Compiled immutable tool catalogs reject malformed/duplicate schemas with source diagnostics, validate complete model calls and arguments before resolution side effects, fail closed on dynamic removal, and require replacement rather than live mutation after refresh; Gemini keeps only a positive legacy subset in `parameters` and uses `parametersJsonSchema` for `oneOf`, `additionalProperties`, type unions, nested or top-level boolean schemas, and unknown keywords | `adk_toolset_test`; `adk_tool_call_test`; `adk_runner_tools_test`; `adk_code_toolset_test`; `adk_llm_gemini_test:test_json_schema_tool_payload/1` |
-| Bounded supervised tasks and serial/parallel tool execution | `adk_task_test`; `adk_runner_tools_test`; `adk_toolset_test`; `adk_code_toolset_test` |
-| Generic Runner/stable-run confirmation is evaluated after schema/policy and before lifecycle callbacks/execution, acts as a parallel barrier, preserves invalid continuations, freshly re-resolves on approval, executes once, and rejects without side effects; resolved local modules cannot weaken it, restoration failures are surfaced, developer UI payloads are pause-type aware, and non-Runner `prompt`/fresh `invoke`/delegation/AgentTool plus typed-workflow calls fail closed | `adk_tool_confirmation_test`; `adk_direct_confirmation_test`; `adk_runner_continuation_restore_test`; `adk_workflow_graph_test:confirmation_required_workflow_tool_fails_closed/0`; `adk_dev_http_test:ui_uses_typed_confirmation_payload_case/1`; `adk_toolset_test:resolved_confirmation_metadata_is_internal_and_validated/0` |
-| Sub-agent replacement is resolved by stable registered name | `adk_sub_agents_test:test_restarted_sub_agent_is_resolved_by_name/0` |
-| Event graph agent/function/tool helpers include instructions and callback lifecycle | `adk_graph_node_test` |
-| Declared local tools receive only owner/scope/deadline-bound state, artifact, and memory capabilities; effects are drained into correlated event metadata; remote tools receive no local handle | `adk_context_capability_test`; `adk_context_runner_test`; `adk_toolset_test`; `adk_context_capability_tool` fixture |
-| Artifact scopes, immutable versions, scope-provenance name pages, pagination, quotas, deadline fencing, filesystem publication/repair, multi-instance-safe scope/name/version lifetime admission before scan exhaustion, exact-scope sharded overlap with same-scope ordering, killed-caller cold-route cleanup, ephemeral model attachment, and metadata-only effects remain bounded and isolated | `adk_artifact_conformance_test`; `adk_artifact_ets_test`; `adk_artifact_fs_test:lifetime_version_capacity_fails_before_scan_exhaustion_test/0`, `lifetime_scope_and_name_capacity_preserve_bounded_listing_test/0` and the full module; `adk_scope_sharded_test:killed_cold_route_caller_releases_admission_test/0` and the full module; `adk_context_capability_test`; `adk_context_runner_test:artifact_attachment_is_ephemeral_and_effect_is_durable/0`; targeted REST gate `readme_live_gemini_SUITE:artifact_and_memory_tools/1` passed on 2026-07-15 |
-| Memory v2 requires exact app/user authority, deterministic idempotent ingestion, bounded preload and model-selected retrieval, durable local Mnesia, exact-user sharded overlap with same-scope ordering and killed-caller cold-route cleanup, scoped erase, and fail-closed durable-outbox admission with bounded resolution plus pre-mutation ownership renewal/revalidation; delivery is lease-owned idempotent at-least-once, not adapter-generation fenced | `adk_memory_conformance_test`; `adk_memory_v2_ets_test`; `adk_memory_mnesia_test`; `adk_scope_sharded_test:killed_cold_route_caller_releases_admission_test/0` and the full module; `adk_memory_outbox_test:processor_bounds_and_cancels_resolver/1`, `ownership_loss_prevents_adapter_mutation/1` and the full module; `adk_context_runner_test:memory_v2_preload_is_exactly_scoped/0`, `model_selected_memory_load_is_exactly_scoped/0`; targeted REST gate `readme_live_gemini_SUITE:artifact_and_memory_tools/1` passed on 2026-07-15 |
-| Context filtering preserves complete exchanges; canonicalization and secret pruning are mandatory; event and complete-envelope byte/token budgets fail before provider I/O; compression and automatic compaction are owner/deadline bounded and commit only an expected session prefix | `adk_context_policy_test`; `adk_context_envelope_test`; `adk_context_compaction_test`; `adk_context_runner_test`; `adk_runner_safety_test`; `adk_session_service_test`; `erlang_adk_session_mnesia_test`; `readme_examples_test:agent_contracts_and_context_policy/0` |
-| Provider-prefix caching is not response caching: keys include app/user/model/policy/prefix/TTL, misses are single-flight, leases/resource names stay private, every waiter deadline is rechecked before installation, an all-expired result is deleted as an orphan, Gemini sends `cachedContent` plus only final content on hit, and bypass sends the original request | `adk_context_cache_test:queued_provider_result_cannot_beat_caller_deadline/0` and the full module; `adk_context_cache_gemini_test`; `adk_llm_gemini_test`; REST `readme_live_gemini_SUITE:context_cache/1` failed with HTTP 429 after one bounded retry on 2026-07-15 and is not counted as passed. |
-| ETS/Mnesia scoped state, concurrent create/update, and independent-session locking | `adk_state_scoping_test`; `adk_session_service_test`; `erlang_adk_session_mnesia_test` |
-| Public callback/plugin/tool/provider/workflow failures are bounded structural values and seeded secrets do not enter callbacks, model responses, logs, status, checkpoints, task outcomes, or durable failure records | `adk_callbacks_isolation_test`; `adk_llm_test`; `adk_plugin_pipeline_test`; `adk_auth_test`; `adk_agent_mailbox_test`; `adk_task_test`; `adk_failure_security_test`; `adk_workflow_failure_security_test` |
-| Stable run credit delivery permits one unacknowledged message and reports a post-subscription buffer overrun | `adk_run_test:credit_subscriber_is_bounded_and_detects_gap_case/0`; `adk_run_test:credit_subscriber_runtime_buffer_overrun_case/0` |
-| Developer SSE closes at event, encoded-byte, and duration bounds without cancelling the retained run | `adk_dev_http_test:sse_replay_case/1`; `adk_dev_http_test:sse_byte_limit_closes_without_cancelling_case/1`; `adk_dev_http_test:sse_duration_limit_closes_without_cancelling_case/1`; `adk_dev_http_test:sse_detach_case/1` |
-| Developer startup is authenticated, loopback-bound, bounded, and keeps only the bearer-token digest in route state; exact-scope resource resolution and context lifecycle expose only whitelisted metadata/counts without handles, artifact bytes, private metadata, events, summaries, policies, cache leases/resources, session content, or state; artifact name pages, artifact versions, and memory hits with a mismatched embedded scope fail closed; destructive cache invalidation requires the exact current scope fingerprint | `erlang_adk_startup_test:supervised_dev_listener_is_authenticated/0`; `adk_dev_http_test:auth_case/1`, `sse_config_validation_case/0`; `adk_dev_v05_http_test:context_lifecycle_case/1`, `resource_scope_mismatch_fails_closed/1`, `cli_case/1`; `adk_context_cache_test` |
-| Durable workflow recovery and Mnesia HITL recovery preserve committed boundaries and continuation correlation | `adk_durable_workflow_test`; `adk_hitl_mnesia_restart_test`; `readme_workflow_examples_test:graph_fork_join_and_pause_resume/0` |
-| Workflow output continues through successor input, explicit stop and legacy complete terminate, fork/parallel outputs are deterministic maps, loop bounds complete normally, and nested child resume avoids replay in sequential/graph/fork paths | `adk_workflow_test`; `adk_workflow_graph_test`; `readme_workflow_examples_test` |
-| Typed workflow agent dispatch resolves the current supervised process by registered name and fails closed if its runtime canonical identity does not match the compiled name | `adk_workflow_graph_test:workflow_agent_registry_alias_mismatch_fails_closed/0` |
-| Durable lease expiry is a write fence, a live local PID does not extend it, concurrent takeover has one winner, and the old token is stale after claim/restart | `adk_durable_workflow_test:expired_owner_cannot_write_without_takeover/1`, `expired_live_local_owner_is_claimable/1`, `concurrent_expiry_claim_has_single_winner/1`, `ledger_restart_preserves_expiry_fence/1` |
-
-## Commands
-
-The complete deterministic gate is:
+The complete deterministic command is authoritative for Erlang behavior:
 
 ```bash
 ./rebar3 do clean, compile, eunit, ct, dialyzer
+./scripts/coverage.sh
+./rebar3 xref
 ```
 
-The packaging gate is:
-
-```bash
-./rebar3 escriptize
-_build/default/bin/adk doctor
-_build/default/bin/adk config validate examples/agent.json
-```
-
-The focused README and concurrency gates are:
+The focused README commands are useful diagnostics, but they are not a
+replacement for the complete gate:
 
 ```bash
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
-erlc -Werror -pa _build/default/lib/erlang_adk/ebin -o /tmp \
-  examples/readme_weather_tool.erl \
-  examples/readme_live_weather_executor.erl \
-  examples/readme_stateful_counter_plugin.erl
-./rebar3 eunit \
-  --module=adk_live_media_test,adk_live_gemini_codec_test,adk_live_gun_transport_test,adk_live_public_api_test,adk_live_session_test,adk_live_tool_execution_test,adk_live_observability_test,adk_live_voice_protocol_test,adk_live_voice_bridge_test,adk_plugin_pipeline_test,adk_plugin_runner_integration_test,adk_plugin_builtin_test,adk_plugin_stateful_test,adk_trace_context_test,adk_observability_v2_test,adk_observability_runner_test,adk_otlp_json_test,adk_otlp_http_json_exporter_test,adk_eval_criteria_test,adk_eval_v2_test,adk_eval_llm_judge_test,adk_eval_dev_view_test,adk_dev_v07_http_test,adk_cli_test
-./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
-./rebar3 ct --suite test/integrations/stress/adk_v05_stress_SUITE.erl
 ```
 
-The focused 0.5 resource and data/context gates used for the evidence above
-are:
+## Live provider commands
+
+### Gemini REST
+
+This suite exercises REST generation, streaming, tools, Runner, orchestration,
+multimodal content, data services, evaluation, and related README behavior
+with `gemini-3.1-flash-lite`:
 
 ```bash
-./rebar3 eunit --module=adk_dev_v05_http_test
-./rebar3 eunit --module=adk_scope_sharded_test
-./rebar3 eunit \
-  --module=adk_artifact_conformance_test,adk_artifact_ets_test,adk_artifact_fs_test,adk_scope_sharded_test,adk_memory_conformance_test,adk_memory_v2_ets_test,adk_memory_mnesia_test,adk_memory_outbox_test,adk_context_policy_test,adk_context_envelope_test,adk_context_capability_test,adk_context_compaction_test,adk_context_runner_test,adk_context_cache_test,adk_context_cache_gemini_test
-```
-
-The billable REST provider gate is deliberately opt-in and must run in the
-shell that contains `GEMINI_API_KEY`:
-
-```bash
+export GEMINI_API_KEY="your_google_api_key"
 ERLANG_ADK_GEMINI_REST=1 ./rebar3 ct \
   --suite test/readme/readme_live_gemini_SUITE.erl
 ```
 
-Despite its historical name, that suite uses REST GenerateContent/SSE and
-`gemini-3.1-flash-lite`. The actual paid Gemini Live WebSocket gate is
-independent:
+### Gemini Live
+
+This independent suite exercises the bidirectional WebSocket path with
+`gemini-3.1-flash-live-preview`:
 
 ```bash
+export GEMINI_API_KEY="your_google_api_key"
 ERLANG_ADK_GEMINI_LIVE=1 ./rebar3 ct \
   --suite test/models/gemini/gemini_live_SUITE.erl
 ```
 
-Provider results supplement rather than replace deterministic codec,
-transport, HTTP/SSE, failure, cancellation, correlation, security, and
-persistence fixtures.
+Both commands require network access, quota, and explicit permission to make
+provider calls. A skip, provider rejection, quota error, or network failure is
+not a passing provider result. OpenAI Responses, Anthropic Messages,
+compatible Chat Completions, and OpenAI Realtime have deterministic codec and
+injected-transport coverage, but this repository does not currently provide
+equivalent first-party paid suites for them.
+
+Detailed test selection, coverage rules, provider-result interpretation, and
+release acceptance are documented in [`TESTING.md`](TESTING.md) and
+[`RELEASING.md`](RELEASING.md).

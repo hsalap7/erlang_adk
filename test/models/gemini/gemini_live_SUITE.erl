@@ -178,6 +178,11 @@ with_voice_bridge(Fun) ->
                          Session, ?PRINCIPAL, self(),
                          #{credit => ?CREDIT,
                            max_audio_frame_bytes => 64000}),
+        receive
+            {adk_live_voice_frame, Bridge,
+             <<1, 128, 16000:32/unsigned-big, 1, 1>>} -> ok
+        after 1000 -> ct:fail(gemini_live_voice_input_config_timeout)
+        end,
         try Fun(Session, Bridge)
         after
             _ = erlang_adk:stop_live_voice_bridge(Bridge)

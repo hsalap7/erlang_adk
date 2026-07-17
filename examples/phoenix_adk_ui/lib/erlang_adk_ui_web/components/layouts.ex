@@ -49,7 +49,7 @@ defmodule ErlangAdkUiWeb.Layouts do
       </main>
 
       <footer class="console-footer">
-        <span>Erlang ADK v0.7</span>
+        <span>Erlang ADK v0.8</span>
         <span>Bounded · supervised · server-owned</span>
       </footer>
     </div>

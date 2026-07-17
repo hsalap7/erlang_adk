@@ -90,6 +90,36 @@ defmodule ErlangAdkUi.LiveGateway.LocalTest do
              Local.open_voice(identity, session_id, self(), voice_options())
 
     assert is_pid(bridge)
+
+    assert_receive {:adk_live_voice_frame, ^bridge,
+                    <<1, 128, 16_000::unsigned-big-integer-size(32), 1, 1>>}
+
+    assert :ok = Local.close_voice(identity, voice_ref)
+  end
+
+  test "OpenAI session status selects and signals trusted 24 kHz browser input" do
+    {session_id, session, transport} = start_openai_live_session()
+    identity = live_identity()
+
+    on_exit(fn ->
+      _ = :erlang_adk.close_live_session(session, identity.principal, :test_complete)
+    end)
+
+    :ok =
+      ErlangAdkUi.TestLiveTransport.inject(transport, %{"type" => "session.updated"})
+
+    assert eventually(fn -> active_session?(identity, session_id, "automatic", 24_000) end)
+
+    assert {:ok,
+            %{
+              voice_ref: voice_ref,
+              bridge: bridge,
+              input_format: %{sample_rate: 24_000, channels: 1, format: :pcm_s16le}
+            }} = Local.open_voice(identity, session_id, self(), voice_options())
+
+    assert_receive {:adk_live_voice_frame, ^bridge,
+                    <<1, 128, 24_000::unsigned-big-integer-size(32), 1, 1>>}
+
     assert :ok = Local.close_voice(identity, voice_ref)
   end
 
@@ -132,6 +162,30 @@ defmodule ErlangAdkUi.LiveGateway.LocalTest do
     {session_id, session, transport}
   end
 
+  defp start_openai_live_session do
+    session_id = "phoenix-openai-voice-#{System.unique_integer([:positive, :monotonic])}"
+    identity = live_identity()
+
+    config = %{
+      provider: :adk_live_openai,
+      provider_config: %{
+        automatic_activity_detection: true,
+        model: "gpt-realtime-test",
+        response_modalities: [:audio]
+      },
+      transport: ErlangAdkUi.TestLiveTransport,
+      transport_opts: %{test_pid: self()}
+    }
+
+    assert {:ok, session} =
+             :erlang_adk.start_live_session(session_id, identity.principal, config)
+
+    assert_receive {:test_live_transport, :opened, transport}
+    assert_receive {:test_live_transport, :sent, ^transport, setup_frame}
+    assert %{"type" => "session.update"} = Jason.decode!(setup_frame)
+    {session_id, session, transport}
+  end
+
   defp live_identity do
     %{
       principal: "principal",
@@ -146,12 +200,12 @@ defmodule ErlangAdkUi.LiveGateway.LocalTest do
     }
   end
 
-  defp active_session?(identity, session_id, expected_mode) do
+  defp active_session?(identity, session_id, expected_mode, expected_rate \\ 16_000) do
     case Local.discover(identity) do
       {:ok, sessions} ->
         Enum.any?(sessions, fn status ->
           status.id == session_id and status.state == "active" and
-            status.voice_mode == expected_mode
+            status.voice_mode == expected_mode and status.input_sample_rate == expected_rate
         end)
 
       _error ->
