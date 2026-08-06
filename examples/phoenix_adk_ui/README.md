@@ -33,6 +33,7 @@ mix assets.test
 mix test
 mix precommit
 mix hex.audit
+elixir ../../scripts/verify_phoenix_hex_audit.exs
 ```
 
 `mix assets.test` runs dependency-free resampler and browser-hook tests.
@@ -48,6 +49,11 @@ release boots in both test-only trusted-proxy and direct-TLS configurations,
 serves `GET /health` with HTTP 200 on loopback (with the repository test CA for
 TLS), and stops cleanly. `mix hex.audit` remains non-zero only for the explicit
 Cowlib exception documented below.
+
+The v0.9.0 gate repeats those results with the refreshed security locks: 103
+ExUnit tests and 40 browser/audio tests pass, production assets and release
+assembly complete, and both trusted-proxy and verified direct-TLS health smokes
+pass.
 
 Phoenix LiveView is temporarily pinned to the official upstream fix commit
 `86165533e311469a1b62093fd182d9d874de8106` for CVE-2026-58228. Replace that Git
@@ -398,17 +404,20 @@ loader. Live media remains ephemeral; the browser view is not durable storage.
 ADK Live resumption does not imply replay of unacknowledged media, text, or tool
 responses.
 
-The locked dependency tree currently resolves Cowlib 2.18.0. `mix hex.audit`
-reports [EEF-CVE-2026-43969](https://cna.erlef.org/osv/EEF-CVE-2026-43969.json)
+The locked dependency tree resolves Bandit 1.12.4, Cowboy 2.18.0, Cowlib
+2.19.0, and Gun 2.4.1. Those versions remove EEF-CVE-2026-65623,
+EEF-CVE-2026-65624, and EEF-CVE-2026-59248 from `mix hex.audit`. The remaining
+output contains three package findings for two unresolved advisories:
+[EEF-CVE-2026-43969](https://cna.erlef.org/osv/EEF-CVE-2026-43969.json)
 (also GHSA-g2wm-735q-3f56) and
-[EEF-CVE-2026-43966](https://cna.erlef.org/osv/EEF-CVE-2026-43966.json). The
-companion does not configure Gun's cookie store, and the locked Cowboy 2.17.0
-and Gun 2.4.1 enable their invalid-header rejection defaults, but vulnerable
-Cowlib routines remain present. Treat a non-zero audit as a visible release
+[EEF-CVE-2026-43966](https://cna.erlef.org/osv/EEF-CVE-2026-43966.json), which
+Gun repeats as GHSA-w4f7-4cxr-rv3c. The companion does not configure Gun's
+cookie store, and locked Cowboy 2.18.0 and Gun 2.4.1 contain the
+EEF-documented invalid-header rejection protections, but vulnerable Cowlib
+routines remain present. Treat the non-zero audit as a visible release
 exception, track an official fixed Cowlib release, and rerun the full suite
-before upgrading; do not silently waive the advisories. As of 2026-07-15,
-[2.18.0 is the latest official Cowlib release](https://hex.pm/packages/cowlib)
-and both EEF advisory ranges are still open. The available
+before upgrading; do not silently waive the advisories. As of 2026-08-06 both
+EEF advisory ranges remain open. The available
 [preliminary fork patch](https://github.com/erlef/cowlib/commit/177953dd51540da11090666c1f007214127a1144)
 addresses only EEF-CVE-2026-43969, so it is not a safe replacement for an
 official release that resolves both findings.

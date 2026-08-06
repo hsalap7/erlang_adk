@@ -84,9 +84,9 @@ also passed. The full opt-in billable REST `gemini-3.1-flash-lite` run passed
 14 of 16 cases;
 Google Search grounding and context-cache creation are explicit HTTP 429
 quota/rate-limit failures after one bounded retry, with no skips. Skips and
-provider/quota failures are not counted as passes. The Phoenix dependency
-audit remains non-zero for the two documented Cowlib 2.18.0 advisories and is
-recorded as an explicit exception, not a passing gate.
+provider/quota failures are not counted as passes. At that recorded gate, the
+Phoenix dependency audit was non-zero for the two documented Cowlib 2.18.0
+advisories and was recorded as an explicit exception, not a passing gate.
 
 The final 2026-07-16 v0.7 clean Erlang gate passes 1,176 EUnit tests, six
 deterministic Common Test cases, 73.88% aggregate Erlang line coverage against
@@ -132,8 +132,10 @@ reducers, constrained loopback-compatible endpoints, and native Vertex/ADC.
 The deterministic release validation compiled 242 production and 271 test
 modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common Test cases,
 reported 0 Dialyzer warnings, and reported 0 undefined or deprecated
-call/function findings in the manual Xref checks. No package, coverage, full
-Phoenix, or new paid-provider result is claimed for this release.
+call/function findings from `./rebar3 xref`. The Phoenix companion passed
+103 ExUnit tests, 40 browser/audio tests, production assets/release, and both
+release health smokes. No package, coverage, or new paid-provider result is
+claimed for this release.
 
 ## Build agents
 

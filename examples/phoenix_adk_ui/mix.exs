@@ -45,7 +45,7 @@ defmodule ErlangAdkUi.MixProject do
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.4"},
       {:dns_cluster, "~> 0.2"},
-      {:bandit, "~> 1.10"}
+      {:bandit, "~> 1.12.1"}
     ]
   end
 

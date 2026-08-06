@@ -45,6 +45,9 @@ No changes have been assigned to the next release.
 - Workflow retry attempt numbers survive checkpoints. An ambiguous in-flight
   attempt repeats at the same number after recovery rather than receiving a
   fresh retry budget.
+- Root and Phoenix locks now resolve Cowboy 2.18.0, Cowlib 2.19.0, Ranch 2.2.1,
+  and Gun 2.4.1; the companion additionally resolves Bandit 1.12.4 and
+  Plug.Crypto 2.2.0.
 - The application and OTLP instrumentation versions are now `0.9.0`.
 
 ### Security
@@ -59,16 +62,23 @@ No changes have been assigned to the next release.
   private-address policy remains in force elsewhere.
 - Vertex profiles cannot expose OAuth tokens, ADC handles, arbitrary origins,
   headers, executables, or command arguments to public configuration.
+- Dependency upgrades remove Bandit EEF-CVE-2026-65623, Cowboy
+  EEF-CVE-2026-65624, and Cowlib EEF-CVE-2026-59248 from the Phoenix audit.
+  The exact-exception verifier now matches package/advisory pairs, so a new
+  GHSA-only finding cannot hide behind the two documented unresolved Cowlib
+  advisories.
 
 ### Validation
 
 - Release validation compiled 242 production modules and 271 test modules with
   warnings treated as errors. All 1,495 EUnit tests and all 6 deterministic
   Common Test cases passed.
-- A fresh Dialyzer run completed with 0 warnings, and the manual Xref checks
-  reported 0 undefined or deprecated calls or functions. The passing aggregate
-  includes the focused graph, durability, provider, model, and CLI regression
-  suites.
+- A fresh Dialyzer run completed with 0 warnings, and `./rebar3 xref` reported
+  0 undefined or deprecated calls or functions. The passing aggregate includes
+  the focused graph, durability, provider, model, and CLI regression suites.
+- The Phoenix companion passed 103 ExUnit and 40 browser/audio tests,
+  production asset and release assembly, locked-dependency validation, and
+  trusted-proxy plus verified direct-TLS health smokes.
 
 ### Compatibility and known limitations
 
@@ -78,9 +88,9 @@ No changes have been assigned to the next release.
 - There is no visual graph editor, arbitrary multi-node branch-region
   scheduler, automatic cross-vendor router, blanket 100+ model guarantee, or
   Agent Skills implementation.
-- Coverage, package, full Phoenix, and optional paid-provider results were not
-  recorded for this release; deterministic fixtures do not prove arbitrary
-  Vertex or OpenAI-compatible deployments.
+- Coverage, package, and optional paid-provider results were not recorded for
+  this release; deterministic fixtures do not prove arbitrary Vertex or
+  OpenAI-compatible deployments.
 
 ## [0.8.0] - 2026-07-17
 

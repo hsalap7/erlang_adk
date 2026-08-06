@@ -89,9 +89,10 @@ only the focused modules.
 The released v0.9.0 deterministic validation compiled 242 production and 271
 test modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common Test
 cases, and completed with 0 Dialyzer warnings and 0 undefined or deprecated
-call/function findings in the manual Xref checks. Its coverage, package,
-complete Phoenix, escript/doctor, and paid-provider evidence remains separately
-bounded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md).
+call/function findings from `./rebar3 xref`. Its Phoenix companion passed
+103 ExUnit and 40 browser/audio tests, production assets/release, and both
+health smokes. Coverage, package, escript/doctor, and paid-provider evidence
+remains separately bounded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md).
 
 The seven-module post-audit repair regression set passed 67/67, covering
 contiguous in-flight multi-frame priority ordering, Anthropic's minimum
@@ -138,11 +139,18 @@ trusted-proxy and verified direct-TLS loopback smokes. Each smoke required HTTP
 200 from `/health` and clean shutdown. Follow the exact deployment setup in
 the companion README.
 
-`mix hex.audit` currently returns non-zero for EEF-CVE-2026-43969 and
-EEF-CVE-2026-43966 in Cowlib 2.18.0. This is a known release exception, not a
-pass. The wrapper must return zero only after matching that exact known set;
-any new or missing finding fails so the exception and documentation are
-reviewed. Before approval, the release owner must either:
+The v0.9.0 companion repeated that complete gate successfully with the patched
+dependency locks: 103 ExUnit tests, 40 browser/audio tests, production assets,
+release assembly, and both health smokes passed.
+
+The v0.9.0 dependency refresh moved Bandit to 1.12.4, Cowboy to 2.18.0, and
+Cowlib to 2.19.0, removing EEF-CVE-2026-65623, EEF-CVE-2026-65624, and
+EEF-CVE-2026-59248 from the audit. `mix hex.audit` remains non-zero for
+EEF-CVE-2026-43969 and EEF-CVE-2026-43966 in Cowlib; Gun repeats the latter as
+GHSA-w4f7-4cxr-rv3c. This is a known release exception, not a pass. The wrapper
+must return zero only after matching those exact three package findings; any
+new or missing finding fails so the exception and documentation are reviewed.
+Before approval, the release owner must either:
 
 - use an official dependency release that fixes both advisories and rerun the
   complete gate; or

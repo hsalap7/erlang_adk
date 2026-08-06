@@ -188,9 +188,8 @@ region, server/version/model, date, and failure/skip status.
 The recorded 0.9 deterministic release validation compiled 242 production and
 271 test modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common
 Test cases, and reported 0 Dialyzer warnings and 0 undefined or deprecated
-call/function findings in the manual Xref checks. These direct gates do not
-substitute for the unrecorded coverage, package, complete Phoenix, or
-paid-provider gates.
+call/function findings from `./rebar3 xref`. These direct gates do not
+substitute for the unrecorded coverage, package, or paid-provider gates.
 
 Every current README recipe and sanity command is mapped to its prerequisites
 and validation in
@@ -351,15 +350,23 @@ modes passed. Those counts are historical. On 2026-07-17 the v0.8
 Production assets, release assembly, and both trusted-proxy and direct-TLS
 loopback smokes also passed.
 
-`mix hex.audit` is expected to remain non-zero at the current lock only for
-the two Cowlib 2.18.0 advisories documented in [`SECURITY.md`](../SECURITY.md).
-The wrapper enforces that exact exception and fails for new or stale findings;
-it does not make the underlying audit a pass. The root Rebar3 project has
-no equivalent `rebar3 hex audit` command; do not describe this Mix result as a
-root dependency audit.
+The v0.9.0 companion gate passed with the refreshed security locks: 103 ExUnit
+tests, 40 dependency-free Node browser/audio tests, warnings-as-errors
+compilation, production assets, release assembly, and both trusted-proxy and
+verified direct-TLS health smokes. `mix deps --check-locked` reports every
+dependency current, including the path dependency as Erlang ADK 0.9.0.
 
-For the recorded v0.8 gate, raw `mix hex.audit` was non-zero only for those
-same two advisories, and the exact-exception verifier passed.
+The current locks resolve Bandit 1.12.4, Cowboy 2.18.0, Cowlib 2.19.0, and Gun
+2.4.1. `mix hex.audit` is expected to remain non-zero only for the three package
+findings covering the two unresolved Cowlib advisories documented in
+[`SECURITY.md`](../SECURITY.md): EEF-CVE-2026-43969, EEF-CVE-2026-43966, and
+Gun's GHSA-w4f7-4cxr-rv3c alias for the latter. The wrapper enforces that exact
+package/advisory set and fails for new or stale findings; it does not make the
+underlying audit a pass. The root Rebar3 project has no equivalent `rebar3 hex
+audit` command; do not describe this Mix result as a root dependency audit.
+
+For the recorded v0.8 gate, raw `mix hex.audit` was non-zero only for the two
+Cowlib advisories then present, and the prior exact-exception verifier passed.
 
 The companion's local-auth mode is for interactive development, but its
 authorization, CSRF, session, gateway, socket, LiveView, static-asset, and

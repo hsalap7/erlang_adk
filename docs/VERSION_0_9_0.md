@@ -1,9 +1,8 @@
 # Erlang ADK 0.9.0 release contract
 
 > **Status:** released on 2026-08-06. The deterministic release tests recorded
-> below passed. Coverage, Hex/ExDoc packaging, the complete Phoenix companion,
-> and optional paid-provider runs were not recorded for this release and are
-> not implied by the release status.
+> below passed. Coverage, Hex/ExDoc packaging, and optional paid-provider runs
+> were not recorded for this release and are not implied by the release status.
 
 Version 0.9 focuses on two connected foundations: a durable, inspectable graph
 runtime and a broader but still explicit model-adapter fabric. It preserves the
@@ -161,7 +160,8 @@ Populate this ledger only from one reviewed release revision.
 | Clean compile, EUnit, Common Test, Dialyzer | Passed: 242 production and 271 test modules compiled with `-Werror`; all 1,495 EUnit tests and all 6 Common Test cases passed; a fresh Dialyzer run reported 0 warnings |
 | Deterministic line coverage | Not recorded for this release; the existing floor was not lowered or reinterpreted |
 | Focused graph/workflow/model/provider/CLI tests | Passed within the 1,495-test aggregate run |
-| Xref, escript, doctor, config validation | Manual Xref passed with 0 undefined or deprecated calls or functions; release-contract and CLI tests passed. A complete escript/doctor release execution was not recorded. |
+| Xref, escript, doctor, config validation | `./rebar3 xref` passed with 0 undefined or deprecated calls or functions; release-contract and CLI tests passed. A complete escript/doctor release execution was not recorded. |
 | ExDoc, Hex build, extracted-package compile | Not recorded for this release |
-| Phoenix gates | Formatting, metadata, and documentation links validated; full companion gates were not recorded for this release |
+| Phoenix gates | Passed: locked dependencies; warnings-as-errors compilation; 103 ExUnit and 40 browser/audio tests; production assets and release assembly; trusted-proxy and verified direct-TLS health smokes; exact documented advisory-exception verifier |
+| Phoenix dependency audit | Bandit 1.12.4, Cowboy 2.18.0, and Cowlib 2.19.0 remove EEF-CVE-2026-65623, EEF-CVE-2026-65624, and EEF-CVE-2026-59248. Raw `mix hex.audit` remains non-zero for three package findings covering EEF-CVE-2026-43969 and EEF-CVE-2026-43966; the exact package/advisory verifier passed. |
 | Paid Gemini/Vertex/OpenAI/Anthropic/compatible evidence | No new 0.9 remote-provider result recorded here |

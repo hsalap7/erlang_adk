@@ -76,12 +76,14 @@ mix precommit
 MIX_ENV=prod mix assets.deploy
 MIX_ENV=prod mix release
 mix hex.audit
+elixir ../../scripts/verify_phoenix_hex_audit.exs
 ```
 
 `mix precommit` checks formatting, warnings-as-errors compilation, browser
-assets/tests, and ExUnit. `mix hex.audit` currently exits non-zero for the two
-documented Cowlib 2.18.0 advisories. Preserve and report that result; do not
-disable the audit or call it passing. See [`SECURITY.md`](SECURITY.md).
+assets/tests, and ExUnit. `mix hex.audit` currently exits non-zero for three
+package findings representing the two unresolved Cowlib 2.19.0 advisories.
+Preserve and report that result; do not disable the audit or call it passing.
+See [`SECURITY.md`](SECURITY.md).
 
 For local UI work without an external identity provider, use
 `ADK_UI_LOCAL_AUTH=true` only with `MIX_ENV=dev` and the exact loopback URL

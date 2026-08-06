@@ -29,8 +29,10 @@ for installation and executable examples.
 
 The v0.9.0 deterministic release validation passed all 1,495 EUnit tests and
 all 6 deterministic Common Test cases, with warning-as-error compilation, 0
-Dialyzer warnings, and 0 undefined or deprecated call/function findings in the
-manual Xref checks. The complete evidence boundary is recorded in
+Dialyzer warnings, and 0 undefined or deprecated call/function findings from
+`./rebar3 xref`. The Phoenix companion also passed 103 ExUnit and 40
+browser/audio tests, production assets/release, and both health smokes. The
+complete evidence boundary is recorded in
 [`VERSION_0_9_0.md`](VERSION_0_9_0.md#release-evidence-ledger).
 
 ## Runtime and workflow guides

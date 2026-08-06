@@ -692,10 +692,12 @@ coverage data. Running `rebar3 cover --verbose` alone does not execute tests.
 The v0.9.0 deterministic release validation succeeded: 242 production and 271
 test modules compiled with warnings treated as errors, all 1,495 EUnit tests
 and all 6 deterministic Common Test cases passed, Dialyzer reported 0 warnings,
-and the manual Xref checks reported 0 undefined or deprecated calls or
-functions. See the
+and `./rebar3 xref` reported 0 undefined or deprecated calls or functions. See
+the
 [v0.9.0 release evidence](docs/VERSION_0_9_0.md#release-evidence-ledger) for the
-separately tracked coverage, packaging, Phoenix, and paid-provider gates.
+separately tracked coverage, packaging, Phoenix, and paid-provider gates. The
+Phoenix companion additionally passed 103 ExUnit tests, 40 browser/audio tests,
+production asset/release assembly, and both release health smokes.
 
 ### If README examples changed
 
@@ -728,8 +730,8 @@ The first setup needs network access:
 
 `mix precommit` checks formatting, compilation warnings, browser/audio
 JavaScript, assets, and ExUnit with fake providers. It does not use model
-quota. The audit verifier accepts only the exact documented dependency
-exception and fails if the set changes.
+quota. The audit verifier accepts only the exact three documented package
+findings for the two unresolved Cowlib advisories and fails if the set changes.
 
 ### Documentation, CLI, and package checks
 
