@@ -255,7 +255,7 @@ gun_up_uses_bearer_auth_and_only_documented_headers_test() ->
                            <<"openai-organization">>, Headers)),
             ?assertEqual(<<"proj_test">>,
                          proplists:get_value(<<"openai-project">>, Headers)),
-            ?assertEqual(<<"erlang-adk/0.8">>,
+            ?assertEqual(<<"erlang-adk/0.9">>,
                          proplists:get_value(<<"user-agent">>, Headers)),
             ?assertEqual(5, length(Headers)),
             ?assertEqual(3, maps:get(flow, WsOptions)),

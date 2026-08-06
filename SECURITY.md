@@ -8,9 +8,10 @@ Security reports are welcome and should be handled privately.
 
 | Version | Security support |
 | --- | --- |
-| 0.8.x | Current supported release line |
-| 0.7.x | Previous release line; upgrade to 0.8.x for provider-profile and transport hardening |
-| 0.3.x-0.6.x | Historical development milestones; upgrade to 0.8.x |
+| 0.9.x | Current supported release line |
+| 0.8.x | Previous release line; upgrade to 0.9.x for graph durability and Vertex AI support |
+| 0.7.x | Historical release line; upgrade to 0.9.x |
+| 0.3.x-0.6.x | Historical development milestones; upgrade to 0.9.x |
 | Earlier | Unsupported |
 
 The repository may contain development branches for older milestones. A
@@ -88,8 +89,9 @@ boundary is documented in the
 
 ## Runtime security baseline
 
-Version 0.8 requires Erlang/OTP 27.3.4.14 or a later security-supported OTP
-release. In particular, OTP 27.3.4.14 carries SSL 11.2.12.10, which fixes
+Versions 0.8 and 0.9 require Erlang/OTP 27.3.4.14 or a later
+security-supported OTP release. In particular, OTP 27.3.4.14 carries SSL
+11.2.12.10, which fixes
 [CVE-2026-54891](https://cna.erlef.org/cves/CVE-2026-54891.html), a TLS-client
 plaintext-injection vulnerability affecting earlier OTP 27 patch levels. This
 project is a TLS client for Gemini, OIDC, MCP, OpenAPI, A2A, and OTLP, so the

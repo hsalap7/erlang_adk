@@ -7,6 +7,57 @@ invalid root schemas before a coordinator is started. Runtime route values may
 select a compiled node ID or `end_node`; they cannot introduce Erlang source,
 an MFA, a tool module, or another node.
 
+## Canonical graph foundation
+
+The first-class graph runtime is `adk_workflow` with `kind => graph`.
+`adk_graph` remains the small fluent compatibility builder, but its compiled
+handle now contains a canonical workflow graph. The compatibility API keeps
+its historical `{ok, State}` / `{error, Reason}` result form and in-process
+executor because it has always permitted arbitrary Erlang terms such as pids,
+while durable workflow state is intentionally JSON-safe. A caller can cross
+that migration boundary explicitly with
+`adk_graph:run(Graph, State, #{runtime => workflow})`, or obtain the compiled
+workflow through `adk_graph:to_workflow/1` and use the full `adk_workflow` API.
+
+Compiled workflow graphs can be inspected without exposing executable funs,
+MFA extra arguments, tool arguments, nested workflow options, or provider
+configuration:
+
+```erlang
+{ok, Descriptor} = adk_graph:describe(CompiledGraphOrWorkflow),
+{ok, Dot} = adk_graph:to_dot(CompiledGraphOrWorkflow),
+{ok, Mermaid} = adk_graph:to_mermaid(CompiledGraphOrWorkflow).
+```
+
+The descriptor is an exact JSON-safe value with stable `node_order`, typed
+nodes and edges, public execution policies and schemas, definition identity,
+state reducers, and structural analysis. DOT and Mermaid renderers use
+synthetic node identifiers, escape application-owned labels, and are
+deterministic for the same compiled graph. The same operations are available
+through `erlang_adk:inspect_graph/1` and `erlang_adk:render_graph/2`.
+
+For an already available module exporting a zero-arity workflow/graph factory,
+the packaged CLI provides:
+
+```text
+adk graph validate my_graphs checkout
+adk graph describe my_graphs checkout
+adk graph render my_graphs checkout --format mermaid
+```
+
+Render formats are `mermaid`, `dot`, and `json`. Lookup is restricted to code
+already known to the runtime and does not create arbitrary atoms from command
+input.
+
+Whole-graph validation now requires a fork's `join` target to be a typed
+`join` node. Inspection also reports non-fatal diagnostics for unreachable
+nodes, graphs with no statically visible terminal path, generic strongly
+connected components which rely on the global `max_steps` bound, orphan or
+shared joins, shared fork branches, and join predecessors outside the declared
+fork. These remain warnings because trusted actions can stop directly and
+trusted route callbacks can select any compiled node at runtime, so some
+properties cannot be proved from static edges alone.
+
 ## Node types
 
 - An `action` node is the backwards-compatible `#{id => Id, run => Action}`.
@@ -30,8 +81,8 @@ an MFA, a tool module, or another node.
 - A `loop` node declares `while`, `body`, `done`, and `max_iterations`. The
   iteration count is stored in the public checkpoint.
 - A `fork` node declares ordered `branches`, one `join`, an explicit `merge`
-  policy, and `max_concurrency`. Each branch is a predeclared action-like node
-  whose edge must point directly to that join.
+  policy, a `join_policy`, and `max_concurrency`. Each branch is a predeclared
+  action-like node whose edge must point directly to that join.
 - A `join` node is a no-op barrier by default and may optionally have `run`.
 
 Action-like and join nodes require explicit entries in the graph `edges` map.
@@ -62,14 +113,39 @@ The workflow's final output is the most recently committed output. If no node
 has produced one, final state is the compatibility fallback. Committed output
 is part of the checkpoint and is restored without replay.
 
-Fork branches record versioned output-and-delta entries. After all branches
-commit, deltas merge in declaration order and the join receives a deterministic
-`#{BranchId => Output}` map as its input. The same map becomes the current
-workflow output. `reject_conflicts` and `ordered_last_wins` have the same state
-merge behavior as top-level parallel workflows; a trusted `{custom, Fun}`
-merger is also supported.
+Fork branches record versioned output-and-delta entries. The `join_policy`
+controls when fan-in is ready:
+
+- `all` (the default) waits for every branch;
+- `any` accepts the first committed successful result;
+- `first_success` also accepts the first success but, unlike `any`, tolerates a
+  failed branch while another declared branch can still succeed; and
+- `{quorum, N}` (or the equivalent JSON map) accepts `N` committed successes.
+
+`all`, `any`, and quorum are fail-fast if a started branch fails;
+`first_success` is the only policy that continues past branch failure.
+
+An early-completing policy cancels still-running branches. Results that crossed
+the checkpoint boundary remain committed; an external effect from a cancelled
+uncommitted branch may have happened and can be retried after recovery. The
+join receives a deterministic `#{BranchId => Output}` map containing only the
+committed successful branches used by that completion. The same map becomes
+the current workflow output.
+
+Deltas merge in branch declaration order. `reject_conflicts` and
+`ordered_last_wins` have the same state merge behavior as top-level parallel
+workflows; a trusted `{custom, Fun}` merger is also supported.
 
 ## Checkpoint and replay semantics
+
+New workflow checkpoints use schema version 2 and bind the saved cursor to the
+compiled `definition_fingerprint`. They also preserve execution/sequence
+identity, per-node attempts and status, runnable/waiting work, join
+accumulators, cycle counters, and interruptions. A valid schema-v1 checkpoint
+is accepted for the 0.8-to-0.9 upgrade and is rewritten as v2 on its next
+commit. Supply and maintain `definition_revision` when a workflow containing
+callbacks must resume across code deployments; otherwise that definition is
+marked non-portable.
 
 Fork workers receive the same immutable input state. Results are checkpointed
 as branches finish while visible state remains unchanged. If cancellation or a
@@ -120,10 +196,17 @@ child, completed child nodes are not replayed, and a child that pauses again
 replaces the stored child checkpoint. Its eventual output and state delta then
 propagate through the parent node or fork branch normally.
 
-This nested-pause contract currently covers graph workflow nodes, workflow
-branches inside graph forks, and sequential parent steps. It does not yet make
-a nested child pause checkpoint-resumable inside a top-level parallel branch,
-top-level loop body, or transfer member.
+The same nested-pause contract now covers graph workflow nodes, workflow
+branches inside graph forks, sequential parent steps, top-level parallel
+branches, loop bodies, and transfer members. A parallel sibling cancelled
+before its own result commits remains at least once and may run again.
+
+A graph `tool` node whose module requires confirmation produces a typed
+`tool_confirmation` pause instead of failing with
+`tool_confirmation_requires_runner`. Approval is correlated to its stable
+action ID and rechecks the requirement before executing that exact call;
+rejection, invalid booleans, and action mismatches fail closed. The same
+contract applies to protected tool actions in the other typed workflow kinds.
 
 ## Per-action timeout and retry
 
@@ -144,12 +227,13 @@ failure, cancellation, or global workflow deadline is not retried. Per-attempt
 timeout kills only that attempt; cancellation and the global deadline interrupt
 backoff and reap active workers.
 
-The attempt counter belongs to one live execution of an uncommitted node. It is
-not a durable retry ledger: cancelling or checkpointing and later resuming that
-node starts a fresh retry budget. Applications must not use the retry attempt
-number as an external idempotency identity.
+Checkpoint v2 preserves the attempt ledger. If a crash leaves an attempt marked
+running without a committed result, resume repeats the same one-based attempt
+number and retains the original retry bound. This avoids granting a fresh
+budget, but the action itself remains at least once. Applications must not use
+the retry attempt number alone as an external idempotency identity.
 
-## Root schemas and safety bounds
+## Root and node schemas, state reducers, and safety bounds
 
 An optional root `input_schema` and `output_schema` is compiled once with the
 workflow. A fresh start validates its initial input before any action runs.
@@ -157,6 +241,30 @@ Resume trusts the already validated initial checkpoint instead of validating it
 again. Final output validation uses the most recently committed output, falling
 back to final state only when no output exists. An invalid final output returns
 `output_schema_validation_failed` and leaves a non-complete checkpoint.
+
+Every graph node may also declare `input_schema` and `output_schema`. Schemas
+compile with the workflow. A node input is checked before its callback or tool
+runs; a node output is checked before its delta is committed or routing
+continues. Fork branch outputs are checked against their branch schemas, and
+the fork node's output schema sees the completed `#{BranchId => Output}` map.
+Failures identify the node as `node_input_schema_validation_failed` or
+`node_output_schema_validation_failed` without exposing executable
+configuration.
+
+At the workflow root, `state_reducers` maps binary state keys to one of:
+
+```erlang
+#{<<"latest">> => overwrite,
+  <<"events">> => append,
+  <<"total">> => sum,
+  <<"owner">> => reject_conflict}
+```
+
+`overwrite` is the default for undeclared keys and preserves earlier behavior.
+`append` requires list values, `sum` requires numbers, and `reject_conflict`
+accepts a missing or equal value but fails on a different existing value.
+`reject_conflicts` is accepted as a spelling alias. Reducer failures report
+only the state key and reducer class, not the conflicting values.
 
 `max_steps`, `max_iterations`, `max_concurrency`, per-action timeout/retry, and
 the workflow absolute deadline are independent bounds. Cancellation and

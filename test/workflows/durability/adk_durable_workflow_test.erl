@@ -503,6 +503,8 @@ status(InvocationId, Ledger) ->
 
 assert_second_checkpoint(Record) ->
     Checkpoint = maps:get(checkpoint, Record),
+    ?assertEqual(maps:get(invocation_id, Record),
+                 maps:get(<<"execution_id">>, Checkpoint)),
     Cursor = maps:get(<<"cursor">>, Checkpoint),
     ?assertEqual(2, maps:get(<<"next_index">>, Cursor)),
     ?assertEqual(true,

@@ -160,6 +160,38 @@ After the final audit repairs, the seven-module targeted regression set passed
 `max_tokens >= 1` validation, and synchronous/streaming Gun header and trailer
 limits.
 
+## Focused v0.9 graph, durability, and model gates
+
+Use this focused set when maintaining the released 0.9 line:
+
+```bash
+./rebar3 eunit \
+  --module=adk_workflow_v09_runtime_test,adk_workflow_data_contract_test,adk_workflow_first_success_recovery_test,adk_workflow_join_policy_test,adk_workflow_graph_test,adk_graph_foundation_test
+
+./rebar3 eunit \
+  --module=adk_agent_provider_capability_test,adk_provider_profile_test,adk_provider_registry_live_test,adk_provider_request_options_test,adk_provider_vertex_test,adk_local_model_endpoint_test,adk_google_adc_test,adk_model_http_client_test,adk_llm_vertex_test,adk_cli_test
+```
+
+These tests cover checkpoint-v2 identity and v1 migration, durable attempts,
+lifecycle ordering, nested continuation, typed workflow tool confirmation,
+join policies, node schemas, state reducers, graph inspection/CLI, effective
+provider capabilities, loopback-only local endpoints, and injected-transport
+Vertex/ADC behavior. They are diagnostic; they do not replace the clean EUnit,
+Common Test, Dialyzer, coverage, xref, package, and documentation gates.
+
+The Vertex and local-server cases are deterministic configuration/codec/
+transport-boundary evidence. They are not evidence that a paid Vertex project
+or every Ollama, vLLM, LiteLLM, compatible gateway, or model version accepted a
+request. Record optional remote smokes separately, including exact project,
+region, server/version/model, date, and failure/skip status.
+
+The recorded 0.9 deterministic release validation compiled 242 production and
+271 test modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common
+Test cases, and reported 0 Dialyzer warnings and 0 undefined or deprecated
+call/function findings in the manual Xref checks. These direct gates do not
+substitute for the unrecorded coverage, package, complete Phoenix, or
+paid-provider gates.
+
 Every current README recipe and sanity command is mapped to its prerequisites
 and validation in
 [`README_EXAMPLE_COVERAGE.md`](README_EXAMPLE_COVERAGE.md).
@@ -183,7 +215,7 @@ _build/default/bin/adk config validate examples/agent.json
 ./scripts/verify_hex_package.sh
 ```
 
-For v0.8, `adk doctor` must report application version `0.8.0`, OTP 27, the
+For v0.9, `adk doctor` must report application version `0.9.0`, OTP 27, the
 REST default `gemini-3.1-flash-lite`, required dependencies, and whether a
 Gemini, OpenAI, or Anthropic key is configured without exposing any key. The
 configuration validator must accept configured binary profiles through their
@@ -194,9 +226,13 @@ exports as unused errors. ExDoc must be warning-free. The non-publishing Hex
 build and artifact verifier must prove required contents, excluded
 caches/secrets, and a clean compile from the extracted package.
 
-On 2026-07-17, xref, escript assembly, `adk doctor` reporting 0.8.0, checked
+Historically, on 2026-07-17, xref, escript assembly, `adk doctor` reporting
+0.8.0, checked
 configuration validation, ExDoc, the 0.8.0 Hex build, and compilation from the
 verified extracted package all passed.
+
+No equivalent 0.9 package result was recorded for this release. Run all
+commands above before making a later package-evidence claim.
 
 ## Paid Gemini REST gate
 
@@ -273,10 +309,11 @@ historical and must not be carried forward as v0.8 evidence.
 
 ## OpenAI, Anthropic, and compatible provider evidence
 
-The 0.8 repository currently provides deterministic injected-transport and
+The 0.9 repository currently provides deterministic injected-transport and
 codec coverage for OpenAI Responses, Anthropic Messages, compatible Chat
-Completions, and OpenAI Realtime. It does not currently provide a first-party
-opt-in paid Common Test suite for those providers. Therefore:
+Completions, OpenAI Realtime, and Vertex AI GenerateContent/SSE. It does not
+currently provide a first-party opt-in paid Common Test suite for those
+providers. Therefore:
 
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` being present is not itself a test;
 - deterministic fixture success must be reported as deterministic evidence,

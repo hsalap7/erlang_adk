@@ -20,7 +20,7 @@ graph_workflow_test_() ->
       fun typed_agent_tool_and_nested_workflow_nodes/0,
       fun workflow_agent_invocations_are_fresh_and_receive_context/0,
       fun workflow_agent_registry_alias_mismatch_fails_closed/0,
-      fun confirmation_required_workflow_tool_fails_closed/0,
+      fun confirmation_required_workflow_tool_pauses_and_resumes/0,
       fun conditional_false_workflow_tool_executes/0,
       fun confirmation_evaluation_failure_fails_closed/0,
       fun node_retry_succeeds_and_exposes_attempt_context/0,
@@ -689,7 +689,7 @@ workflow_agent_registry_alias_mismatch_fails_closed() ->
         exit(Agent, kill)
     end.
 
-confirmation_required_workflow_tool_fails_closed() ->
+confirmation_required_workflow_tool_pauses_and_resumes() ->
     enable_confirmation_probes(),
     Id = <<"workflow-static-side-effect">>,
     Compiled = compile_ok(
@@ -704,16 +704,26 @@ confirmation_required_workflow_tool_fails_closed() ->
                                #{<<"id">> => Id}, <<"tool_result">>},
                           retry => #{max_attempts => 3}}]}),
     try
-        {failed,
-         {step_failed, <<"protected-tool">>, Failure}, _Checkpoint} =
+        {paused, Details, Checkpoint} =
             adk_workflow:run(Compiled, #{}),
-        ?assert(adk_failure:is_failure(Failure)),
+        Confirmation = maps:get(<<"reason">>, Details),
+        ?assertEqual(<<"tool_confirmation">>,
+                     maps:get(<<"type">>, Confirmation)),
+        ?assert(adk_tool_confirmation:valid_details(Confirmation)),
+        assert_no_confirmation_execution(Id),
+        {ok, Ref} = adk_workflow:resume(
+                      Compiled, Checkpoint,
+                      #{resume_input => #{<<"approved">> => true},
+                        retention_ms => 100}),
+        {completed, State, _} = adk_workflow:await(Ref, 1000),
         ?assertEqual(
-           tool_confirmation_requires_runner,
-           maps:get(reason,
-                    adk_failure:log_metadata(
-                      adk_workflow_tool, confirmation, Failure))),
-        assert_no_confirmation_execution(Id)
+           #{<<"id">> => Id, <<"kind">> => <<"static">>},
+           maps:get(<<"tool_result">>, State)),
+        receive
+            {confirmation_tool_executed, static, Id, _Pid, _Context} -> ok
+        after 1000 ->
+            error(confirmed_workflow_tool_not_executed)
+        end
     after
         disable_confirmation_probes()
     end.

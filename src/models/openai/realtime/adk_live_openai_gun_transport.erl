@@ -296,7 +296,7 @@ start_upgrade(Connection, ApiKey, State) ->
 
 upgrade_headers(ApiKey, State) ->
     Headers0 = [{<<"authorization">>, <<"Bearer ", ApiKey/binary>>},
-                {<<"user-agent">>, <<"erlang-adk/0.8">>}],
+                {<<"user-agent">>, <<"erlang-adk/0.9">>}],
     Headers1 = optional_header(
                  safety_identifier, <<"openai-safety-identifier">>,
                  State, Headers0),

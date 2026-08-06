@@ -171,7 +171,7 @@ handle_info({gun_up, Connection, http},
                           silence_pings => true},
             StreamRef = gun:ws_upgrade(
                           Connection, Path,
-                          [{<<"user-agent">>, <<"erlang-adk/0.8">>}],
+                          [{<<"user-agent">>, <<"erlang-adk/0.9">>}],
                           WsOptions),
             UpgradeTimer = phase_timer(
                              maps:get(upgrade_timeout_ms, State), upgrading),

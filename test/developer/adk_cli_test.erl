@@ -12,6 +12,7 @@ cli_test_() ->
       fun doctor_redacts_environment_case/0,
       fun doctor_missing_credentials_case/0,
       fun checked_config_validation_case/0,
+      fun graph_tooling_commands_case/0,
       fun rich_gemini_config_translation_case/0,
       fun native_provider_config_validation_case/0,
       fun configured_profile_precedes_builtin_cli_alias_case/0,
@@ -77,6 +78,7 @@ doctor_redacts_environment_case() ->
         ?assertEqual(true, maps:get(openai_api_key_configured, Report)),
         ?assertEqual(true, maps:get(anthropic_api_key_configured, Report)),
         Providers = maps:get(providers, Report),
+        ?assertEqual(available, maps:get(vertex, Providers)),
         ?assertEqual(available, maps:get(openai, Providers)),
         ?assertEqual(available, maps:get(anthropic, Providers)),
         ?assertEqual(available, maps:get(compatible, Providers)),
@@ -160,6 +162,44 @@ checked_config_validation_case() ->
     after
         _ = file:delete(Path)
     end.
+
+graph_tooling_commands_case() ->
+    {ok, Validated} = adk_cli:command(
+                        ["graph", "validate",
+                         "adk_cli_graph_fixture", "graph"]),
+    ?assertEqual(valid, maps:get(status, Validated)),
+    ?assertEqual(<<"cli-graph-fixture">>,
+                 maps:get(workflow_id, Validated)),
+    ?assertEqual(64, byte_size(maps:get(fingerprint, Validated))),
+
+    {ok, Described} = adk_cli:command(
+                        ["graph", "describe",
+                         "adk_cli_graph_fixture", "graph"]),
+    Descriptor = maps:get(graph, Described),
+    ?assertEqual(<<"graph">>, maps:get(<<"kind">>, Descriptor)),
+    ?assertEqual(<<"start">>, maps:get(<<"entry">>, Descriptor)),
+
+    lists:foreach(
+      fun(Format) ->
+          {ok, Rendered} = adk_cli:command(
+                             ["graph", "render",
+                              "adk_cli_graph_fixture", "graph",
+                              "--format", Format]),
+          ?assert(is_binary(maps:get(content, Rendered)))
+      end, ["mermaid", "dot", "json"]),
+    ?assertEqual(
+       {error, unsupported_graph_render_format},
+       adk_cli:command(
+         ["graph", "render", "adk_cli_graph_fixture", "graph",
+          "--format", "svg"])),
+    ?assertEqual(
+       {error, graph_factory_not_graph_workflow},
+       adk_cli:command(
+         ["graph", "validate", "adk_cli_graph_fixture", "not_graph"])),
+    ?assertMatch(
+       {error, {graph_factory_failed, {adk_failure, _}}},
+       adk_cli:command(
+         ["graph", "validate", "adk_cli_graph_fixture", "crash"])).
 
 rich_gemini_config_translation_case() ->
     Path = temp_path("rich-gemini-agent"),

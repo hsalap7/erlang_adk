@@ -3,8 +3,9 @@
 %% This adapter is intentionally narrower than "arbitrary HTTP".  The
 %% operator selects a trusted HTTPS `base_url' (normally through a provider
 %% profile), while the adapter owns the fixed `/chat/completions' path and a
-%% small allow-list of authentication header shapes.  Callers cannot inject
-%% header names, request paths, redirects, or transport authority.
+%% small allow-list of authentication header shapes.  The only HTTP exception
+%% is the profile-materialized, keyless numeric-loopback policy. Callers cannot
+%% inject header names, request paths, redirects, or transport authority.
 -module(adk_llm_compatible).
 
 -behaviour(adk_llm).
@@ -49,6 +50,7 @@ capabilities() ->
       function_calling => true,
       parallel_function_calling => true,
       function_call_ids => true,
+      generation_config => true,
       structured_output => true,
       multimodal => true,
       content_schema_version => adk_content:codec_version(),
@@ -75,7 +77,7 @@ validate_config(Config) when is_map(Config) ->
     case unknown_config_keys(Config) of
         [] ->
             case first_error(
-                   [validate_https_base_url(Config),
+                   [validate_endpoint_policy(Config),
                     validate_auth_scheme(Config),
                     validate_optional_api_key(Config),
                     validate_auth_credential(Config),
@@ -259,6 +261,14 @@ validate_codec_options(Config) ->
         {error, _} = Error -> Error
     end.
 
+validate_endpoint_policy(#{local_endpoint_policy := loopback_keyless} =
+                           Config) ->
+    adk_local_model_endpoint:validate_runtime(Config);
+validate_endpoint_policy(#{local_endpoint_policy := _Policy}) ->
+    {error, invalid_local_model_endpoint_policy};
+validate_endpoint_policy(Config) ->
+    validate_https_base_url(Config).
+
 validate_https_base_url(Config) ->
     case maps:get(base_url, Config, undefined) of
         Base when is_binary(Base), byte_size(Base) > 0 ->
@@ -316,6 +326,7 @@ unknown_config_keys(Config) ->
 
 known_config_keys() ->
     [provider, model, base_url, api_key, auth_scheme,
+     local_endpoint_policy,
      temperature, top_p, max_tokens, max_completion_tokens,
      stop_sequences, parallel_tool_calls, tool_choice,
      response_format, response_mime_type, response_schema,

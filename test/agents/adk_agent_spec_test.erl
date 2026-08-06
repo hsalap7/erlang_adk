@@ -99,6 +99,27 @@ safety_settings_require_provider_capability_test() ->
                      [#{category => dangerous_content,
                         threshold => unsupported}]}})).
 
+rich_capability_values_are_supported_test() ->
+    {ok, Spec} = adk_agent_spec:compile(
+                   #{required_capabilities =>
+                         [function_calling, input_modalities,
+                          context_cache]}),
+    ?assertEqual(
+       ok,
+       adk_agent_spec:check_capabilities(
+         Spec,
+         #{function_calling => synchronous,
+           input_modalities => [text, audio],
+           context_cache => #{explicit => true}})),
+    ?assertEqual(
+       {error, {missing_capabilities,
+                [context_cache, function_calling, input_modalities]}},
+       adk_agent_spec:check_capabilities(
+         Spec,
+         #{function_calling => unsupported,
+           input_modalities => [],
+           context_cache => #{}})).
+
 input_schema_success_and_failure_test() ->
     {ok, Spec} = adk_agent_spec:compile(
                    #{input_schema => object_schema(<<"question">>)}),

@@ -8,7 +8,8 @@ release_application_keeps_feature_modules_test() ->
     FeatureAnchors =
         [erlang_adk,
          adk_agent, adk_agent_spec, adk_runner, adk_run,
-         adk_workflow, adk_planning_runtime, adk_ambient,
+         adk_workflow, adk_graph, adk_planning_runtime, adk_ambient,
+         adk_graph_validate, adk_graph_ir, adk_graph_inspect,
          adk_tool, adk_openapi_toolset, adk_mcp_client,
          adk_artifact_service, adk_memory_service, adk_context,
          adk_auth_provider, adk_oidc_provider_sup,
@@ -18,8 +19,10 @@ release_application_keeps_feature_modules_test() ->
          adk_llm_gemini, adk_live_gemini,
          adk_llm_openai, adk_live_openai,
          adk_llm_anthropic, adk_llm_compatible,
+         adk_llm_vertex, adk_vertex_model_resource,
          adk_provider_profile, adk_provider_registry,
-         adk_provider_credential, adk_model_http_client],
+         adk_provider_credential, adk_google_adc,
+         adk_local_model_endpoint, adk_model_http_client],
     ?assertEqual([], FeatureAnchors -- Modules),
     %% Recursive test discovery must never leak fixtures into the release
     %% application descriptor or Hex package.
@@ -27,6 +30,11 @@ release_application_keeps_feature_modules_test() ->
                 adk_live_fake_transport, readme_examples_test],
     ?assertEqual([], [Module || Module <- TestOnly,
                                lists:member(Module, Modules)]).
+
+release_application_version_is_current_test() ->
+    ok = ensure_application_loaded(),
+    ?assertEqual({ok, "0.9.0"},
+                 application:get_key(erlang_adk, vsn)).
 
 release_application_keeps_runtime_dependencies_test() ->
     ok = ensure_application_loaded(),
@@ -57,7 +65,30 @@ provider_profile_public_surface_test() ->
        {base_url_matches, 2}]),
     assert_exports(
       adk_model_sse_decoder,
-      [{new, 0}, {new, 1}, {feed, 2}, {finish, 1}]).
+      [{new, 0}, {new, 1}, {feed, 2}, {finish, 1}]),
+    assert_exports(
+      adk_google_adc,
+      [{access_token, 1}, {validate_config, 1}]),
+    assert_exports(
+      adk_local_model_endpoint,
+      [{normalize, 1}, {is_endpoint, 1}, {validate_profile, 5},
+       {materialize, 1}, {validate_runtime, 1}]),
+    assert_exports(
+      adk_vertex_model_resource,
+      [{parse, 1}, {generate_path, 1}, {stream_path, 1}]),
+    assert_exports(
+      adk_graph_inspect,
+      [{describe, 1}, {to_dot, 1}, {to_mermaid, 1}]),
+    assert_exports(adk_graph_ir, [{from_compiled, 1}, {from_data, 2}]),
+    assert_exports(adk_graph_validate, [{validate, 1}, {analyze, 1}]).
+
+graph_public_surface_test() ->
+    assert_exports(
+      adk_graph,
+      [{new, 0}, {add_node, 3}, {add_edge, 3},
+       {add_conditional_edge, 3}, {set_entry_point, 2},
+       {compile, 1}, {run, 2}, {run, 3}, {to_workflow, 1},
+       {describe, 1}, {to_dot, 1}, {to_mermaid, 1}]).
 
 extension_behaviour_callbacks_remain_available_test() ->
     assert_callbacks(

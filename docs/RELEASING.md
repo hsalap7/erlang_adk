@@ -2,8 +2,10 @@
 
 This is the maintainer checklist for preparing, approving, tagging, and
 publishing a release. The commands below describe actions to take only after
-their prerequisites and approvals are satisfied. This document does not claim
-that `v0.8.0` has been tagged, pushed, or published.
+their prerequisites and approvals are satisfied. The v0.9.0 release status and
+evidence are recorded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md) and the
+[`CHANGELOG`](../CHANGELOG.md); running this checklist does not publish a later
+release by itself.
 
 ## 1. Establish the release candidate
 
@@ -83,6 +85,13 @@ and warning-as-error compilation of all three example modules. Common Test
 intentionally skipped 22 paid cases in the deterministic command. Do not
 approve a later candidate by copying either release's numbers or by running
 only the focused modules.
+
+The released v0.9.0 deterministic validation compiled 242 production and 271
+test modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common Test
+cases, and completed with 0 Dialyzer warnings and 0 undefined or deprecated
+call/function findings in the manual Xref checks. Its coverage, package,
+complete Phoenix, escript/doctor, and paid-provider evidence remains separately
+bounded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md).
 
 The seven-module post-audit repair regression set passed 67/67, covering
 contiguous in-flight multi-frame priority ordering, Anthropic's minimum
@@ -214,9 +223,9 @@ signed tag where maintainer signing is configured; otherwise use an annotated
 tag and preserve the external approval record:
 
 ```bash
-git tag -s v0.8.0 -m "Erlang ADK 0.8.0"
+git tag -s v0.9.0 -m "Erlang ADK 0.9.0"
 # or, when signing is unavailable:
-git tag -a v0.8.0 -m "Erlang ADK 0.8.0"
+git tag -a v0.9.0 -m "Erlang ADK 0.9.0"
 ```
 
 Verify the tag points to the approved commit, then push the branch/tag through
@@ -224,9 +233,9 @@ the repository's protected release process. Publication is a separate
 credentialed action:
 
 ```bash
-git show --no-patch --decorate v0.8.0
-git push origin version_0.8.0
-git push origin v0.8.0
+git show --no-patch --decorate v0.9.0
+git push origin version_0.9.0
+git push origin v0.9.0
 ./rebar3 hex publish
 ```
 

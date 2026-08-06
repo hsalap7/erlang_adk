@@ -1,7 +1,8 @@
 %% @doc Validation and secret-free projection for operator-owned model profiles.
 %%
 %% A profile binds a public binary identifier to pre-existing adapter modules,
-%% an HTTPS endpoint/preset, model aliases, and a credential source. Callers
+%% an HTTPS endpoint/preset (or the explicit keyless loopback policy), model
+%% aliases, and a credential source. Callers
 %% can select only the identifier and an alias: they cannot choose modules,
 %% endpoint URLs, headers, environment names, concrete model identifiers, or
 %% operator-owned request authority/privacy defaults.
@@ -22,9 +23,10 @@
 -define(MAX_ANTHROPIC_VERSION_BYTES, 256).
 
 -type profile_id() :: binary().
--type endpoint() :: gemini | openai | anthropic | local |
+-type endpoint() :: gemini | openai | anthropic | vertex | local |
                     #{scheme := https, host := binary(),
-                      port := pos_integer(), base_path := binary()}.
+                      port := pos_integer(), base_path := binary()} |
+                    adk_local_model_endpoint:endpoint().
 -type normalized_profile() :: map().
 -export_type([profile_id/0, endpoint/0, normalized_profile/0]).
 
@@ -112,9 +114,11 @@ normalize_profile_fields(ProfileId, Profile) ->
         {{ok, CheckedRequest}, {ok, CheckedLive},
          {ok, Endpoint}, {ok, Models}, {ok, Credential},
          {ok, RequestOptions}, {ok, Capabilities}} ->
-            case request_endpoint_allowed(CheckedRequest, Endpoint) of
-                false -> {error, provider_request_endpoint_mismatch};
-                true ->
+            case validate_profile_contract(
+                   CheckedRequest, CheckedLive, Endpoint, Models,
+                   Credential, RequestOptions) of
+                {error, _} = Error -> Error;
+                ok ->
                     Base = #{id => ProfileId,
                              endpoint => Endpoint,
                              models => Models,
@@ -168,27 +172,34 @@ normalize_live_adapter(_Adapter) -> {error, invalid_live_adapter}.
 
 request_endpoint_allowed(undefined, _Endpoint) -> true;
 request_endpoint_allowed(adk_llm_openai, openai) -> true;
-request_endpoint_allowed(adk_llm_openai, Endpoint) when is_map(Endpoint) ->
-    true;
+request_endpoint_allowed(adk_llm_openai, #{scheme := https}) -> true;
 request_endpoint_allowed(adk_llm_anthropic, anthropic) -> true;
-request_endpoint_allowed(adk_llm_anthropic, Endpoint) when is_map(Endpoint) ->
-    true;
+request_endpoint_allowed(adk_llm_anthropic, #{scheme := https}) -> true;
 request_endpoint_allowed(adk_llm_gemini, gemini) -> true;
-request_endpoint_allowed(adk_llm_gemini, Endpoint) when is_map(Endpoint) ->
-    true;
-request_endpoint_allowed(adk_llm_compatible, Endpoint)
-  when is_map(Endpoint) -> true;
+request_endpoint_allowed(adk_llm_gemini, #{scheme := https}) -> true;
+request_endpoint_allowed(adk_llm_vertex, vertex) -> true;
+request_endpoint_allowed(adk_llm_compatible, #{scheme := https}) -> true;
+request_endpoint_allowed(adk_llm_compatible, Endpoint) ->
+    adk_local_model_endpoint:is_endpoint(Endpoint);
 request_endpoint_allowed(Adapter, _Endpoint)
   when Adapter =:= adk_llm_openai;
        Adapter =:= adk_llm_anthropic;
        Adapter =:= adk_llm_gemini;
+       Adapter =:= adk_llm_vertex;
        Adapter =:= adk_llm_compatible -> false;
+request_endpoint_allowed(_CustomAdapter, vertex) -> false;
 request_endpoint_allowed(_CustomAdapter, _Endpoint) -> true.
 
 normalize_endpoint(Endpoint)
   when Endpoint =:= gemini; Endpoint =:= openai;
-       Endpoint =:= anthropic; Endpoint =:= local ->
+       Endpoint =:= anthropic; Endpoint =:= vertex;
+       Endpoint =:= local ->
     {ok, Endpoint};
+normalize_endpoint(#{policy := loopback_keyless} = Endpoint) ->
+    case adk_local_model_endpoint:normalize(Endpoint) of
+        {ok, Normalized} -> {ok, Normalized};
+        {error, _} -> {error, invalid_provider_endpoint}
+    end;
 normalize_endpoint(Endpoint) when is_map(Endpoint) ->
     Allowed = [scheme, host, port, base_path],
     case lists:sort(maps:keys(Endpoint)) =:= lists:sort(Allowed) of
@@ -209,6 +220,50 @@ normalize_custom_endpoint(#{scheme := https, host := Host,
     end;
 normalize_custom_endpoint(_Endpoint) ->
     {error, invalid_provider_endpoint}.
+
+validate_profile_contract(RequestAdapter, LiveAdapter, Endpoint, Models,
+                          Credential, RequestOptions) ->
+    case request_endpoint_allowed(RequestAdapter, Endpoint) of
+        false -> {error, provider_request_endpoint_mismatch};
+        true ->
+            case {validate_vertex_profile(
+                    RequestAdapter, LiveAdapter, Endpoint, Credential),
+                  validate_vertex_models(RequestAdapter, Models)} of
+                {ok, ok} ->
+                    adk_local_model_endpoint:validate_profile(
+                      Endpoint, RequestAdapter, LiveAdapter,
+                      Credential, RequestOptions);
+                {{error, _} = Error, _} -> Error;
+                {_, {error, _} = Error} -> Error
+            end
+    end.
+
+validate_vertex_profile(adk_llm_vertex, undefined, vertex,
+                        #{source := Source}) when Source =/= none -> ok;
+validate_vertex_profile(adk_llm_vertex, undefined, vertex,
+                        #{source := none}) ->
+    {error, vertex_oauth_credential_required};
+validate_vertex_profile(adk_llm_vertex, _Live, vertex, _Credential) ->
+    {error, vertex_live_not_supported};
+validate_vertex_profile(_Request, _Live, vertex, _Credential) ->
+    {error, provider_request_endpoint_mismatch};
+validate_vertex_profile(_Request, _Live, _Endpoint,
+                        #{source := google_adc}) ->
+    {error, google_adc_requires_vertex_request_adapter};
+validate_vertex_profile(_Request, _Live, _Endpoint, _Credential) -> ok.
+
+validate_vertex_models(adk_llm_vertex, Models) ->
+    case lists:all(
+           fun(#{id := Model}) ->
+               case adk_vertex_model_resource:parse(Model) of
+                   {ok, _Target} -> true;
+                   {error, _} -> false
+               end
+           end, maps:values(Models)) of
+        true -> ok;
+        false -> {error, invalid_vertex_model_resource}
+    end;
+validate_vertex_models(_Adapter, _Models) -> ok.
 
 normalize_models(Models)
   when is_map(Models), map_size(Models) > 0,

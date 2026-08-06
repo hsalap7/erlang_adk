@@ -1,7 +1,7 @@
 # Upgrading Erlang ADK
 
-Version 0.8.0 is cumulative. This guide highlights behavior and deployment
-changes introduced by the 0.3-0.8 delivery milestones; it is not a substitute
+Version 0.9.0 is cumulative. This guide highlights behavior and deployment
+changes introduced by the 0.3-0.9 delivery milestones; it is not a substitute
 for the exact contracts in the version documents.
 
 ## Before upgrading
@@ -21,7 +21,7 @@ for the exact contracts in the version documents.
 There is no general automatic schema-migration promise for arbitrary
 application session tables or custom adapters. Node-local web sessions, run
 lookup, A2A tasks, and Live discovery also do not gain transparent horizontal
-failover in 0.8. Model profiles are also node-local application configuration,
+failover in 0.9. Model profiles are also node-local application configuration,
 not a distributed registry. Stage any persistent-data, profile rollout, or
 multi-node change explicitly.
 
@@ -309,6 +309,99 @@ ACKs still apply only to subsequent sequenced provider events. The rate is
 derived from trusted provider capabilities inside the Live session; remove any
 caller-supplied sample-rate override.
 
+## 0.8.0 to 0.9.0: definition-bound workflows and model endpoints
+
+### Plan the checkpoint-v2 migration
+
+Workflow checkpoint schema v2 binds saved state to the compiled
+`definition_fingerprint`, not only workflow ID/version/kind. The 0.9 runtime
+accepts a valid v1 checkpoint once and writes v2 at the next checkpoint
+boundary. That rewrite is one-way for the invocation; do not roll it back to a
+0.8 runtime afterward.
+
+For every durable workflow that contains an Erlang callback and may resume
+after a code deployment, add a root `definition_revision`:
+
+```erlang
+#{version => 1,
+  id => <<"checkout">>,
+  definition_revision => <<"checkout-2026-08-v1">>,
+  kind => graph,
+  %% ...
+ }.
+```
+
+Treat the revision as application schema: keep it unchanged only while all
+callback semantics and captures are resume-compatible, and bump it deliberately
+when they are not. Without a revision, definitions containing anonymous funs
+are marked non-portable and should be recovered only against the exact
+compatible build. Test a staged v1 resume, observe a v2 commit, and then test a
+definition mismatch before upgrading production records.
+
+Retry attempts now survive checkpoints. An ambiguous in-flight attempt repeats
+at the same attempt number instead of receiving a fresh budget. The call can
+still happen more than once; preserve stable external idempotency keys based on
+invocation and step/cursor identity.
+
+### Review nested pauses and confirmations
+
+Nested child pauses now bubble and resume through top-level parallel, loop,
+and transfer workflows as well as sequential and graph shapes. To make a
+parallel pause durable, the runtime cancels uncommitted siblings; those
+siblings may run again after resume. Audit external effects for idempotency.
+
+Protected typed-workflow tool nodes now pause with structured
+`tool_confirmation` details instead of failing closed solely because they are
+outside the Runner. Update workflow clients to present the opaque action ID and
+resume with a correlated boolean decision. Do not treat arbitrary JSON or a
+model-generated value as approval.
+
+If operational code consumes workflow progress, opt into
+`lifecycle_receiver`. It is separate from `event_receiver` and emits ordered
+schema-v1 messages for workflow/node/route/fork/join/attempt/checkpoint/pause
+events. It is best-effort observation, not a replacement for the durable
+checkpoint or invocation ledger.
+
+### Adopt graph contracts deliberately
+
+Existing forks keep `join_policy => all`. Before selecting `any`,
+`first_success`, or `{quorum, N}`, account for cancellation of remaining
+branches and the possibility that an uncommitted branch effect already
+happened. The join input contains only successful committed results selected by
+the policy. `all`, `any`, and quorum fail fast on a branch failure;
+`first_success` is the failure-tolerant choice.
+
+Per-node `input_schema` and `output_schema` are optional and compile before
+execution. Add them at trust boundaries first. State keys remain overwrite by
+default; opt into `append`, `sum`, or `reject_conflict` through root
+`state_reducers` only after checking existing stored state types.
+
+Use `erlang_adk:inspect_graph/1`, `erlang_adk:render_graph/2`, or the local
+`adk graph` commands in CI to review topology and warnings. These are read-only
+descriptor/rendering tools, not a visual editor or an arbitrary graph
+scheduler.
+
+### Configure local servers and Vertex explicitly
+
+The local keyless exception applies only to `adk_llm_compatible` at numeric
+`127.0.0.1` or `::1`, with auth `none` and no Live adapter. It does not allow a
+hostname, private LAN address, container bridge address, or arbitrary cleartext
+endpoint. Put non-loopback deployments behind an operator-controlled HTTPS
+gateway and retain normal certificate/DNS/private-address policy.
+
+Vertex uses `adk_llm_vertex`, a complete Google publisher-model resource, the
+`vertex` endpoint preset, and OAuth. A trusted profile may resolve
+`google_adc`; direct trusted code may also pass an already-minted access token.
+Profile-selected `google_adc` uses only the fixed bounded `gcloud auth
+application-default print-access-token --quiet` command. Direct trusted code
+may instead inject an `adc_token_provider` handle; profile callers cannot.
+Public callers cannot choose an origin, token provider, executable, arguments,
+headers, or credential material.
+
+A model recipe is not remote compatibility evidence. Re-run deterministic
+tests and an explicitly authorized paid/staging smoke for each exact Vertex or
+compatible deployment you rely on.
+
 ## Post-upgrade validation
 
 Run every gate in [`TESTING.md`](TESTING.md) that applies to the deployment.
@@ -318,6 +411,14 @@ Specifically verify:
 - exact OIDC callbacks, audiences, algorithms, scopes, and session rotation;
 - binary profile/model selection, generation changes, missing credentials,
   and caller authority-override rejection;
+- v1-to-v2 workflow checkpoint rewrite, definition mismatch rejection,
+  durable attempt numbers, and at-least-once external idempotency;
+- parallel/loop/transfer/graph nested pause recovery and typed workflow tool
+  confirmation approve/reject/mismatch paths;
+- graph topology warnings, join-policy cancellation, per-node schemas, state
+  reducer type/conflict failures, and secret-free graph inspection;
+- numeric-loopback local endpoint rejection/acceptance boundaries and Vertex
+  resource/ADC/OAuth origin isolation;
 - provider-native content, tools, structured output, streaming, and sanitized
   failure behavior for every configured endpoint;
 - Anthropic `max_tokens >= 1` and 64 KiB synchronous/streaming Gun

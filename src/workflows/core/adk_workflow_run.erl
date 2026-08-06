@@ -39,7 +39,9 @@ init(LaunchRef) when is_reference(LaunchRef) ->
            waiters => #{},
            started_at => erlang:system_time(millisecond),
            finished_at => undefined,
-           event_count => 0}};
+           event_count => 0,
+           lifecycle_event_count => 0,
+           terminal_lifecycle_seen => false}};
 init(_Invalid) ->
     {stop, invalid_workflow_launch_ref}.
 
@@ -119,7 +121,9 @@ initialize_run(Compiled, InitialState0, Opts0, BaseState) ->
                            outcome => undefined,
                            checkpoint => Checkpoint,
                            waiters => #{},
-                           event_count => 0}};
+                           event_count => 0,
+                           lifecycle_event_count => 0,
+                           terminal_lifecycle_seen => false}};
                 {error, Reason} ->
                     {error, public_init_error(Reason)}
             end;
@@ -153,6 +157,17 @@ handle_info({adk_workflow_event, Engine, Event},
     Runtime = maps:get(runtime, State),
     notify_event(maps:get(event_receiver, Runtime), self(), Event),
     {noreply, State#{event_count => maps:get(event_count, State) + 1}};
+handle_info({adk_workflow_lifecycle, Engine, Event},
+            State = #{state := running, engine := Engine}) ->
+    Runtime = maps:get(runtime, State),
+    notify_lifecycle(maps:get(lifecycle_receiver, Runtime), self(), Event),
+    {noreply,
+     State#{lifecycle_event_count =>
+                maps:get(lifecycle_event_count, State, 0) + 1,
+            terminal_lifecycle_seen =>
+                maps:get(terminal_lifecycle_seen, State, false)
+                orelse maps:get(<<"type">>, Event, undefined)
+                    =:= <<"workflow_terminal">>}};
 handle_info({adk_workflow_terminal, Engine, Result, Checkpoint},
             State = #{state := running, engine := Engine}) ->
     Outcome = normalize_engine_outcome(Result, Checkpoint),
@@ -228,7 +243,9 @@ format_status(Status) ->
                 engine_running => is_pid(maps:get(engine, Data, undefined)),
                 durable => maps:get(durable, Data, undefined) =/= undefined,
                 waiter_count => map_size(maps:get(waiters, Data, #{})),
-                event_count => maps:get(event_count, Data, 0)};
+                event_count => maps:get(event_count, Data, 0),
+                lifecycle_event_count =>
+                    maps:get(lifecycle_event_count, Data, 0)};
          (message, _Message) -> adk_secret_redactor:marker();
          (log, _Log) -> [];
          (reason, _Reason) -> adk_secret_redactor:marker();
@@ -262,6 +279,11 @@ normalize_init(Compiled, InitialState0, Opts) when is_map(Opts) ->
                                             Remaining = maps:get(
                                                 <<"remaining">>, Checkpoint),
                                             Runtime = Runtime0#{
+                                                execution_id => maps:get(
+                                                    <<"execution_id">>,
+                                                    Checkpoint,
+                                                    maps:get(execution_id,
+                                                             Runtime0)),
                                                 steps_remaining => maps:get(
                                                     <<"steps">>, Remaining),
                                                 transfers_remaining => maps:get(
@@ -301,7 +323,9 @@ prepare_durable(Compiled, InitialState, Runtime, Checkpoint, Opts) ->
                is_atom(Module), is_integer(LeaseMs), LeaseMs > 0 ->
             Metadata = #{workflow_id => maps:get(id, Compiled),
                          workflow_version => maps:get(version, Compiled),
-                         kind => maps:get(kind, Compiled)},
+                         kind => maps:get(kind, Compiled),
+                         definition_fingerprint =>
+                             adk_workflow:definition_fingerprint(Compiled)},
             case maybe_create_durable(Mode, Module, Handle, InvocationId,
                                       Metadata, Checkpoint) of
                 ok ->
@@ -363,6 +387,9 @@ adopt_claimed_checkpoint(Compiled, _InitialState, Runtime, _Checkpoint,
                                          ClaimedCheckpoint),
                     Runtime1 = Runtime#{
                         invocation_id => maps:get(invocation_id, Durable),
+                        execution_id => maps:get(
+                            <<"execution_id">>, ClaimedCheckpoint,
+                            maps:get(execution_id, Runtime)),
                         steps_remaining => maps:get(<<"steps">>, Remaining),
                         transfers_remaining =>
                             maps:get(<<"transfers">>, Remaining)},
@@ -384,31 +411,43 @@ normalize_runtime(Compiled, Opts) ->
                               maps:get(max_concurrency, Data, 1)),
     Retention = maps:get(retention_ms, Opts, ?DEFAULT_RETENTION_MS),
     EventReceiver = maps:get(event_receiver, Opts, undefined),
+    LifecycleReceiver = maps:get(lifecycle_receiver, Opts, undefined),
     case valid_runtime(Deadline, MaxSteps, MaxTransfers,
-                       MaxConcurrency, Retention, EventReceiver) of
+                       MaxConcurrency, Retention, EventReceiver,
+                       LifecycleReceiver) of
         true ->
             {ok, #{deadline => Deadline,
-                   execution_id => workflow_execution_id(),
+                   execution_id => runtime_execution_id(Opts),
                    steps_remaining => MaxSteps,
                    transfers_remaining => MaxTransfers,
                    transfers_initial => MaxTransfers,
                    max_concurrency => MaxConcurrency,
                    retention_ms => Retention,
-                   event_receiver => EventReceiver}};
+                   event_receiver => EventReceiver,
+                   lifecycle_receiver => LifecycleReceiver}};
         false -> {error, invalid_workflow_options}
     end.
+
+runtime_execution_id(#{?DURABLE_OPT :=
+                           #{invocation_id := InvocationId}})
+  when is_binary(InvocationId), byte_size(InvocationId) > 0 ->
+    InvocationId;
+runtime_execution_id(_Opts) -> workflow_execution_id().
 
 workflow_execution_id() ->
     Counter = erlang:unique_integer([positive, monotonic]),
     <<"workflow-", (integer_to_binary(Counter))/binary>>.
 
-valid_runtime(Deadline, Steps, Transfers, Concurrency, Retention, Receiver) ->
+valid_runtime(Deadline, Steps, Transfers, Concurrency, Retention, Receiver,
+              LifecycleReceiver) ->
     (Deadline =:= infinity orelse is_integer(Deadline))
     andalso is_integer(Steps) andalso Steps > 0
     andalso is_integer(Transfers) andalso Transfers >= 0
     andalso is_integer(Concurrency) andalso Concurrency > 0
     andalso is_integer(Retention) andalso Retention >= 0
-    andalso (Receiver =:= undefined orelse is_pid(Receiver)).
+    andalso (Receiver =:= undefined orelse is_pid(Receiver))
+    andalso (LifecycleReceiver =:= undefined
+             orelse is_pid(LifecycleReceiver)).
 
 persist_checkpoint(Checkpoint, State = #{durable := undefined}) ->
     {ok, State#{checkpoint => Checkpoint}};
@@ -529,17 +568,48 @@ finish(Outcome, State = #{state := running}) ->
 finish_local(Outcome, State = #{state := running}) ->
     cancel_timer(maps:get(deadline_timer, State)),
     cancel_timer(maps:get(lease_timer, State, undefined)),
-    reply_waiters(Outcome, maps:get(waiters, State)),
-    Runtime = maps:get(runtime, State),
+    State1 = ensure_terminal_lifecycle(Outcome, State),
+    %% Deliver the synthetic cancellation/deadline terminal lifecycle before
+    %% awaiters observe the terminal outcome, matching engine-driven ordering.
+    reply_waiters(Outcome, maps:get(waiters, State1)),
+    Runtime = maps:get(runtime, State1),
     TerminalTimer = erlang:send_after(maps:get(retention_ms, Runtime),
                                       self(), adk_workflow_expire),
-    State#{state => outcome_state(Outcome),
+    State1#{state => outcome_state(Outcome),
            outcome => Outcome,
            finished_at => erlang:system_time(millisecond),
            waiters => #{},
            deadline_timer => undefined,
            lease_timer => undefined,
            terminal_timer => TerminalTimer}.
+
+ensure_terminal_lifecycle(_Outcome,
+                          State = #{terminal_lifecycle_seen := true}) ->
+    State;
+ensure_terminal_lifecycle(Outcome, State) ->
+    Runtime = maps:get(runtime, State),
+    case maps:get(lifecycle_receiver, Runtime, undefined) of
+        undefined -> State;
+        Receiver ->
+            Compiled = maps:get(compiled, State),
+            Sequence = maps:get(lifecycle_event_count, State, 0) + 1,
+            Event = #{<<"schema_version">> => 1,
+                      <<"type">> => <<"workflow_terminal">>,
+                      <<"sequence">> => Sequence,
+                      <<"timestamp">> => erlang:system_time(millisecond),
+                      <<"workflow_id">> => maps:get(id, Compiled),
+                      <<"workflow_kind">> => atom_to_binary(
+                                                 maps:get(kind, Compiled),
+                                                 utf8),
+                      <<"invocation_id">> => maps:get(
+                         invocation_id, Runtime,
+                         maps:get(execution_id, Runtime)),
+                      <<"outcome">> =>
+                          atom_to_binary(outcome_state(Outcome), utf8)},
+            notify_lifecycle(Receiver, self(), Event),
+            State#{lifecycle_event_count => Sequence,
+                   terminal_lifecycle_seen => true}
+    end.
 
 reply_waiters(Outcome, Waiters) ->
     maps:foreach(
@@ -561,7 +631,8 @@ status_map(State) ->
       finished_at => maps:get(finished_at, State),
       checkpoint => maps:get(checkpoint, State),
       waiter_count => map_size(maps:get(waiters, State)),
-      event_count => maps:get(event_count, State)},
+      event_count => maps:get(event_count, State),
+      lifecycle_event_count => maps:get(lifecycle_event_count, State, 0)},
     case maps:get(durable, State, undefined) of
         undefined -> Base;
         Durable -> Base#{invocation_id => maps:get(invocation_id, Durable),
@@ -585,6 +656,11 @@ stop_engine(State) ->
 notify_event(undefined, _Ref, _Event) -> ok;
 notify_event(Receiver, Ref, Event) ->
     Receiver ! {adk_workflow_event, Ref, Event},
+    ok.
+
+notify_lifecycle(undefined, _Ref, _Event) -> ok;
+notify_lifecycle(Receiver, Ref, Event) ->
+    Receiver ! {adk_workflow_lifecycle, Ref, Event},
     ok.
 
 cancel_timer(undefined) -> ok;

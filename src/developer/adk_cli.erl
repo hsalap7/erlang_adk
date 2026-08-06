@@ -67,6 +67,14 @@ command_noninteractive(["doctor"]) ->
     doctor();
 command_noninteractive(["config", "validate", Path]) ->
     validate_config_command(Path);
+command_noninteractive(["graph", "validate", Module, Function]) ->
+    graph_validate_command(Module, Function);
+command_noninteractive(["graph", "describe", Module, Function]) ->
+    graph_describe_command(Module, Function);
+command_noninteractive(["graph", "render", Module, Function | Args]) ->
+    with_options(
+      Args, #{"--format" => format},
+      fun(Opts) -> graph_render_command(Module, Function, Opts) end);
 command_noninteractive(["run" | Args]) ->
     with_options(
       Args,
@@ -241,6 +249,9 @@ usage() ->
     <<"Erlang ADK developer CLI\n\n"
       "  adk doctor\n"
       "  adk config validate AGENT.json\n"
+      "  adk graph validate MODULE FUNCTION\n"
+      "  adk graph describe MODULE FUNCTION\n"
+      "  adk graph render MODULE FUNCTION [--format mermaid|dot|json]\n"
       "  adk run --config AGENT.json --message TEXT [--user ID --session ID]\n"
       "  adk console --config AGENT.json [--user ID --session ID]\n"
       "  adk evaluate --config AGENT.json --dataset DATASET.json\n"
@@ -299,6 +310,7 @@ doctor() ->
     ProviderStatus = module_status(adk_llm_gemini),
     ProviderStatuses =
         #{gemini => ProviderStatus,
+          vertex => module_status(adk_llm_vertex),
           openai => module_status(adk_llm_openai),
           anthropic => module_status(adk_llm_anthropic),
           compatible => module_status(adk_llm_compatible)},
@@ -355,6 +367,135 @@ validate_config_command(Path) ->
                    tool_count => length(maps:get(tools, Agent))}};
         {error, _} = Error -> Error
     end.
+
+graph_validate_command(ModuleText, FunctionText) ->
+    case load_graph_factory(ModuleText, FunctionText) of
+        {ok, Compiled} ->
+            case adk_graph_inspect:describe(Compiled) of
+                {ok, Descriptor} ->
+                    Analysis = maps:get(<<"analysis">>, Descriptor),
+                    {ok, #{command => graph_validate,
+                           status => valid,
+                           workflow_id => maps:get(<<"workflow_id">>,
+                                                   Descriptor),
+                           fingerprint => maps:get(
+                                            <<"definition_fingerprint">>,
+                                            Descriptor),
+                           warnings => maps:get(<<"warnings">>, Analysis)}};
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error -> Error
+    end.
+
+graph_describe_command(ModuleText, FunctionText) ->
+    case load_graph_factory(ModuleText, FunctionText) of
+        {ok, Compiled} ->
+            case adk_graph_inspect:describe(Compiled) of
+                {ok, Descriptor} ->
+                    {ok, #{command => graph_describe,
+                           graph => Descriptor}};
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error -> Error
+    end.
+
+graph_render_command(ModuleText, FunctionText, Opts) ->
+    FormatText = maps:get(format, Opts, "mermaid"),
+    case normalize_graph_format(FormatText) of
+        {error, _} = Error -> Error;
+        {ok, Format} ->
+            case load_graph_factory(ModuleText, FunctionText) of
+                {error, _} = Error -> Error;
+                {ok, Compiled} ->
+                    render_graph_result(Compiled, Format)
+            end
+    end.
+
+render_graph_result(Compiled, json) ->
+    case adk_graph_inspect:describe(Compiled) of
+        {ok, Descriptor} ->
+            {ok, #{command => graph_render, format => json,
+                   content => jsx:encode(Descriptor)}};
+        {error, _} = Error -> Error
+    end;
+render_graph_result(Compiled, dot) ->
+    render_graph_text(Compiled, dot, adk_graph_inspect:to_dot(Compiled));
+render_graph_result(Compiled, mermaid) ->
+    render_graph_text(
+      Compiled, mermaid, adk_graph_inspect:to_mermaid(Compiled)).
+
+render_graph_text(_Compiled, Format, {ok, Content}) ->
+    {ok, #{command => graph_render, format => Format, content => Content}};
+render_graph_text(_Compiled, _Format, {error, _} = Error) -> Error.
+
+normalize_graph_format("mermaid") -> {ok, mermaid};
+normalize_graph_format("dot") -> {ok, dot};
+normalize_graph_format("json") -> {ok, json};
+normalize_graph_format(_) -> {error, unsupported_graph_render_format}.
+
+load_graph_factory(ModuleText, FunctionText) ->
+    case resolve_available_module(ModuleText) of
+        {error, _} = Error -> Error;
+        {ok, Module} ->
+            case code:ensure_loaded(Module) of
+                {module, Module} ->
+                    case resolve_exported_function(Module, FunctionText) of
+                        {ok, Function} -> invoke_graph_factory(Module,
+                                                               Function);
+                        {error, _} = Error -> Error
+                    end;
+                _ -> {error, graph_factory_module_unavailable}
+            end
+    end.
+
+resolve_available_module(ModuleText) when is_list(ModuleText) ->
+    case [Candidate || {Candidate, _File, _Loaded} <- code:all_available(),
+                       Candidate =:= ModuleText] of
+        [Candidate | _] ->
+            %% Candidate comes from the installed code path rather than
+            %% caller text, so this creates at most the selected available
+            %% module atom.
+            {ok, list_to_atom(Candidate)};
+        [] -> {error, graph_factory_module_unavailable}
+    end;
+resolve_available_module(_) -> {error, invalid_graph_factory_module}.
+
+resolve_exported_function(Module, FunctionText) when is_list(FunctionText) ->
+    case [Function || {Function, 0} <- Module:module_info(exports),
+                      atom_to_list(Function) =:= FunctionText] of
+        [Function | _] -> {ok, Function};
+        [] -> {error, graph_factory_function_unavailable}
+    end;
+resolve_exported_function(_Module, _FunctionText) ->
+    {error, invalid_graph_factory_function}.
+
+invoke_graph_factory(Module, Function) ->
+    try Module:Function() of
+        {ok, Value} -> compile_graph_factory_value(Value);
+        Value -> compile_graph_factory_value(Value)
+    catch
+        Class:Reason ->
+            {error, {graph_factory_failed,
+                     adk_failure:exception(
+                       graph_cli, factory, Class, Reason)}}
+    end.
+
+compile_graph_factory_value(Value) when is_map(Value) ->
+    case adk_workflow:is_compiled(Value) of
+        true ->
+            case maps:get(kind, Value) of
+                graph -> {ok, Value};
+                _ -> {error, graph_factory_not_graph_workflow}
+            end;
+        false ->
+            case adk_workflow:compile(Value) of
+                {ok, #{kind := graph} = Compiled} -> {ok, Compiled};
+                {ok, _Other} -> {error, graph_factory_not_graph_workflow};
+                {error, _} = Error -> Error
+            end
+    end;
+compile_graph_factory_value(_Value) ->
+    {error, invalid_graph_factory_result}.
 
 run_command(Opts) ->
     with_required(Opts, [config, message],

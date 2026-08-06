@@ -31,6 +31,7 @@ not change any public API or generated BEAM name.
 | `src/models/openai/realtime/` | OpenAI Realtime provider codec and fixed-origin verified-TLS WebSocket transport |
 | `src/models/anthropic/` | Native Anthropic Messages provider and pure request/content/stream codecs |
 | `src/models/compatible/` | Narrow OpenAI-compatible Chat Completions provider and pure request/content/stream codecs |
+| `src/models/vertex/` | Vertex AI publisher-model resource validation and native GenerateContent/SSE adapter |
 | `src/plugins/` | Stateless and stateful plugin contracts, instances, pipelines, and runtime supervision |
 | `src/protocols/a2a/` | A2A v1 implementation and legacy compatibility adapters |
 | `src/protocols/http/` | Shared HTTP listener lifecycle and route composition |

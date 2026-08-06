@@ -1,4 +1,4 @@
-# Phoenix production UI companion (v0.8)
+# Phoenix production UI companion (v0.9)
 
 This is a Phoenix 1.8 companion application for Erlang ADK. It runs Phoenix,
 `erlang_adk`, the authenticated gateway, and supervised agent runs on the same
@@ -11,7 +11,7 @@ text runs, bounded event rendering, credit/ack backpressure, reconnect by
 server-side cursor, cancellation, and typed human approval. The `/live`
 console adds principal-scoped discovery of server-owned ADK Live sessions,
 future-only attach/detach, realtime text input, bounded Live event credit/ack,
-an authenticated binary full-duplex voice bridge with v0.8 server-negotiated
+an authenticated binary full-duplex voice bridge with server-negotiated
 16/24 kHz input, read-only observability
 snapshots, and pure evaluation report and baseline-comparison panels. Browser
 input never selects an ADK user ID,

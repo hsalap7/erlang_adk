@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-package_path="${1:-${repo_root}/_build/default/lib/erlang_adk/hex/erlang_adk-0.8.0.tar}"
+package_path="${1:-${repo_root}/_build/default/lib/erlang_adk/hex/erlang_adk-0.9.0.tar}"
 
 if [[ ! -f "${package_path}" ]]; then
   echo "Hex package not found: ${package_path}" >&2
@@ -26,10 +26,12 @@ required_files=(
   "README.md"
   "CHANGELOG.md"
   "SECURITY.md"
+  "docs/MODEL_SUPPORT.md"
   "docs/PROVIDER_PROFILES.md"
   "docs/RELEASING.md"
   "docs/TEST_LAYOUT.md"
   "docs/VERSION_0_8_0.md"
+  "docs/VERSION_0_9_0.md"
   "examples/readme_weather_tool.erl"
   "examples/phoenix_adk_ui/README.md"
   "examples/phoenix_adk_ui/assets/js/live_voice.js"
@@ -40,6 +42,7 @@ required_files=(
   "src/auth/core/adk_authorizer.erl"
   "src/auth/credentials/adk_token_manager.erl"
   "src/auth/credentials/adk_provider_credential.erl"
+  "src/auth/credentials/adk_google_adc.erl"
   "src/auth/integrations/a2a/adk_a2a_v1_oidc_auth.erl"
   "src/auth/integrations/openapi/adk_openapi_auth_manager.erl"
   "src/auth/oauth/adk_authorization_flow.erl"
@@ -69,11 +72,14 @@ required_files=(
   "src/models/gemini/adk_llm_gemini.erl"
   "src/models/openai/adk_llm_openai.erl"
   "src/models/openai/realtime/adk_live_openai.erl"
+  "src/models/profiles/adk_local_model_endpoint.erl"
   "src/models/profiles/adk_provider_profile.erl"
   "src/models/profiles/adk_provider_registry.erl"
   "src/models/transport/adk_model_http_client.erl"
   "src/models/transport/adk_model_http_headers.erl"
   "src/models/transport/adk_model_sse_decoder.erl"
+  "src/models/vertex/adk_llm_vertex.erl"
+  "src/models/vertex/adk_vertex_model_resource.erl"
   "src/plugins/adk_plugin.erl"
   "src/protocols/a2a/v1/adk_a2a_v1_card.erl"
   "src/protocols/a2a/legacy/erlang_adk_a2a_client.erl"
@@ -94,6 +100,9 @@ required_files=(
   "src/workflows/core/adk_workflow.erl"
   "src/workflows/durability/adk_invocation_ledger.erl"
   "src/workflows/graph/adk_graph.erl"
+  "src/workflows/graph/adk_graph_inspect.erl"
+  "src/workflows/graph/adk_graph_ir.erl"
+  "src/workflows/graph/adk_graph_validate.erl"
   "src/workflows/planning/adk_plan.erl"
   "src/erlang_adk.erl"
   "src/erlang_adk_app.erl"
@@ -166,8 +175,8 @@ if [[ -n "${unexpected_root_source}" ]]; then
   exit 1
 fi
 
-if ! grep -Fq '{<<"version">>,<<"0.8.0">>}.' "${outer_dir}/metadata.config"; then
-  echo "Hex metadata does not declare version 0.8.0" >&2
+if ! grep -Fq '{<<"version">>,<<"0.9.0">>}.' "${outer_dir}/metadata.config"; then
+  echo "Hex metadata does not declare version 0.9.0" >&2
   exit 1
 fi
 
@@ -217,4 +226,4 @@ cd "${contents_dir}"
 "${repo_root}/rebar3" compile
 cd "${original_dir}"
 
-echo "Verified erlang_adk 0.8.0 package contents and clean extracted compile"
+echo "Verified erlang_adk 0.9.0 package contents and clean extracted compile"
