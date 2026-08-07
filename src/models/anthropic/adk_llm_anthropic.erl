@@ -48,6 +48,7 @@ capabilities() ->
       content_streaming => true,
       function_calling => true,
       parallel_function_calling => true,
+      generation_config => true,
       structured_output => true,
       multimodal => true,
       content_schema_version => adk_content:codec_version(),

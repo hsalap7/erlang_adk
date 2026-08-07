@@ -7,7 +7,7 @@
 -module(adk_model_http_client).
 
 -export([validate_options/1, validate_https_base_url/1,
-         request/4, stream/5, resolve_api_key/2,
+         request/4, stream/5, stream_sse/5, resolve_api_key/2,
          resolve_bound_api_key/3, resolve_explicit_api_key/1,
          base_url_matches/2]).
 
@@ -61,6 +61,18 @@ stream(Config, Path, Headers, Payload, Callback)
   when is_function(Callback, 1) ->
     invoke(stream, Config, Path, Headers, Payload, Callback);
 stream(_Config, _Path, _Headers, _Payload, _Callback) ->
+    {error, invalid_stream_callback}.
+
+%% @doc Stream from the adapter-owned path using the one fixed query parameter
+%% required by Google GenerateContent SSE endpoints. The caller still supplies
+%% a query-free path and cannot add or replace URL authority/query data.
+-spec stream_sse(map(), binary(), [{binary(), binary()}], map(),
+                 adk_model_http_transport:chunk_callback()) ->
+    {ok, adk_model_http_transport:response()} | {error, term()}.
+stream_sse(Config, Path, Headers, Payload, Callback)
+  when is_function(Callback, 1) ->
+    invoke(stream_sse, Config, Path, Headers, Payload, Callback);
+stream_sse(_Config, _Path, _Headers, _Payload, _Callback) ->
     {error, invalid_stream_callback}.
 
 %% @doc Resolve a direct adapter key or its conventional environment value.
@@ -119,7 +131,7 @@ base_url_matches(_Config, _Expected) -> false.
 
 invoke(Mode, Config, Path, Headers, Payload, Callback)
   when is_map(Config), is_binary(Path), is_list(Headers), is_map(Payload) ->
-    case prepare_request(Config, Path, Headers, Payload) of
+    case prepare_request(Mode, Config, Path, Headers, Payload) of
         {ok, {Transport, Handle}, Request} ->
             invoke_transport(Mode, Transport, Handle, Request, Callback);
         {error, _} = Error -> Error
@@ -127,19 +139,20 @@ invoke(Mode, Config, Path, Headers, Payload, Callback)
 invoke(_Mode, _Config, _Path, _Headers, _Payload, _Callback) ->
     {error, invalid_model_http_request}.
 
-prepare_request(Config, Path, Headers, Payload) ->
+prepare_request(Mode, Config, Path, Headers, Payload) ->
     case adk_model_http_headers:validate(Headers) of
-        ok -> prepare_request_with_headers(Config, Path, Headers, Payload);
+        ok -> prepare_request_with_headers(
+                Mode, Config, Path, Headers, Payload);
         {error, _} = Error -> Error
     end.
 
-prepare_request_with_headers(Config, Path, Headers, Payload) ->
+prepare_request_with_headers(Mode, Config, Path, Headers, Payload) ->
     case {base_target(Config), timeout(Config), max_response_bytes(Config),
           allow_private(Config), transport(Config), encode_payload(Payload),
           normalize_path(Path)} of
         {{ok, Base, Scheme, Host}, {ok, Timeout}, {ok, MaxBytes},
          {ok, AllowPrivate}, {ok, Transport}, {ok, Body}, {ok, SafePath}} ->
-            Url = join_url(Base, SafePath),
+            Url = join_url(Base, SafePath, Mode),
             Request = #{method => <<"POST">>, url => Url,
                         headers => Headers, body => Body,
                         timeout_ms => Timeout,
@@ -173,7 +186,9 @@ invoke_transport(stream, Module, Handle, Request, Callback) ->
         _ -> {error, invalid_transport_response}
     catch
         Class:_Reason -> {error, {model_transport_failed, Class}}
-    end.
+    end;
+invoke_transport(stream_sse, Module, Handle, Request, Callback) ->
+    invoke_transport(stream, Module, Handle, Request, Callback).
 
 base_target(Config) ->
     case maps:get(base_url, Config, undefined) of
@@ -309,7 +324,9 @@ sanitize_transport_error({stream_callback_failed, Class})
   when is_atom(Class) -> {stream_callback_failed, Class};
 sanitize_transport_error(_Reason) -> model_transport_error.
 
-join_url(Base, Path) -> <<Base/binary, Path/binary>>.
+join_url(Base, Path, stream_sse) ->
+    <<Base/binary, Path/binary, "?alt=sse">>;
+join_url(Base, Path, _Mode) -> <<Base/binary, Path/binary>>.
 
 trim_trailing_slash(Base) when byte_size(Base) > 1 ->
     case binary:last(Base) of

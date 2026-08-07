@@ -15,16 +15,17 @@
 -define(MAX_PROFILES_BYTES, 4194304).
 -define(SNAPSHOT_KEY, {?MODULE, profile_snapshot_hmac_key}).
 
--type source() :: none |
+-type source() :: none | google_adc |
                   {env, binary() | string()} |
                   {application_env, atom(), atom()} |
                   {literal, binary()}.
--type descriptor() :: #{source := none | env | application_env | literal}.
+-type descriptor() :: #{source := none | google_adc | env |
+                                  application_env | literal}.
 -export_type([source/0, descriptor/0]).
 
 %% @doc Resolve the credential source owned by a configured binary profile.
 -spec resolve(term()) ->
-    {ok, none | binary()} | {error, term()}.
+    {ok, none | google_adc | binary()} | {error, term()}.
 resolve(ProfileId) when is_binary(ProfileId) ->
     case raw_profile(ProfileId) of
         {ok, Profile, _Normalized} ->
@@ -39,7 +40,7 @@ resolve(_ProfileId) ->
 %% adapter, endpoint and model. The environment is read once; a changed raw
 %% profile fails before its credential source is touched.
 -spec resolve_snapshot(term(), term()) ->
-    {ok, none | binary()} | {error, term()}.
+    {ok, none | google_adc | binary()} | {error, term()}.
 resolve_snapshot(ProfileId, ExpectedSnapshot)
   when is_binary(ProfileId), is_binary(ExpectedSnapshot),
        byte_size(ExpectedSnapshot) =:= 32 ->
@@ -95,7 +96,7 @@ initialize_snapshot_key() ->
 %% `untrusted' form is deliberately fail-closed, including for environment
 %% sources, so callers cannot probe arbitrary process/application variables.
 -spec resolve(term(), trusted | untrusted) ->
-    {ok, none | binary()} | {error, term()}.
+    {ok, none | google_adc | binary()} | {error, term()}.
 resolve(Source, trusted) ->
     resolve_trusted(Source);
 resolve(_Source, untrusted) ->
@@ -107,6 +108,8 @@ resolve(_Source, _Trust) ->
 -spec describe(term()) -> {ok, descriptor()} | {error, term()}.
 describe(none) ->
     {ok, #{source => none}};
+describe(google_adc) ->
+    {ok, #{source => google_adc}};
 describe({env, Name}) ->
     case normalize_env_name(Name) of
         {ok, BinaryName} ->
@@ -126,6 +129,10 @@ describe(_Source) ->
 
 resolve_trusted(none) ->
     {ok, none};
+resolve_trusted(google_adc) ->
+    %% This is a source marker, not credential material. The Vertex adapter
+    %% performs bounded token acquisition immediately before its HTTPS call.
+    {ok, google_adc};
 resolve_trusted({env, Name}) ->
     case normalize_env_name(Name) of
         {ok, BinaryName} ->

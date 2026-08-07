@@ -28,7 +28,8 @@ create namespaces or change EUnit/Common Test module names.
 | `test/workflows/` | `src/workflows/` |
 | `test/readme/` | README examples and opt-in provider integration evidence |
 
-The 0.8 model-provider slice mirrors its deeper production ownership:
+The 0.8 and 0.9 model-provider slices mirror their deeper production
+ownership:
 
 | Test path | Production owner |
 | --- | --- |
@@ -42,6 +43,7 @@ The 0.8 model-provider slice mirrors its deeper production ownership:
 | `test/models/anthropic/request/` | Pure Messages content, request, response, and SSE lifecycle codecs |
 | `test/models/compatible/` | Compatible Chat Completions provider behavior |
 | `test/models/compatible/request/` | Pure compatible content, request/response, and SSE codecs |
+| `test/models/vertex/` | Vertex publisher-model validation plus deterministic GenerateContent/SSE request, response, and transport behavior |
 | `test/live/core/` | Provider-neutral contiguous multi-frame/no-op admission, priority ordering, profile resolution, ownership, and flow control |
 | `test/live/voice/` | Negotiated format framing, 16/24 kHz input, bridge ownership, and acknowledgement behavior |
 

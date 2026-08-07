@@ -54,11 +54,39 @@ atomic ownership claim:
       DurableOpts#{resume_input => #{<<"approved">> => true}}).
 ```
 
-The ledger persists the workflow identity, JSON-safe checkpoint, terminal
-outcome, revision, and ownership lease. It deliberately does not persist
-compiled Erlang funs or agent pids. The application must therefore load code
-and reconstruct the same compiled workflow before resuming. A mismatched
-workflow is rejected.
+The ledger persists the workflow identity, definition-bound JSON-safe
+checkpoint, terminal outcome, record revision, and ownership lease. It
+deliberately does not persist compiled Erlang funs or agent pids. The
+application must therefore load code and reconstruct the same compiled
+workflow before resuming. A mismatched ID/version/kind is rejected as
+`checkpoint_workflow_mismatch`; a v2 checkpoint built from different compiled
+semantics is rejected as `checkpoint_definition_mismatch`.
+
+## Checkpoint schema v2 and definition identity
+
+New checkpoints use schema version 2. Alongside state, cursor, remaining
+budgets, output, and completion, they carry:
+
+- the compiled `definition_fingerprint` and stable `execution_id`;
+- monotonically increasing `sequence`, `parent_sequence`, and `created_at`;
+- durable per-node attempt entries and node status;
+- currently runnable and waiting work;
+- fork/join accumulators and cycle counters; and
+- interruption records needed to restore a typed pause.
+
+The fingerprint covers the compiled workflow kind and canonical definition.
+An optional root `definition_revision` may be a non-negative integer or
+non-empty binary. When it is present, callback identity omits VM-local fun
+identity/captures, making the definition suitable for an application-managed
+cross-deployment resume contract. The application must bump that revision
+when callback meaning changes. Without a revision, a workflow containing
+anonymous callbacks is marked non-portable and should be resumed only against
+the exact compatible build.
+
+Valid schema-v1 checkpoints remain readable for the 0.8-to-0.9 upgrade. They
+are checked against workflow ID/version/kind and rewritten as v2 at the next
+checkpoint boundary. Once rewritten, resume is definition-bound and reverting
+that invocation to a 0.8 runtime is unsupported.
 
 ## Commit and ownership semantics
 
@@ -95,6 +123,12 @@ Execution is **at least once** across a crash. A completed, acknowledged step
 is not run again. An action whose external side effect happened after the last
 checkpoint but whose result was not durably committed may run again.
 
+Retry attempt state is durable in v2. If recovery finds an attempt marked
+running but without a committed result, it reruns that same one-based attempt
+number. It does not grant a new retry budget. This makes configured
+`max_attempts` stable across restarts, but it does not make an in-flight action
+exactly once.
+
 Durable action callbacks receive these extra context fields:
 
 ```erlang
@@ -109,6 +143,36 @@ Use the stable invocation ID plus step ID/cursor as an idempotency key when an
 action calls a payment system, queue, database, or other side-effecting
 service. The target service should atomically remember that key with its
 result. Parallel branches have the same at-least-once rule independently.
+
+When a nested child pauses inside sequential, parallel, loop, transfer, graph,
+or graph-fork execution, the parent commits the child's checkpoint and
+propagates the pause. Resume re-enters that child without replaying its already
+committed work. A sibling cancelled before its own result commits may run
+again, so sibling effects need the same idempotency treatment.
+
+A protected workflow tool node produces structured `tool_confirmation`
+details with a stable action ID. Resume accepts only a correlated boolean
+decision: approval re-evaluates the confirmation requirement and executes that
+exact call, while rejection and malformed or mismatched input fail closed.
+
+## Lifecycle delivery
+
+Set `lifecycle_receiver => Pid` in workflow options to receive:
+
+```erlang
+{adk_workflow_lifecycle, WorkflowRef, EventMap}
+```
+
+Events are JSON-safe schema-v1 maps with a per-execution sequence, timestamp,
+workflow/invocation identity, type, and type-specific metadata. They cover
+workflow start/terminal, node start/completion/failure, routing, fork/join,
+attempt/retry, checkpoint commit, and pause/resume. The receiver is separate
+from `event_receiver` for compatibility.
+
+Lifecycle messages are operational observations, not a durable transaction
+log. A receiver process can die or miss messages, and a recovered execution
+starts a new lifecycle sequence. Use committed checkpoints and the invocation
+ledger—not lifecycle delivery—as the recovery source of truth.
 
 ## Mnesia operation
 
@@ -125,7 +189,7 @@ state. Deployments requiring encrypted storage can implement the
 `adk_invocation_ledger` behaviour with their database/KMS policy while
 retaining the same atomic claim, checkpoint, finish, and fencing contract.
 
-Durable workflow recovery is separate from an intentional tool/HITL pause.
-Paused Runner invocations continue to use `adk_run:resume/2` and the session
-continuation store. This ledger is specifically for unexpected process or
-application interruption at workflow checkpoint boundaries.
+Typed workflow tool/HITL pauses are stored in the workflow checkpoint and may
+be resumed through the workflow invocation API. Paused Runner agent
+invocations continue to use `adk_run:resume/2` and the separate session
+continuation store. The two continuation formats are not interchangeable.

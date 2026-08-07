@@ -4,7 +4,7 @@ defmodule ErlangAdkUi.MixProject do
   def project do
     [
       app: :erlang_adk_ui,
-      version: "0.8.0",
+      version: "0.9.0",
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -45,7 +45,7 @@ defmodule ErlangAdkUi.MixProject do
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.4"},
       {:dns_cluster, "~> 0.2"},
-      {:bandit, "~> 1.10"}
+      {:bandit, "~> 1.12.1"}
     ]
   end
 

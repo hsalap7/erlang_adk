@@ -9,6 +9,7 @@ live_profile_session_test_() ->
      fun setup/0,
      fun cleanup/1,
      [fun profile_credential_is_brokered_and_redacted_case/0,
+      fun narrowed_profile_capabilities_are_enforced_case/0,
       fun profile_transport_authority_is_rejected_case/0,
       fun handoff_and_policy_share_rejection_case/0,
       fun provider_default_transport_and_rate_case/0,
@@ -83,6 +84,25 @@ profile_credential_is_brokered_and_redacted_case() ->
           after
               ok = adk_live_credential_broker:revoke(CredentialRef)
           end
+      end).
+
+narrowed_profile_capabilities_are_enforced_case() ->
+    Secret = <<"narrowed-live-profile-secret">>,
+    Profile = (openai_profile(Secret))#{
+                models =>
+                    #{<<"voice">> =>
+                          #{id => <<"gpt-realtime-profile-id">>,
+                            capabilities =>
+                                #{input_audio_sample_rate => 16000}}}},
+    with_profiles(
+      #{<<"openai-live">> => Profile},
+      fun() ->
+          Result = adk_live_session:prepare_config(
+                     profile_session_config()),
+          ?assertEqual(
+             {error, invalid_live_provider_capabilities}, Result),
+          ?assertEqual(nomatch,
+                       binary:match(term_to_binary(Result), Secret))
       end).
 
 profile_transport_authority_is_rejected_case() ->

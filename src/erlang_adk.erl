@@ -3,7 +3,7 @@
 -export([spawn_agent/3, stop_agent/1, prompt/2, invoke/3,
          delegate/2, delegate/3,
          delegate/4, sequential/2, parallel/2, parallel/3, loop/4,
-         compile_workflow/1,
+         compile_workflow/1, inspect_graph/1, render_graph/2,
          start_workflow/2, start_workflow/3,
          run_workflow/2, run_workflow/3,
          await_workflow/1, await_workflow/2,
@@ -84,6 +84,19 @@ loop(WorkerPid, ReviewerPid, Prompt, MaxIterations) ->
 %% @doc Validate and compile a declarative workflow specification.
 compile_workflow(Spec) ->
     adk_workflow:compile(Spec).
+
+%% @doc Return a deterministic, JSON-safe graph descriptor without executable
+%% callbacks, credentials, state, or tool arguments.
+inspect_graph(Compiled) ->
+    adk_graph_inspect:describe(Compiled).
+
+%% @doc Render a compiled graph as DOT or Mermaid text.
+render_graph(Compiled, dot) ->
+    adk_graph_inspect:to_dot(Compiled);
+render_graph(Compiled, mermaid) ->
+    adk_graph_inspect:to_mermaid(Compiled);
+render_graph(_Compiled, _Format) ->
+    {error, unsupported_graph_render_format}.
 
 %% @doc Start an independently supervised workflow coordinator.
 start_workflow(Compiled, InitialState) ->

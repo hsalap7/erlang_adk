@@ -60,6 +60,56 @@ fixed_auth_modes_allow_x_api_key_and_keyless_local_test() ->
     after 1000 -> ?assert(false)
     end.
 
+explicit_loopback_policy_allows_keyless_local_http_test() ->
+    Config = local_config(
+               {response, 200, text_response(<<"local-http">>)}),
+    Result = adk_llm_compatible:generate(
+               Config,
+               [#{role => user, content => <<"run locally">>}], []),
+    {ok, {ok, <<"local-http">>}, _} = adk_provider_result:decode(Result),
+    receive
+        {model_http_request, Request} ->
+            ?assertEqual(
+               <<"http://127.0.0.1:11434/v1/chat/completions">>,
+               maps:get(url, Request)),
+            ?assertEqual([<<"http">>], maps:get(allowed_schemes, Request)),
+            ?assertEqual([<<"127.0.0.1">>],
+                         maps:get(allowed_hosts, Request)),
+            ?assertEqual(true, maps:get(allow_private_hosts, Request)),
+            Headers = maps:from_list(maps:get(headers, Request)),
+            ?assertEqual(false,
+                         maps:is_key(<<"authorization">>, Headers)),
+            ?assertEqual(false, maps:is_key(<<"x-api-key">>, Headers))
+    after 1000 -> ?assert(false)
+    end.
+
+loopback_policy_fails_closed_on_authority_auth_or_policy_changes_test() ->
+    Base = local_base_config(),
+    ?assertEqual(ok, adk_llm_compatible:validate_config(Base)),
+    ?assertEqual(
+       {error, local_model_endpoint_loopback_http_required},
+       adk_llm_compatible:validate_config(
+         Base#{base_url => <<"http://localhost:11434/v1">>})),
+    ?assertEqual(
+       {error, local_model_endpoint_loopback_http_required},
+       adk_llm_compatible:validate_config(
+         Base#{base_url => <<"http://10.0.0.7:11434/v1">>})),
+    ?assertEqual(
+       {error, local_model_endpoint_requires_keyless_auth},
+       adk_llm_compatible:validate_config(Base#{auth_scheme => bearer})),
+    ?assertEqual(
+       {error, local_model_endpoint_requires_no_credential},
+       adk_llm_compatible:validate_config(
+         Base#{api_key => <<"must-not-be-used">>})),
+    ?assertEqual(
+       {error, local_model_endpoint_requires_private_host_access},
+       adk_llm_compatible:validate_config(
+         Base#{allow_private_hosts => false})),
+    ?assertEqual(
+       {error, invalid_local_model_endpoint_policy},
+       adk_llm_compatible:validate_config(
+         Base#{local_endpoint_policy => arbitrary_http})).
+
 stream_preserves_fragmented_and_coalesced_deltas_test() ->
     First = sse(stream_chunk(
                   #{<<"role">> => <<"assistant">>,
@@ -202,6 +252,9 @@ configuration_and_remote_errors_are_secret_safe_test() ->
 
 capability_projection_reflects_structured_output_gate_test() ->
     ?assertEqual(true,
+                 maps:get(generation_config,
+                          adk_llm_compatible:capabilities())),
+    ?assertEqual(true,
                  maps:get(structured_output,
                           adk_llm_compatible:capabilities())),
     ?assertEqual(false,
@@ -242,6 +295,18 @@ config(Fixture) ->
 base_config() ->
     #{model => <<"vendor-model">>,
       base_url => <<"https://compatible.test/v1">>}.
+
+local_config(Fixture) ->
+    (local_base_config())#{http_transport =>
+                              {adk_model_fixture_transport,
+                               {self(), Fixture}}}.
+
+local_base_config() ->
+    #{model => <<"local-model">>,
+      base_url => <<"http://127.0.0.1:11434/v1">>,
+      auth_scheme => none,
+      allow_private_hosts => true,
+      local_endpoint_policy => loopback_keyless}.
 
 text_response(Text) ->
     response(#{<<"role">> => <<"assistant">>,

@@ -7,7 +7,7 @@ for installation and executable examples.
 ## Release and project documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — cumulative changes from 0.3.0 through
-  the 0.8.0 release candidate, fixes, evidence, and visible limitations.
+  the released 0.9.0 version, fixes, evidence, and visible limitations.
 - [`TESTING.md`](TESTING.md) — deterministic, paid-provider, Phoenix, browser,
   packaging, and audit gates.
 - [`TEST_LAYOUT.md`](TEST_LAYOUT.md) — test ownership, recursive discovery,
@@ -26,6 +26,14 @@ for installation and executable examples.
 - [`README_EXAMPLE_COVERAGE.md`](README_EXAMPLE_COVERAGE.md) — current README
   recipes and sanity checks mapped to prerequisites, deterministic coverage,
   and optional live validation.
+
+The v0.9.0 deterministic release validation passed all 1,495 EUnit tests and
+all 6 deterministic Common Test cases, with warning-as-error compilation, 0
+Dialyzer warnings, and 0 undefined or deprecated call/function findings from
+`./rebar3 xref`. The Phoenix companion also passed 103 ExUnit and 40
+browser/audio tests, production assets/release, and both health smokes. The
+complete evidence boundary is recorded in
+[`VERSION_0_9_0.md`](VERSION_0_9_0.md#release-evidence-ledger).
 
 ## Runtime and workflow guides
 
@@ -53,10 +61,13 @@ for installation and executable examples.
 
 ## Providers, plugins, evaluation, and observability
 
+- [`MODEL_SUPPORT.md`](MODEL_SUPPORT.md) — adapter support tiers, remote
+  evidence boundaries, and model/server recipes including keyless local
+  Ollama/vLLM profiles and HTTPS gateways.
 - [`PROVIDER_PROFILES.md`](PROVIDER_PROFILES.md) — recommended binary profile
   configuration for Gemini, native OpenAI Responses, native Anthropic
-  Messages, compatible Chat Completions, Gemini Live, and OpenAI Realtime,
-  including credential and authority boundaries.
+  Messages, Vertex AI, compatible Chat Completions, Gemini Live, and OpenAI
+  Realtime, including credential and authority boundaries.
 - [`GEMINI_GROUNDING.md`](GEMINI_GROUNDING.md) — Google Search grounding,
   bounded provider metadata, streaming, and failure behavior.
 - [`PLUGINS_OBSERVABILITY_EVALUATION.md`](PLUGINS_OBSERVABILITY_EVALUATION.md)
@@ -85,6 +96,9 @@ not implicit release claims.
 - [`VERSION_0_8_0.md`](VERSION_0_8_0.md) — model provider profiles, native
   OpenAI/Anthropic request adapters, compatible vendors, shared model
   transport, and OpenAI Realtime bidirectional sessions.
+- [`VERSION_0_9_0.md`](VERSION_0_9_0.md) — definition-bound durable workflow
+  checkpoints, graph validation/inspection and data contracts, nested
+  continuation parity, local-compatible endpoints, and Vertex AI/ADC.
 
 ## Model and test terminology
 
@@ -101,8 +115,9 @@ enabled. A skip or quota failure is never counted as a deterministic pass.
 
 OpenAI Responses, Anthropic Messages, compatible Chat Completions, and OpenAI
 Realtime passed deterministic injected-transport/codec coverage in the 0.8
-release gate. The repository does not provide equivalent first-party paid
-Common Test suites for them. A configured key or passing fixture must not be
-reported as remote-provider success. The 2026-07-17 Gemini REST and Live
-attempts were external credential failures, recorded separately from passing
-deterministic evidence; see [`TESTING.md`](TESTING.md).
+release gate. The 0.9 release also has deterministic Vertex and local-server
+fixtures, but neither is paid or arbitrary-endpoint evidence. A configured key
+or passing fixture must not be reported as remote-provider success. The
+2026-07-17 Gemini REST and Live attempts were external credential failures,
+recorded separately from passing deterministic evidence; see
+[`TESTING.md`](TESTING.md).

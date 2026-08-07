@@ -1,9 +1,13 @@
 # Model provider profiles
 
-Erlang ADK 0.8 adds operator-owned model profiles as the recommended way to
+Erlang ADK supports operator-owned model profiles as the recommended way to
 select a vendor, model, endpoint, and credential. Public agent or Live-session
 configuration contains only bounded binary profile and model aliases. It does
 not contain a module name, raw model ID, URL, header map, or API key.
+
+See [MODEL_SUPPORT.md](MODEL_SUPPORT.md) for adapter support tiers, the
+evidence boundary, and recipes for Gemini/Gemma, Vertex AI, OpenAI, Claude,
+Ollama, vLLM, LiteLLM Proxy, and transparent Apigee deployments.
 
 This guide concerns `provider_profiles`, the model-provider registry. It is
 separate from the OAuth/tool-authentication `auth_provider_profiles` setting
@@ -14,8 +18,8 @@ introduced in 0.6.
 A profile keeps deployment authority in application configuration while
 leaving inference choices explicit:
 
-- the operator chooses a pre-existing adapter atom and an endpoint preset or
-  structured HTTPS endpoint;
+- the operator chooses a pre-existing adapter atom and an endpoint preset,
+  structured HTTPS endpoint, or the explicit keyless loopback policy;
 - the operator maps public binary aliases to concrete provider model IDs;
 - the operator chooses a credential source and authority/storage/billing
   options;
@@ -81,9 +85,9 @@ following fields:
 | --- | --- |
 | `request_adapter` | Optional existing atom implementing request generation and streaming. |
 | `live_adapter` | Optional existing atom implementing the Live provider contract. |
-| `endpoint` | `gemini`, `openai`, `anthropic`, `local`, or a structured custom HTTPS endpoint. |
+| `endpoint` | `gemini`, `openai`, `anthropic`, `vertex`, `local`, a structured custom HTTPS endpoint, or the exact `loopback_keyless` map below. |
 | `models` | One or more binary aliases mapped to a concrete binary model ID or to `#{id => ModelId, capabilities => Map}`. |
-| `credential` | `none`, `{env, Name}`, `{application_env, App, Key}`, or `{literal, Binary}`. |
+| `credential` | `none`, `google_adc`, `{env, Name}`, `{application_env, App, Key}`, or `{literal, Binary}`. |
 | `capabilities` | Optional bounded, secret-free profile/model metadata. It may narrow, but must not widen, adapter behavior. |
 | `request_options` | Optional operator-locked adapter options described below. |
 
@@ -100,15 +104,40 @@ A custom endpoint is data, not a URL string:
   base_path => <<"/v1">>}
 ```
 
-Only HTTPS custom endpoints are accepted by profiles. Userinfo, query,
-fragment, control characters, and `..` path segments are not accepted. Each
-adapter appends its own fixed operation path, such as `/responses`,
-`/messages`, or `/chat/completions`. Redirects are disabled, TLS peer and
-hostname verification are mandatory, response sizes and deadlines are
-bounded, each aggregate response-header or trailer block is capped at 64 KiB
-in both synchronous and streaming Gun paths, and non-global resolved addresses
-are rejected by default. A profile caller cannot enable private-address access
-or replace the HTTP transport.
+Ordinary custom endpoints are HTTPS only. Userinfo, query, fragment, control
+characters, and `..` path segments are not accepted. Each adapter appends its
+own fixed operation path, such as `/responses`, `/messages`, or
+`/chat/completions`. Redirects are disabled, TLS peer and hostname verification
+are mandatory for HTTPS, response sizes and deadlines are bounded, each
+aggregate response-header or trailer block is capped at 64 KiB in both
+synchronous and streaming Gun paths, and non-global resolved addresses are
+rejected by default. A profile caller cannot enable private-address access or
+replace the HTTP transport.
+
+0.9.0 adds one separate HTTP exception for a keyless OpenAI-compatible server on
+the same machine:
+
+```erlang
+#{scheme => http,
+  host => <<"127.0.0.1">>,
+  port => 11434,
+  base_path => <<"/v1">>,
+  policy => loopback_keyless}
+```
+
+The host must be the exact numeric loopback `127.0.0.1` or `::1`;
+`localhost`, LAN/container addresses, wildcard/listen addresses, and arbitrary
+private hosts are rejected. This endpoint requires
+`request_adapter => adk_llm_compatible`, no Live adapter,
+`credential => none`, and locked `request_options => #{auth_scheme => none}`.
+Materialization adds an internal policy marker and private-host permission that
+public callers cannot set. The compatible adapter rechecks those values and
+the exact loopback HTTP URL before dispatch. Redirects remain disabled and the
+transport remains pinned to the exact scheme and host.
+
+The older `endpoint => local` atom remains a preset owned by a trusted custom
+adapter; it does not authorize HTTP for `adk_llm_compatible` and is not an
+alias for this policy map.
 
 The bundled adapter/preset pairs are:
 
@@ -117,7 +146,8 @@ The bundled adapter/preset pairs are:
 | `adk_llm_gemini` | `gemini` or a structured HTTPS endpoint |
 | `adk_llm_openai` | `openai` or a structured HTTPS endpoint |
 | `adk_llm_anthropic` | `anthropic` or a structured HTTPS endpoint |
-| `adk_llm_compatible` | a structured HTTPS endpoint |
+| `adk_llm_vertex` | `vertex` only; origin is derived from the full publisher-model resource |
+| `adk_llm_compatible` | a structured HTTPS endpoint, or the exact keyless loopback map |
 | `adk_live_gemini` | `gemini` only |
 | `adk_live_openai` | `openai` only |
 
@@ -129,6 +159,7 @@ Bundled request adapters accept only these profile-level locked options:
 | `adk_llm_anthropic` | `anthropic_version` when the map is non-empty |
 | `adk_llm_compatible` | optional empty map (defaults to bearer/auto), or `auth_scheme` plus an optional locked `response_format` mode |
 | `adk_llm_gemini` | no profile request options in 0.8 |
+| `adk_llm_vertex` | no profile request options in 0.9 |
 
 Unknown fields fail profile validation; they are not forwarded to a provider.
 
@@ -155,6 +186,15 @@ is resolved only if that profile generation still matches. A concurrent
 profile replacement fails with `provider_profile_changed` instead of combining
 old authority with a new credential source. Error values and public profile
 projections never contain credential material.
+
+`google_adc` is accepted only for `request_adapter => adk_llm_vertex` with the
+`vertex` endpoint and no Live adapter. It resolves to a fresh OAuth bearer at
+request time through the fixed, bounded
+`gcloud auth application-default print-access-token --quiet` command. This is
+the current local ADC bridge, not a claim of full authentication-library ADC
+precedence or attached-service-account metadata support. Ordinary environment,
+application-environment, and literal sources are treated as already-minted
+OAuth access tokens for Vertex; the operator must rotate those before expiry.
 
 For direct legacy native OpenAI and Anthropic configurations, the conventional
 ambient environment key is read only for the exact official base URL. A custom
@@ -220,12 +260,45 @@ Protocol references: [Messages API](https://platform.claude.com/docs/en/api/mess
 [streaming](https://platform.claude.com/docs/en/build-with-claude/streaming),
 and [API versioning](https://platform.claude.com/docs/en/api/versioning).
 
+## Native Vertex AI GenerateContent profile
+
+`adk_llm_vertex` accepts only a complete v1 Google publisher-model resource and
+derives the fixed Vertex HTTPS origin from its location:
+
+```erlang
+#{<<"vertex-prod">> =>
+      #{request_adapter => adk_llm_vertex,
+        endpoint => vertex,
+        models =>
+            #{<<"chat">> =>
+                  <<"projects/PROJECT_ID/locations/us-central1/",
+                    "publishers/google/models/CONFIGURED_MODEL_ID">>},
+        credential => google_adc}}
+```
+
+The supported caller options are the bounded sampling/token/stop settings,
+response MIME type/schema, safety settings, content and stream-event limits,
+and request/response bounds implemented by the adapter. `candidate_count`,
+thinking controls, built-in tools, cached content, Live configuration, custom
+origins, partner publishers, endpoint resources, token-provider handles, and
+transport overrides are rejected. Capability metadata can narrow this ceiling
+but cannot raise it.
+
+The stream method uses the adapter-owned `alt=sse` query after the ordinary
+query-free path validation; general model HTTP paths still reject caller query
+or fragment data. This profile recipe and its deterministic tests are not a
+remote Vertex verification result.
+
+Protocol references: [Vertex AI GenerateContent](https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference)
+and [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials).
+
 ## OpenAI-compatible profile
 
 `adk_llm_compatible` targets a deliberately narrow Chat Completions shape. It
-does not mean arbitrary HTTP compatibility. The operator owns a structured
-HTTPS base endpoint and one of three authentication modes: `bearer`,
-`x_api_key`, or `none`.
+does not mean arbitrary HTTP compatibility. The operator normally owns a
+structured HTTPS base endpoint and one of three authentication modes:
+`bearer`, `x_api_key`, or `none`. The only supported HTTP form is the distinct
+keyless numeric-loopback policy above.
 
 ```erlang
 #{<<"vendor-prod">> =>
@@ -253,6 +326,15 @@ not implement Chat Completions structured output. Do not claim audio, response
 formats, tool-call streaming, usage fields, or other optional vendor behavior
 until the target service has been tested against the deterministic codec
 contract and an opt-in provider smoke test.
+
+For local development with Ollama or vLLM, configure the server's
+OpenAI-compatible Chat Completions surface and use the `loopback_keyless` map;
+the adapter appends `/chat/completions` to `base_path`. This is deterministic
+profile/transport support, not proof that a particular server/model implements
+optional tools, multimodal input, structured output, or streaming details.
+Use an ordinary authenticated HTTPS profile for LiteLLM Proxy or other remote
+gateways. See [MODEL_SUPPORT.md](MODEL_SUPPORT.md) for complete recipes and
+the evidence tiers.
 
 ## Gemini and OpenAI Live profiles
 
@@ -332,6 +414,9 @@ and [Gemini Live](https://ai.google.dev/api/live).
   credential sources operator-owned. OpenAI Realtime's bounded
   `safety_identifier` remains an allowlisted per-request semantic field, not an
   arbitrary header-map escape hatch.
+- Use `loopback_keyless` only for a same-machine, intentionally unauthenticated
+  compatible server. It is not a general private-network or development TLS
+  bypass.
 - Use separate profile IDs when tenant, region, billing project, retention,
   or capability policy differs.
 - Validate all profiles at startup with `adk_provider_registry:profiles/0`

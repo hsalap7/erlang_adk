@@ -28,6 +28,37 @@ live_profile_resolution_is_operator_owned_test() ->
                        binary:match(term_to_binary(Resolved), Secret))
       end).
 
+live_profile_capabilities_are_constrained_by_adapter_test() ->
+    Profile = (openai_profile(<<"secret">>))#{
+                capabilities =>
+                    #{live => true,
+                      input_modalities => [text],
+                      profile_only_claim => true}},
+    with_profiles(
+      #{<<"openai-live">> => Profile},
+      fun() ->
+          {ok, Resolved} = adk_provider_registry:resolve_live_config(
+                             <<"openai-live">>, #{model => <<"voice">>}),
+          Capabilities = maps:get(capabilities, Resolved),
+          ?assertEqual(true, maps:get(live, Capabilities)),
+          ?assertEqual([text], maps:get(input_modalities, Capabilities)),
+          ?assertEqual(24000,
+                       maps:get(input_audio_sample_rate, Capabilities)),
+          ?assertNot(maps:is_key(profile_only_claim, Capabilities))
+      end).
+
+live_profile_disabled_capability_is_enforced_test() ->
+    Profile = (openai_profile(<<"secret">>))#{
+                capabilities => #{live => false}},
+    with_profiles(
+      #{<<"openai-live">> => Profile},
+      fun() ->
+          ?assertEqual(
+             {error, {provider_profile_capability_unavailable, live}},
+             adk_provider_registry:resolve_live_config(
+               <<"openai-live">>, #{model => <<"voice">>}))
+      end).
+
 live_profile_authority_overrides_are_rejected_test() ->
     Secret = <<"profile-authority-secret">>,
     with_profiles(

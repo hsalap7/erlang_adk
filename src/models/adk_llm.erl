@@ -196,6 +196,8 @@ materialize_profile_config(
     end.
 
 put_profile_credential(none, Config) -> Config;
+put_profile_credential(google_adc, Config) ->
+    Config#{credential_source => google_adc};
 put_profile_credential(Credential, Config) when is_binary(Credential) ->
     Config#{api_key => Credential}.
 
@@ -206,10 +208,16 @@ endpoint_config(openai) ->
     {ok, #{base_url => <<"https://api.openai.com/v1">>}};
 endpoint_config(anthropic) ->
     {ok, #{base_url => <<"https://api.anthropic.com/v1">>}};
+endpoint_config(vertex) ->
+    %% The native adapter derives the one permitted Google API origin from the
+    %% location embedded in its complete publisher-model resource.
+    {ok, #{}};
 endpoint_config(local) ->
     %% The trusted local adapter owns its loopback URL and port. Public
     %% profile selection still cannot override it.
     {ok, #{}};
+endpoint_config(#{policy := loopback_keyless} = Endpoint) ->
+    adk_local_model_endpoint:materialize(Endpoint);
 endpoint_config(#{scheme := https, host := Host, port := Port,
                   base_path := BasePath}) ->
     Authority = endpoint_authority(Host, Port),

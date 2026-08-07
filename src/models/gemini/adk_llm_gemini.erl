@@ -21,7 +21,9 @@
 
 -export([generate/3, stream/4, stream_content/4,
          capabilities/0, validate_config/1,
-         cache_provider/0, cache_prefix/3, public_config/1]).
+         cache_provider/0, cache_prefix/3, public_config/1,
+         encode_generate_content/3, decode_generate_content/2,
+         decode_stream_generate_content/2]).
 
 -define(DEFAULT_MODEL, <<"gemini-3.1-flash-lite">>).
 
@@ -91,6 +93,74 @@ cache_prefix(Config, Memory, Tools) ->
 -spec public_config(map()) -> map().
 public_config(Config) when is_map(Config) ->
     maps:remove(context_cache, adk_secret_redactor:redact(Config)).
+
+%% @doc Pure GenerateContent wire encoder shared by Google's public Gemini API
+%% and the native Vertex request adapter. It owns no URL or credential policy.
+-spec encode_generate_content(map(), list(), list()) ->
+    {ok, map()} | {error, term()}.
+encode_generate_content(Config, Memory, Tools)
+  when is_map(Config), is_list(Memory), is_list(Tools) ->
+    case validate_content_limits(Config) of
+        ok -> build_payload(Config, Memory, Tools);
+        {error, _} = Error -> Error
+    end;
+encode_generate_content(_Config, _Memory, _Tools) ->
+    {error, invalid_gemini_generate_content_input}.
+
+%% @doc Decode a complete GenerateContent response without any Gemini context
+%% cache lifecycle. Callers which expose a different provider identity must
+%% re-tag the checked provider-result envelope at their own boundary.
+-spec decode_generate_content(binary(), map()) -> term().
+decode_generate_content(Body, Config)
+  when is_binary(Body), is_map(Config) ->
+    case normalized_content_limits(Config) of
+        {ok, Limits} -> decode_response(Body, Limits, disabled);
+        {error, _} = Error -> Error
+    end;
+decode_generate_content(_Body, _Config) ->
+    {error, invalid_gemini_generate_content_response}.
+
+%% @doc Decode one JSON value from streamGenerateContent. Accounting-only
+%% frames are represented as `none' and never synthesize an empty content
+%% delta. SSE framing remains the responsibility of the transport adapter.
+-spec decode_stream_generate_content(binary(), map()) ->
+    {ok, none | adk_content:content()} | {error, term()}.
+decode_stream_generate_content(Data, Config)
+  when is_binary(Data), is_map(Config) ->
+    case normalized_content_limits(Config) of
+        {ok, Limits} -> decode_stream_json(Data, Limits);
+        {error, _} = Error -> Error
+    end;
+decode_stream_generate_content(_Data, _Config) ->
+    {error, invalid_stream_response}.
+
+decode_stream_json(Data, Limits) ->
+    try jsx:decode(Data, [return_maps]) of
+        Response when is_map(Response) ->
+            %% Reuse the native stream's bounded usage-metadata validator even
+            %% though this pure decoder intentionally discards accounting.
+            %% Otherwise a malformed usage-only object would be accepted as a
+            %% valid empty model delta by consumers such as Vertex.
+            case {stream_response_parts(Response),
+                  response_cache_usage(Response)} of
+                {{ok, []}, {ok, _Usage}} -> {ok, none};
+                {{ok, Parts}, {ok, _Usage}} ->
+                    adk_llm_gemini_content:decode(Parts, Limits);
+                {{error, _} = Error, _} -> Error;
+                {_, {error, _} = Error} -> Error
+            end;
+        _ -> {error, invalid_stream_response}
+    catch
+        _:_ -> {error, invalid_stream_response_json}
+    end.
+
+normalized_content_limits(Config) ->
+    case adk_content:normalize_limits(
+           maps:get(content_limits, Config, #{})) of
+        {ok, Limits} -> {ok, Limits};
+        {error, Reason} ->
+            {error, {invalid_gemini_option, content_limits, Reason}}
+    end.
 
 validate_config(Config) when is_map(Config) ->
     Validators = [validate_known_config_keys(Config)] ++

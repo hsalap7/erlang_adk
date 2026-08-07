@@ -8,9 +8,10 @@ Security reports are welcome and should be handled privately.
 
 | Version | Security support |
 | --- | --- |
-| 0.8.x | Current supported release line |
-| 0.7.x | Previous release line; upgrade to 0.8.x for provider-profile and transport hardening |
-| 0.3.x-0.6.x | Historical development milestones; upgrade to 0.8.x |
+| 0.9.x | Current supported release line |
+| 0.8.x | Previous release line; upgrade to 0.9.x for graph durability and Vertex AI support |
+| 0.7.x | Historical release line; upgrade to 0.9.x |
+| 0.3.x-0.6.x | Historical development milestones; upgrade to 0.9.x |
 | Earlier | Unsupported |
 
 The repository may contain development branches for older milestones. A
@@ -88,8 +89,9 @@ boundary is documented in the
 
 ## Runtime security baseline
 
-Version 0.8 requires Erlang/OTP 27.3.4.14 or a later security-supported OTP
-release. In particular, OTP 27.3.4.14 carries SSL 11.2.12.10, which fixes
+Versions 0.8 and 0.9 require Erlang/OTP 27.3.4.14 or a later
+security-supported OTP release. In particular, OTP 27.3.4.14 carries SSL
+11.2.12.10, which fixes
 [CVE-2026-54891](https://cna.erlef.org/cves/CVE-2026-54891.html), a TLS-client
 plaintext-injection vulnerability affecting earlier OTP 27 patch levels. This
 project is a TLS client for Gemini, OIDC, MCP, OpenAPI, A2A, and OTLP, so the
@@ -99,25 +101,31 @@ that exact patch level.
 
 ## Known dependency advisories
 
-As of 2026-07-15, both `rebar.lock` and the Phoenix companion's `mix.lock`
-resolve Cowlib 2.18.0. Running `mix hex.audit` in the companion reports two
-unresolved advisories:
+As of 2026-08-06, both `rebar.lock` and the Phoenix companion's `mix.lock`
+resolve Cowboy 2.18.0, Cowlib 2.19.0, and Gun 2.4.1; the companion additionally
+resolves Bandit 1.12.4. These upgrades remove the newly reported Bandit
+EEF-CVE-2026-65623, Cowboy EEF-CVE-2026-65624, and Cowlib
+EEF-CVE-2026-59248 findings. Running `mix hex.audit` still reports three
+package findings for two unresolved advisories:
 
 - [EEF-CVE-2026-43969](https://cna.erlef.org/osv/EEF-CVE-2026-43969.json)
   (also GHSA-g2wm-735q-3f56), a low-severity cookie request-header injection
   issue involving unvalidated `cow_cookie:cookie/1` input; and
 - [EEF-CVE-2026-43966](https://cna.erlef.org/osv/EEF-CVE-2026-43966.json), a
   medium-severity HTTP response-splitting issue involving non-VCHAR input to
-  Cowlib's structured-header escaping helper.
+  Cowlib's structured-header escaping helper. Hex reports this once for
+  Cowlib and once for Gun as GHSA-w4f7-4cxr-rv3c.
 
-Cowlib 2.18.0 is still the latest official release on that date, and neither
-advisory has an official fixed release. A preliminary fork patch addresses
-only EEF-CVE-2026-43969 and is therefore not a complete replacement.
+Cowlib 2.19.0 fixes the separate HPACK/QPACK prefixed-integer denial of service,
+but neither remaining advisory has an official Cowlib fixed release. A
+preliminary fork patch addresses only EEF-CVE-2026-43969 and is therefore not a
+complete replacement.
 
 The checked companion does not configure Gun's cookie store. Locked Cowboy
-2.17.0 and Gun 2.4.1 use their invalid-header rejection defaults, and the
-application validates and bounds browser/provider inputs before constructing
-responses. These controls reduce known reachability; they do **not** remove
+2.18.0 and Gun 2.4.1 include the EEF-documented invalid-header rejection
+protections for EEF-CVE-2026-43966, and the application validates and bounds
+browser/provider inputs before constructing responses. These controls reduce
+known reachability; they do **not** remove
 the vulnerable Cowlib routines, make the audit pass, or justify disabling
 TLS/header validation.
 
@@ -125,8 +133,9 @@ Until an official release resolves both advisories:
 
 1. keep both lock files committed and run `mix hex.audit` for every release;
 2. record the non-zero result as a release exception, not a pass;
-3. run `scripts/verify_phoenix_hex_audit.exs`, whose exact two-advisory
-   allowlist fails if a new advisory appears or the exception becomes stale;
+3. run `scripts/verify_phoenix_hex_audit.exs`, whose exact allowlist of three
+   package findings covers only the two unresolved advisories and fails if a
+   new advisory appears or the exception becomes stale;
 4. avoid adding an application path that sends untrusted cookie values to
    `cow_cookie:cookie/1` or unvalidated bytes to Cowlib response-header
    builders;

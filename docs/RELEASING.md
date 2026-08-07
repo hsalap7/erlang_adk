@@ -2,8 +2,10 @@
 
 This is the maintainer checklist for preparing, approving, tagging, and
 publishing a release. The commands below describe actions to take only after
-their prerequisites and approvals are satisfied. This document does not claim
-that `v0.8.0` has been tagged, pushed, or published.
+their prerequisites and approvals are satisfied. The v0.9.0 release status and
+evidence are recorded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md) and the
+[`CHANGELOG`](../CHANGELOG.md); running this checklist does not publish a later
+release by itself.
 
 ## 1. Establish the release candidate
 
@@ -84,6 +86,14 @@ intentionally skipped 22 paid cases in the deterministic command. Do not
 approve a later candidate by copying either release's numbers or by running
 only the focused modules.
 
+The released v0.9.0 deterministic validation compiled 242 production and 271
+test modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common Test
+cases, and completed with 0 Dialyzer warnings and 0 undefined or deprecated
+call/function findings from `./rebar3 xref`. Its Phoenix companion passed
+103 ExUnit and 40 browser/audio tests, production assets/release, and both
+health smokes. Coverage, package, escript/doctor, and paid-provider evidence
+remains separately bounded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md).
+
 The seven-module post-audit repair regression set passed 67/67, covering
 contiguous in-flight multi-frame priority ordering, Anthropic's minimum
 `max_tokens` value of one, and the 64 KiB synchronous/streaming Gun
@@ -129,11 +139,18 @@ trusted-proxy and verified direct-TLS loopback smokes. Each smoke required HTTP
 200 from `/health` and clean shutdown. Follow the exact deployment setup in
 the companion README.
 
-`mix hex.audit` currently returns non-zero for EEF-CVE-2026-43969 and
-EEF-CVE-2026-43966 in Cowlib 2.18.0. This is a known release exception, not a
-pass. The wrapper must return zero only after matching that exact known set;
-any new or missing finding fails so the exception and documentation are
-reviewed. Before approval, the release owner must either:
+The v0.9.0 companion repeated that complete gate successfully with the patched
+dependency locks: 103 ExUnit tests, 40 browser/audio tests, production assets,
+release assembly, and both health smokes passed.
+
+The v0.9.0 dependency refresh moved Bandit to 1.12.4, Cowboy to 2.18.0, and
+Cowlib to 2.19.0, removing EEF-CVE-2026-65623, EEF-CVE-2026-65624, and
+EEF-CVE-2026-59248 from the audit. `mix hex.audit` remains non-zero for
+EEF-CVE-2026-43969 and EEF-CVE-2026-43966 in Cowlib; Gun repeats the latter as
+GHSA-w4f7-4cxr-rv3c. This is a known release exception, not a pass. The wrapper
+must return zero only after matching those exact three package findings; any
+new or missing finding fails so the exception and documentation are reviewed.
+Before approval, the release owner must either:
 
 - use an official dependency release that fixes both advisories and rerun the
   complete gate; or
@@ -214,9 +231,9 @@ signed tag where maintainer signing is configured; otherwise use an annotated
 tag and preserve the external approval record:
 
 ```bash
-git tag -s v0.8.0 -m "Erlang ADK 0.8.0"
+git tag -s v0.9.0 -m "Erlang ADK 0.9.0"
 # or, when signing is unavailable:
-git tag -a v0.8.0 -m "Erlang ADK 0.8.0"
+git tag -a v0.9.0 -m "Erlang ADK 0.9.0"
 ```
 
 Verify the tag points to the approved commit, then push the branch/tag through
@@ -224,9 +241,9 @@ the repository's protected release process. Publication is a separate
 credentialed action:
 
 ```bash
-git show --no-patch --decorate v0.8.0
-git push origin version_0.8.0
-git push origin v0.8.0
+git show --no-patch --decorate v0.9.0
+git push origin version_0.9.0
+git push origin v0.9.0
 ./rebar3 hex publish
 ```
 

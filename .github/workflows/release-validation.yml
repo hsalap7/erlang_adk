@@ -122,8 +122,9 @@ jobs:
           ../../scripts/smoke_phoenix_release.sh proxy 4101
           ../../scripts/smoke_phoenix_release.sh tls 4443
 
-      # The advisory wrapper succeeds only for the exact two documented Cowlib
-      # findings. New findings, a clean audit, or any stale exception fail the
-      # job and force a dependency/security-document review.
+      # The advisory wrapper succeeds only for the exact three package findings
+      # covering the two documented unresolved Cowlib advisories. New findings,
+      # a clean audit, or any stale exception fail the job and force a
+      # dependency/security-document review.
       # Paid Gemini REST and Live suites are also intentionally absent: pull
       # requests never receive provider credentials or incur provider charges.

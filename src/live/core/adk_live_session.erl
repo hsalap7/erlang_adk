@@ -1559,6 +1559,7 @@ resolve_live_selection(ProfileId, ProviderConfig, TransportOpts, Config)
                    ProfileId, ProviderConfig) of
                 {ok, #{adapter := Provider, endpoint := Endpoint,
                        model := Model, options := ProviderOptions,
+                       capabilities := Capabilities,
                        profile_snapshot := ProfileSnapshot,
                        transport := Transport}} ->
                     case profile_transport_options(
@@ -1577,7 +1578,8 @@ resolve_live_selection(ProfileId, ProviderConfig, TransportOpts, Config)
                                            credential_profile => ProfileId,
                                            credential_profile_snapshot =>
                                                ProfileSnapshot,
-                                           provider_endpoint => Endpoint}};
+                                           provider_endpoint => Endpoint,
+                                           capabilities => Capabilities}};
                                 false ->
                                     {error, invalid_live_session_config}
                             end;
@@ -1656,7 +1658,7 @@ validate_live_selection(Selection0, Values, Config) ->
                             maps:get(max_ingress_bytes, Values)),
                           adk_live_observability:validate_config(
                             maps:get(observability, Config, disabled)),
-                          trusted_input_audio_sample_rate(Provider)} of
+                          trusted_input_audio_sample_rate(Selection)} of
                         {{ok, ToolExecution}, {ok, Observability},
                          {ok, InputAudioSampleRate}} ->
                             Runtime = maps:without(
@@ -1695,18 +1697,24 @@ finalize_transport_options(
 finalize_transport_options(Selection, _ProviderConfig) ->
     {ok, Selection}.
 
-trusted_input_audio_sample_rate(Provider) ->
+trusted_input_audio_sample_rate(
+  #{provider := Provider, capabilities := Capabilities}) ->
+    trusted_input_audio_sample_rate(Provider, Capabilities);
+trusted_input_audio_sample_rate(#{provider := Provider}) ->
     try Provider:capabilities() of
         Capabilities when is_map(Capabilities) ->
-            Rate = maps:get(input_audio_sample_rate, Capabilities,
-                            default_input_audio_sample_rate(Provider)),
-            case bounded(Rate, 8000, 192000) of
-                true -> {ok, Rate};
-                false -> {error, invalid_live_provider_capabilities}
-            end;
+            trusted_input_audio_sample_rate(Provider, Capabilities);
         _ -> {error, invalid_live_provider_capabilities}
     catch
         _:_ -> {error, invalid_live_provider_capabilities}
+    end.
+
+trusted_input_audio_sample_rate(Provider, Capabilities) ->
+    Rate = maps:get(input_audio_sample_rate, Capabilities,
+                    default_input_audio_sample_rate(Provider)),
+    case bounded(Rate, 8000, 192000) of
+        true -> {ok, Rate};
+        false -> {error, invalid_live_provider_capabilities}
     end.
 
 default_input_audio_sample_rate(adk_live_openai) -> 24000;
@@ -1721,6 +1729,8 @@ prepare_session_credential(
     case adk_provider_credential:resolve_snapshot(
            ProfileId, ProfileSnapshot) of
         {ok, none} -> prepare_transport_credential(Sanitized);
+        {ok, google_adc} ->
+            {error, unsupported_live_provider_credential};
         {ok, ApiKey} when is_binary(ApiKey) ->
             Options = maps:get(transport_opts, Sanitized),
             prepare_transport_credential(

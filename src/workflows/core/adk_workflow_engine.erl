@@ -3,15 +3,23 @@
 
 -export([execute/5]).
 
+-define(LIFECYCLE_SEQUENCE_KEY, '$adk_workflow_lifecycle_sequence').
+-define(CHECKPOINT_SEQUENCE_KEY, '$adk_workflow_checkpoint_sequence').
+-define(CHECKPOINT_PARENT_KEY, '$adk_workflow_checkpoint_parent').
+-define(ATTEMPTS_KEY, '$adk_workflow_attempts').
+-define(ATTEMPT_KEY_OVERRIDE, '$adk_workflow_attempt_key_override').
+
 %% The engine traps worker exits so one crashing action is an error value. All
 %% workers are also linked: an untrappable kill of the engine therefore cannot
 %% orphan blocked branch or callback processes.
 execute(Coordinator, Compiled, InitialState, Runtime, Checkpoint) ->
     process_flag(trap_exit, true),
+    initialize_execution_metadata(Checkpoint),
     CoordinatorRef = erlang:monitor(process, Coordinator),
     Env0 = (env_from_checkpoint(Coordinator, Compiled, InitialState,
                                 Runtime, Checkpoint))#{
                coordinator_ref => CoordinatorRef},
+    emit_lifecycle(<<"workflow_started">>, #{}, Env0),
     Result = try
         case deadline_expired(maps:get(deadline, Env0)) of
             true -> {timed_out, Env0};
@@ -24,11 +32,14 @@ execute(Coordinator, Compiled, InitialState, Runtime, Checkpoint) ->
     end,
     {Outcome0, FinalEnv0} = normalize_execution_result(Result),
     {Outcome, FinalEnv} = validate_completed_output(Outcome0, FinalEnv0),
+    emit_terminal_node_failure(Outcome, FinalEnv),
     FinalCheckpoint = case Outcome of
         {completed, FinalState} ->
-            checkpoint(FinalEnv#{state => FinalState}, true);
-        _ -> checkpoint(FinalEnv, false)
+            terminal_checkpoint(FinalEnv#{state => FinalState}, true);
+        _ -> terminal_checkpoint(FinalEnv, false)
     end,
+    emit_lifecycle(<<"workflow_terminal">>,
+                   #{<<"outcome">> => outcome_name(Outcome)}, FinalEnv),
     Coordinator ! {adk_workflow_terminal, self(), Outcome,
                    FinalCheckpoint},
     erlang:demonitor(CoordinatorRef, [flush]),
@@ -69,7 +80,10 @@ sequential_from(Index, Steps, Env) when Index > length(Steps) ->
 sequential_from(Index, Steps, Env0) ->
     Step = lists:nth(Index, Steps),
     Id = maps:get(id, Step),
-    case consume_steps(1, Env0) of
+    emit_lifecycle(<<"node_started">>,
+                   #{<<"node_id">> => Id,
+                     <<"node_type">> => <<"sequential_step">>}, Env0),
+    case consume_action_step(Id, Env0) of
         {error, Reason, Env1} -> {failed, Reason, Env1};
         {ok, Env1} ->
             Context = action_context(Id, Env1, sequential_input(Env1)),
@@ -93,6 +107,8 @@ sequential_from(Index, Steps, Env0) ->
                 {ok, {nested_pause, Pause, ChildCheckpoint}} ->
                     sequential_pause_nested(
                       Index, Id, Pause, ChildCheckpoint, Env1);
+                {ok, {pause, Pause, Delta}} ->
+                    sequential_pause_step(Index, Id, Pause, Delta, Env1);
                 {ok, OtherControl} ->
                     {failed,
                      {step_failed, Id,
@@ -107,6 +123,10 @@ commit_sequential_delta(Index, Steps, Delta, Env1) ->
             Cursor = #{<<"type">> => <<"sequential">>,
                        <<"next_index">> => Next},
             Env3 = commit(Cursor, Env2),
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> =>
+                                 maps:get(id, lists:nth(Index, Steps))},
+                           Env3),
             sequential_from(Next, Steps, Env3);
         {error, Reason} ->
             Id = maps:get(id, lists:nth(Index, Steps)),
@@ -120,6 +140,10 @@ commit_sequential_output(Index, Steps, Output, Delta, Env1) ->
             Cursor = #{<<"type">> => <<"sequential">>,
                        <<"next_index">> => Next},
             Env3 = commit(Cursor, Env2#{output => Output}),
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> =>
+                                 maps:get(id, lists:nth(Index, Steps))},
+                           Env3),
             sequential_from(Next, Steps, Env3);
         {error, Reason} ->
             Id = maps:get(id, lists:nth(Index, Steps)),
@@ -138,10 +162,33 @@ sequential_pause_nested(Index, Id, Pause0, ChildCheckpoint, Env) ->
     Cursor = #{<<"type">> => <<"sequential">>,
                <<"next_index">> => Index,
                <<"phase">> => <<"awaiting_resume">>,
+               <<"resume_kind">> => <<"nested_workflow">>,
                <<"pause">> => Pause,
                <<"nested_checkpoint">> => ChildCheckpoint},
     Env1 = commit(Cursor, Env),
+    emit_lifecycle(<<"workflow_paused">>,
+                   #{<<"node_id">> => Id,
+                     <<"pause_kind">> => <<"nested_workflow">>}, Env1),
     {paused, Pause, Env1}.
+
+sequential_pause_step(Index, Id, Pause0, Delta, Env) ->
+    case normalize_delta(Delta) of
+        {error, Reason} -> {failed, {step_failed, Id, Reason}, Env};
+        {ok, SafeDelta} ->
+            Pause = Pause0#{<<"step_id">> => Id},
+            Cursor = #{<<"type">> => <<"sequential">>,
+                       <<"next_index">> => Index,
+                       <<"phase">> => <<"awaiting_resume">>,
+                       <<"resume_kind">> =>
+                           pause_resume_kind(Pause, <<"step">>),
+                       <<"pause">> => Pause,
+                       <<"paused_delta">> => SafeDelta},
+            Env1 = commit(Cursor, Env),
+            emit_lifecycle(<<"workflow_paused">>,
+                           #{<<"node_id">> => Id,
+                             <<"pause_kind">> => <<"step">>}, Env1),
+            {paused, Pause, Env1}
+    end.
 
 sequential_resume_nested(Index, Steps, Env) ->
     Cursor = maps:get(cursor, Env),
@@ -150,34 +197,71 @@ sequential_resume_nested(Index, Steps, Env) ->
         {ok, Input} ->
             Step = lists:nth(Index, Steps),
             Id = maps:get(id, Step),
-            {workflow, Child, Opts} = maps:get(run, Step),
-            ChildCheckpoint = maps:get(<<"nested_checkpoint">>, Cursor),
-            Context = action_context(Id, Env, sequential_input(Env)),
-            Resume = fun(_State, _AttemptContext) ->
-                resume_nested_workflow(Child, Opts, ChildCheckpoint,
-                                       Input, Context)
-            end,
-            case run_action(Resume, maps:get(state, Env), Context,
-                            action_policy(Step), Env) of
-                timed_out -> {timed_out, Env};
-                {ok, {nested_pause, Pause, NextChildCheckpoint}} ->
-                    sequential_pause_nested(
-                      Index, Id, Pause, NextChildCheckpoint, Env);
-                {ok, {output, Output, Delta}} ->
+            emit_lifecycle(<<"workflow_resumed">>,
+                           #{<<"node_id">> => Id}, Env),
+            case maps:get(<<"resume_kind">>, Cursor,
+                          <<"nested_workflow">>) of
+                <<"step">> ->
                     commit_sequential_output(
-                      Index, Steps, Output, Delta, Env);
-                {error, Reason} ->
-                    {failed, {step_failed, Id, Reason}, Env};
-                {ok, Control} ->
-                    {failed,
-                     {step_failed, Id,
-                      {invalid_control, control_name(Control)}}, Env}
+                      Index, Steps, Input,
+                      maps:get(<<"paused_delta">>, Cursor, #{}), Env);
+                <<"tool_confirmation">> ->
+                    sequential_resume_tool_confirmation(
+                      Index, Id, Step, Steps, Input, Env);
+                <<"nested_workflow">> ->
+                    sequential_resume_nested_workflow(
+                      Index, Id, Step, Steps, Input, Env)
             end
+    end.
+
+sequential_resume_nested_workflow(Index, Id, Step, Steps, Input, Env) ->
+    Cursor = maps:get(cursor, Env),
+    {workflow, Child, Opts} = maps:get(run, Step),
+    ChildCheckpoint = maps:get(<<"nested_checkpoint">>, Cursor),
+    Context = action_context(Id, Env, sequential_input(Env)),
+    Resume = fun(_State, _AttemptContext) ->
+        resume_nested_workflow(Child, Opts, ChildCheckpoint, Input, Context)
+    end,
+    case run_action(Resume, maps:get(state, Env), Context,
+                    action_policy(Step), Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {nested_pause, Pause, NextChildCheckpoint}} ->
+            sequential_pause_nested(
+              Index, Id, Pause, NextChildCheckpoint, Env);
+        {ok, {output, Output, Delta}} ->
+            commit_sequential_output(Index, Steps, Output, Delta, Env);
+        {error, Reason} -> {failed, {step_failed, Id, Reason}, Env};
+        {ok, Control} ->
+            {failed,
+             {step_failed, Id,
+             {invalid_control, control_name(Control)}}, Env}
+    end.
+
+sequential_resume_tool_confirmation(Index, Id, Step, Steps, Input, Env) ->
+    case run_resumed_tool_confirmation(
+           Step, Id, sequential_input(Env), Input, Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {ok, Delta}} ->
+            commit_sequential_delta(Index, Steps, Delta, Env);
+        {ok, {output, Output, Delta}} ->
+            commit_sequential_output(Index, Steps, Output, Delta, Env);
+        {ok, {stop, Output, Delta}} ->
+            complete_sequential_step(Id, Output, Delta, Env);
+        {ok, {complete, Output, Delta}} ->
+            complete_sequential_step(Id, Output, Delta, Env);
+        {ok, {pause, Pause, Delta}} ->
+            sequential_pause_step(Index, Id, Pause, Delta, Env);
+        {error, Reason} -> {failed, {step_failed, Id, Reason}, Env};
+        {ok, Control} ->
+            {failed, {step_failed, Id,
+                      {invalid_control, control_name(Control)}}, Env}
     end.
 
 complete_sequential_step(Id, Output, Delta, Env1) ->
     case merge_delta(Delta, Env1) of
         {ok, Env2} ->
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> => Id}, Env2),
             {completed, maps:get(state, Env2), Env2#{output => Output}};
         {error, Reason} ->
             {failed, {step_failed, Id, Reason}, Env1}
@@ -188,47 +272,69 @@ complete_sequential_step(Id, Output, Delta, Env1) ->
 execute_parallel(Env0) ->
     Data = workflow_data(Env0),
     Branches = maps:get(branches, Data),
-    BranchCount = length(Branches),
-    case consume_steps(BranchCount, Env0) of
-        {error, Reason, Env1} -> {failed, Reason, Env1};
-        {ok, Env1} ->
-            Max = erlang:min(maps:get(max_concurrency,
-                                      maps:get(runtime, Env1)),
-                             BranchCount),
-            State = maps:get(state, Env1),
-            case run_parallel_branches(Branches, State, Env1, Max) of
-                timed_out -> {timed_out, Env1};
-                {error, BranchId, Reason} ->
-                    {failed, {branch_failed, BranchId, Reason}, Env1};
-                {ok, OrderedResults} ->
-                    OrderedDeltas = [{Id, Delta} ||
-                                     {Id, _Output, Delta} <- OrderedResults],
-                    Outputs = maps:from_list(
-                                [{Id, Output} ||
-                                 {Id, Output, _Delta} <- OrderedResults]),
-                    case merge_parallel(maps:get(merge, Data),
-                                        OrderedDeltas, State, Env1) of
-                        {ok, MergedDelta} ->
-                            case merge_delta(MergedDelta, Env1) of
-                                {ok, Env2} ->
-                                    {completed, maps:get(state, Env2),
-                                     Env2#{output => Outputs}};
-                                {error, Reason} ->
-                                    {failed, Reason, Env1}
-                            end;
-                        timed_out -> {timed_out, Env1};
-                        {error, Reason} -> {failed, Reason, Env1}
-                    end
-            end
+    Cursor = maps:get(cursor, Env0),
+    case maps:get(<<"status">>, Cursor, <<"pending">>) of
+        <<"pending">> ->
+            case begin_parallel(length(Branches), Env0) of
+                {error, Reason, Env1} -> {failed, Reason, Env1};
+                {ok, Env1} ->
+                    parallel_run(Branches, #{}, Env1)
+            end;
+        <<"running">> ->
+            parallel_run(
+              Branches, maps:get(<<"results">>, Cursor, #{}), Env0);
+        <<"awaiting_resume">> ->
+            parallel_resume_after_pause(Branches, Env0)
     end.
 
-run_parallel_branches(Branches, State, Env, Max) ->
+parallel_run(Branches, Results, Env) ->
+    BranchCount = length(Branches),
+    Max = erlang:min(maps:get(max_concurrency, maps:get(runtime, Env)),
+                     BranchCount),
+    State = maps:get(state, Env),
+    case run_parallel_branches(Branches, Results, State, Env, Max) of
+        {timed_out, FinalEnv} -> {timed_out, FinalEnv};
+        {paused, Pause, FinalEnv} -> {paused, Pause, FinalEnv};
+        {error, BranchId, Reason, FinalEnv} ->
+            {failed, {branch_failed, BranchId, Reason}, FinalEnv};
+        {ok, OrderedResults, FinalEnv} ->
+            complete_parallel(OrderedResults, State, FinalEnv)
+    end.
+
+complete_parallel(OrderedResults, State, Env) ->
+    Data = workflow_data(Env),
+    OrderedDeltas = [{Id, Delta} ||
+                     {Id, _Output, Delta} <- OrderedResults],
+    Outputs = maps:from_list(
+                [{Id, Output} ||
+                 {Id, Output, _Delta} <- OrderedResults]),
+    case merge_parallel(maps:get(merge, Data), OrderedDeltas, State, Env) of
+        {ok, MergedDelta} ->
+            case merge_delta(MergedDelta, Env) of
+                {ok, Env1} ->
+                    emit_lifecycle(<<"join_completed">>,
+                                   #{<<"join_id">> => <<"parallel">>,
+                                     <<"branch_count">> =>
+                                         length(OrderedResults)}, Env1),
+                    {completed, maps:get(state, Env1),
+                     Env1#{output => Outputs}};
+                {error, Reason} -> {failed, Reason, Env}
+            end;
+        timed_out -> {timed_out, Env};
+        {error, Reason} -> {failed, Reason, Env}
+    end.
+
+run_parallel_branches(Branches, Results, State, Env, Max) ->
     case deadline_expired(maps:get(deadline, Env)) of
-        true -> timed_out;
+        true -> {timed_out, Env};
         false ->
-            Indexed = lists:zip(lists:seq(1, length(Branches)), Branches),
+            Indexed = [{Index, Branch}
+                       || {Index, Branch} <-
+                              lists:zip(lists:seq(1, length(Branches)),
+                                        Branches),
+                          not maps:is_key(maps:get(id, Branch), Results)],
             {Pending, Active} = fill_parallel(Indexed, #{}, Max, State, Env),
-            collect_parallel(Pending, Active, #{}, length(Branches),
+            collect_parallel(Pending, Active, Results, Branches,
                              Max, State, Env)
     end.
 
@@ -237,51 +343,73 @@ fill_parallel(Pending, Active, Max, _State, _Env)
     {Pending, Active};
 fill_parallel([{Index, Branch} | Rest], Active, Max, State, Env) ->
     Id = maps:get(id, Branch),
+    emit_lifecycle(<<"node_started">>,
+                   #{<<"node_id">> => Id,
+                     <<"parent">> => <<"parallel">>}, Env),
     Context = action_context(Id, Env, null),
     Job = spawn_action_worker(maps:get(run, Branch), State, Context,
                               Index, Id, action_policy(Branch)),
     fill_parallel(Rest, Active#{maps:get(job_ref, Job) => Job},
                   Max, State, Env).
 
-collect_parallel(_Pending, Active, Results, Total, _Max, _State, _Env)
-  when map_size(Active) =:= 0, map_size(Results) =:= Total ->
-    {ok, [maps:get(Index, Results) || Index <- lists:seq(1, Total)]};
-collect_parallel(Pending, Active, Results, Total, Max, State, Env) ->
+collect_parallel(_Pending, Active, Results, Branches, _Max, _State, Env)
+  when map_size(Active) =:= 0, map_size(Results) =:= length(Branches) ->
+    {ok, [parallel_result_tuple(maps:get(maps:get(id, Branch), Results),
+                                maps:get(id, Branch))
+          || Branch <- Branches], Env};
+collect_parallel(Pending, Active, Results, Branches, Max, State, Env) ->
     Timeout = remaining_timeout(maps:get(deadline, Env)),
     CoordinatorRef = maps:get(coordinator_ref, Env),
     Coordinator = maps:get(coordinator, Env),
     receive
+        {adk_workflow_attempt_started, Pid, AttemptRef, JobRef,
+         Id, Attempt}
+          when is_pid(Pid), is_reference(AttemptRef),
+               is_map_key(JobRef, Active) ->
+            Job = maps:get(JobRef, Active),
+            true = maps:get(pid, Job) =:= Pid,
+            record_attempt(Job, Id, Attempt, Env),
+            Pid ! {adk_workflow_attempt_ack, AttemptRef},
+            collect_parallel(Pending, Active, Results, Branches,
+                             Max, State, Env);
         {adk_workflow_worker, JobRef, Pid, Raw}
           when is_map_key(JobRef, Active) ->
             Job = maps:get(JobRef, Active),
             true = maps:get(pid, Job) =:= Pid,
+            complete_attempt(Job, Raw),
             cleanup_job(Job),
             Active1 = maps:remove(JobRef, Active),
             case normalize_action(Raw) of
                 timed_out ->
                     kill_active(Active1),
-                    timed_out;
+                    {timed_out, Env};
                 {ok, {ok, Delta}} ->
-                    parallel_continue(Pending, Active1, Results, Total,
+                    parallel_continue(Pending, Active1, Results, Branches,
                                       Max, State, Env, Job, null, Delta);
                 {ok, {output, Output, Delta}} ->
-                    parallel_continue(Pending, Active1, Results, Total,
+                    parallel_continue(Pending, Active1, Results, Branches,
                                       Max, State, Env, Job, Output, Delta);
                 {ok, {stop, Output, Delta}} ->
                     %% Each parallel branch is a single bounded action, so a
                     %% terminal action result completes that branch.
-                    parallel_continue(Pending, Active1, Results, Total,
+                    parallel_continue(Pending, Active1, Results, Branches,
                                       Max, State, Env, Job, Output, Delta);
                 {ok, {complete, Output, Delta}} ->
-                    parallel_continue(Pending, Active1, Results, Total,
+                    parallel_continue(Pending, Active1, Results, Branches,
                                       Max, State, Env, Job, Output, Delta);
+                {ok, {pause, Pause, Delta}} ->
+                    parallel_pause_branch(Job, Pause, Delta, Active1,
+                                          Results, Env);
+                {ok, {nested_pause, Pause, ChildCheckpoint}} ->
+                    parallel_pause_nested(Job, Pause, ChildCheckpoint,
+                                          Active1, Results, Env);
                 {ok, Control} ->
                     kill_active(Active1),
                     {error, maps:get(id, Job),
-                     {invalid_control, control_name(Control)}};
+                     {invalid_control, control_name(Control)}, Env};
                 {error, Reason} ->
                     kill_active(Active1),
-                    {error, maps:get(id, Job), Reason}
+                    {error, maps:get(id, Job), Reason, Env}
             end;
         {'DOWN', CoordinatorRef, process, Coordinator, _Reason} ->
             kill_active(Active),
@@ -295,34 +423,193 @@ collect_parallel(Pending, Active, Results, Total, Max, State, Env) ->
                     {error, maps:get(id, Job),
                      {worker_down,
                       adk_workflow:external_reason(
-                        adk_workflow_action, process_down, Reason)}};
+                        adk_workflow_action, process_down, Reason)}, Env};
                 error ->
-                    collect_parallel(Pending, Active, Results, Total,
+                    collect_parallel(Pending, Active, Results, Branches,
                                      Max, State, Env)
             end;
         {'EXIT', _Pid, _Reason} ->
-            collect_parallel(Pending, Active, Results, Total,
+            collect_parallel(Pending, Active, Results, Branches,
                              Max, State, Env)
     after Timeout ->
         kill_active(Active),
-        timed_out
+        {timed_out, Env}
     end.
 
-parallel_continue(Pending0, Active0, Results0, Total, Max,
+parallel_continue(Pending0, Active0, Results0, Branches, Max,
                   State, Env, Job, Output, Delta) ->
     case normalize_delta(Delta) of
         {ok, SafeDelta} ->
-            Index = maps:get(index, Job),
             Id = maps:get(id, Job),
-            Results = Results0#{Index => {Id, Output, SafeDelta}},
+            Results = Results0#{Id => fork_result(Output, SafeDelta)},
+            Env1 = commit(parallel_running_cursor(Results), Env),
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> => Id,
+                             <<"parent">> => <<"parallel">>}, Env1),
             {Pending, Active} = fill_parallel(Pending0, Active0, Max,
-                                              State, Env),
-            collect_parallel(Pending, Active, Results, Total,
-                             Max, State, Env);
+                                              State, Env1),
+            collect_parallel(Pending, Active, Results, Branches,
+                             Max, State, Env1);
         {error, Reason} ->
             kill_active(Active0),
-            {error, maps:get(id, Job), Reason}
+            {error, maps:get(id, Job), Reason, Env}
     end.
+
+parallel_pause_branch(Job, Pause0, Delta, Active, Results, Env) ->
+    kill_active(Active),
+    case normalize_delta(Delta) of
+        {error, Reason} ->
+            {error, maps:get(id, Job), Reason, Env};
+        {ok, SafeDelta} ->
+            BranchId = maps:get(id, Job),
+            Pause = Pause0#{<<"branch_id">> => BranchId,
+                            <<"parallel_id">> => <<"parallel">>},
+            Cursor = (parallel_pause_cursor(Results, BranchId, Pause))#{
+                         <<"resume_kind">> =>
+                             pause_resume_kind(Pause, <<"branch">>),
+                         <<"paused_delta">> => SafeDelta},
+            Env1 = commit(Cursor, Env),
+            emit_lifecycle(<<"workflow_paused">>,
+                           #{<<"node_id">> => BranchId,
+                             <<"pause_kind">> => <<"parallel_branch">>},
+                           Env1),
+            {paused, Pause, Env1}
+    end.
+
+parallel_pause_nested(Job, Pause0, ChildCheckpoint, Active, Results, Env) ->
+    kill_active(Active),
+    BranchId = maps:get(id, Job),
+    Pause = Pause0#{<<"branch_id">> => BranchId,
+                    <<"parallel_id">> => <<"parallel">>},
+    Cursor = (parallel_pause_cursor(Results, BranchId, Pause))#{
+                 <<"resume_kind">> => <<"nested_workflow">>,
+                 <<"nested_checkpoint">> => ChildCheckpoint},
+    Env1 = commit(Cursor, Env),
+    emit_lifecycle(<<"workflow_paused">>,
+                   #{<<"node_id">> => BranchId,
+                     <<"pause_kind">> => <<"nested_workflow">>}, Env1),
+    {paused, Pause, Env1}.
+
+parallel_resume_after_pause(Branches, Env) ->
+    Cursor = maps:get(cursor, Env),
+    case maps:find(<<"resume_input">>, Cursor) of
+        error -> {failed, {resume_input_required, <<"parallel">>}, Env};
+        {ok, Input} ->
+            BranchId = maps:get(<<"paused_branch">>, Cursor),
+            Results0 = maps:get(<<"results">>, Cursor, #{}),
+            emit_lifecycle(<<"workflow_resumed">>,
+                           #{<<"node_id">> => BranchId}, Env),
+            case maps:get(<<"resume_kind">>, Cursor) of
+                <<"branch">> ->
+                    Delta = maps:get(<<"paused_delta">>, Cursor, #{}),
+                    Results = Results0#{BranchId =>
+                                           fork_result(Input, Delta)},
+                    Env1 = commit(parallel_running_cursor(Results), Env),
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => BranchId,
+                                     <<"parent">> => <<"parallel">>}, Env1),
+                    parallel_run(Branches, Results, Env1);
+                <<"tool_confirmation">> ->
+                    parallel_resume_tool_confirmation(
+                      BranchId, Branches, Results0, Input, Env);
+                <<"nested_workflow">> ->
+                    parallel_resume_nested(
+                      BranchId, Branches, Results0, Input, Env)
+            end
+    end.
+
+parallel_resume_nested(BranchId, Branches, Results0, Input, Env) ->
+    Branch = find_named_action(BranchId, Branches),
+    {workflow, Child, Opts} = maps:get(run, Branch),
+    Cursor = maps:get(cursor, Env),
+    ChildCheckpoint = maps:get(<<"nested_checkpoint">>, Cursor),
+    Context = action_context(BranchId, Env, null),
+    Resume = fun(_State, _AttemptContext) ->
+        resume_nested_workflow(Child, Opts, ChildCheckpoint, Input, Context)
+    end,
+    case run_action(Resume, maps:get(state, Env), Context,
+                    action_policy(Branch), Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {nested_pause, Pause, NextCheckpoint}} ->
+            parallel_pause_nested(
+              #{id => BranchId}, Pause, NextCheckpoint, #{}, Results0, Env);
+        {ok, {output, Output, Delta}} ->
+            case normalize_delta(Delta) of
+                {ok, SafeDelta} ->
+                    Results = Results0#{BranchId =>
+                                           fork_result(Output, SafeDelta)},
+                    Env1 = commit(parallel_running_cursor(Results), Env),
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => BranchId,
+                                     <<"parent">> => <<"parallel">>}, Env1),
+                    parallel_run(Branches, Results, Env1);
+                {error, Reason} ->
+                    {failed, {branch_failed, BranchId, Reason}, Env}
+            end;
+        {error, Reason} ->
+            {failed, {branch_failed, BranchId, Reason}, Env};
+        {ok, Control} ->
+            {failed, {branch_failed, BranchId,
+             {invalid_control, control_name(Control)}}, Env}
+    end.
+
+parallel_resume_tool_confirmation(BranchId, Branches, Results0,
+                                  Input, Env) ->
+    Branch = find_named_action(BranchId, Branches),
+    case run_resumed_tool_confirmation(Branch, BranchId, null, Input, Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {ok, Delta}} ->
+            parallel_record_resumed(
+              BranchId, null, Delta, Branches, Results0, Env);
+        {ok, {output, Output, Delta}} ->
+            parallel_record_resumed(
+              BranchId, Output, Delta, Branches, Results0, Env);
+        {ok, {stop, Output, Delta}} ->
+            parallel_record_resumed(
+              BranchId, Output, Delta, Branches, Results0, Env);
+        {ok, {complete, Output, Delta}} ->
+            parallel_record_resumed(
+              BranchId, Output, Delta, Branches, Results0, Env);
+        {ok, {pause, Pause, Delta}} ->
+            parallel_pause_branch(
+              #{id => BranchId}, Pause, Delta, #{}, Results0, Env);
+        {error, Reason} ->
+            {failed, {branch_failed, BranchId, Reason}, Env};
+        {ok, Control} ->
+            {failed, {branch_failed, BranchId,
+                      {invalid_control, control_name(Control)}}, Env}
+    end.
+
+parallel_record_resumed(BranchId, Output, Delta, Branches, Results0, Env) ->
+    case normalize_delta(Delta) of
+        {ok, SafeDelta} ->
+            Results = Results0#{BranchId => fork_result(Output, SafeDelta)},
+            Env1 = commit(parallel_running_cursor(Results), Env),
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> => BranchId,
+                             <<"parent">> => <<"parallel">>}, Env1),
+            parallel_run(Branches, Results, Env1);
+        {error, Reason} ->
+            {failed, {branch_failed, BranchId, Reason}, Env}
+    end.
+
+parallel_running_cursor(Results) ->
+    #{<<"type">> => <<"parallel">>,
+      <<"status">> => <<"running">>,
+      <<"results">> => Results}.
+
+parallel_pause_cursor(Results, BranchId, Pause) ->
+    #{<<"type">> => <<"parallel">>,
+      <<"status">> => <<"awaiting_resume">>,
+      <<"results">> => Results,
+      <<"paused_branch">> => BranchId,
+      <<"pause">> => Pause}.
+
+parallel_result_tuple(Result, Id) ->
+    {Id, fork_result_output(Result), fork_result_delta(Result)}.
+
+find_named_action(Id, Actions) ->
+    hd([Action || Action <- Actions, maps:get(id, Action) =:= Id]).
 
 merge_parallel(ordered_last_wins, OrderedDeltas, _State, _Env) ->
     {ok, lists:foldl(fun({_Id, Delta}, Acc) -> maps:merge(Acc, Delta) end,
@@ -368,7 +655,10 @@ reject_conflicts([{Id, Delta} | Rest], Owners0, Acc0) ->
 execute_loop(Env) ->
     Cursor = maps:get(cursor, Env),
     Iteration = maps:get(<<"iteration">>, Cursor),
-    loop_from(Iteration, Env).
+    case maps:get(<<"phase">>, Cursor, <<"ready">>) of
+        <<"awaiting_resume">> -> loop_resume_after_pause(Iteration, Env);
+        _ -> loop_from(Iteration, Env)
+    end.
 
 loop_from(Iteration, Env0) ->
     Data = workflow_data(Env0),
@@ -378,7 +668,10 @@ loop_from(Iteration, Env0) ->
         false ->
             Body = maps:get(body, Data),
             Id = maps:get(id, Body),
-            case consume_steps(1, Env0) of
+            emit_lifecycle(<<"node_started">>,
+                           #{<<"node_id">> => Id,
+                             <<"iteration">> => Iteration}, Env0),
+            case consume_action_step(Id, Env0) of
                 {error, Reason, Env1} -> {failed, Reason, Env1};
                 {ok, Env1} ->
                     Context = action_context(Id, Env1, null),
@@ -396,6 +689,12 @@ loop_from(Iteration, Env0) ->
                             complete_loop_body(Output, Delta, Env1);
                         {ok, {complete, Output, Delta}} ->
                             complete_loop_body(Output, Delta, Env1);
+                        {ok, {pause, Pause, Delta}} ->
+                            loop_pause_branch(
+                              Iteration, Pause, Delta, Env1);
+                        {ok, {nested_pause, Pause, ChildCheckpoint}} ->
+                            loop_pause_nested(
+                              Iteration, Pause, ChildCheckpoint, Env1);
                         {ok, Control} ->
                             {failed,
                              {loop_body_failed,
@@ -425,12 +724,22 @@ loop_after_body(Iteration, Delta, Output, Env1) ->
                 {ok, Reply} ->
                     case normalize_predicate(Reply) of
                         done ->
+                            emit_lifecycle(<<"node_completed">>,
+                                           #{<<"node_id">> =>
+                                                 <<"loop-body">>,
+                                             <<"iteration">> => Iteration},
+                                           Env2),
                             {completed, maps:get(state, Env2), Env2};
                         continue ->
                             NextIteration = Iteration + 1,
                             Cursor = #{<<"type">> => <<"loop">>,
                                        <<"iteration">> => NextIteration},
                             Env3 = commit(Cursor, Env2),
+                            emit_lifecycle(<<"node_completed">>,
+                                           #{<<"node_id">> =>
+                                                 <<"loop-body">>,
+                                             <<"iteration">> => Iteration},
+                                           Env3),
                             loop_from(NextIteration, Env3);
                         invalid ->
                             {failed, invalid_loop_predicate_result, Env2}
@@ -441,9 +750,107 @@ loop_after_body(Iteration, Delta, Output, Env1) ->
 complete_loop_body(Output, Delta, Env1) ->
     case merge_delta(Delta, Env1) of
         {ok, Env2} ->
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> => <<"loop-body">>}, Env2),
             {completed, maps:get(state, Env2), Env2#{output => Output}};
         {error, Reason} ->
             {failed, {loop_body_failed, Reason}, Env1}
+    end.
+
+loop_pause_branch(Iteration, Pause0, Delta, Env) ->
+    case normalize_delta(Delta) of
+        {error, Reason} -> {failed, {loop_body_failed, Reason}, Env};
+        {ok, SafeDelta} ->
+            Pause = Pause0#{<<"node_id">> => <<"loop-body">>,
+                            <<"iteration">> => Iteration},
+            Cursor = #{<<"type">> => <<"loop">>,
+                       <<"iteration">> => Iteration,
+                       <<"phase">> => <<"awaiting_resume">>,
+                       <<"resume_kind">> =>
+                           pause_resume_kind(Pause, <<"body">>),
+                       <<"pause">> => Pause,
+                       <<"paused_delta">> => SafeDelta},
+            Env1 = commit(Cursor, Env),
+            emit_lifecycle(<<"workflow_paused">>,
+                           #{<<"node_id">> => <<"loop-body">>,
+                             <<"pause_kind">> => <<"loop_body">>}, Env1),
+            {paused, Pause, Env1}
+    end.
+
+loop_pause_nested(Iteration, Pause0, ChildCheckpoint, Env) ->
+    Pause = Pause0#{<<"node_id">> => <<"loop-body">>,
+                    <<"iteration">> => Iteration},
+    Cursor = #{<<"type">> => <<"loop">>,
+               <<"iteration">> => Iteration,
+               <<"phase">> => <<"awaiting_resume">>,
+               <<"resume_kind">> => <<"nested_workflow">>,
+               <<"pause">> => Pause,
+               <<"nested_checkpoint">> => ChildCheckpoint},
+    Env1 = commit(Cursor, Env),
+    emit_lifecycle(<<"workflow_paused">>,
+                   #{<<"node_id">> => <<"loop-body">>,
+                     <<"pause_kind">> => <<"nested_workflow">>}, Env1),
+    {paused, Pause, Env1}.
+
+loop_resume_after_pause(Iteration, Env) ->
+    Cursor = maps:get(cursor, Env),
+    case maps:find(<<"resume_input">>, Cursor) of
+        error -> {failed, {resume_input_required, <<"loop-body">>}, Env};
+        {ok, Input} ->
+            emit_lifecycle(<<"workflow_resumed">>,
+                           #{<<"node_id">> => <<"loop-body">>}, Env),
+            case maps:get(<<"resume_kind">>, Cursor) of
+                <<"body">> ->
+                    loop_after_body(
+                      Iteration,
+                      maps:get(<<"paused_delta">>, Cursor, #{}), Input, Env);
+                <<"tool_confirmation">> ->
+                    loop_resume_tool_confirmation(Iteration, Input, Env);
+                <<"nested_workflow">> ->
+                    loop_resume_nested(Iteration, Input, Env)
+            end
+    end.
+
+loop_resume_nested(Iteration, Input, Env) ->
+    Body = maps:get(body, workflow_data(Env)),
+    {workflow, Child, Opts} = maps:get(run, Body),
+    Cursor = maps:get(cursor, Env),
+    ChildCheckpoint = maps:get(<<"nested_checkpoint">>, Cursor),
+    Context = action_context(<<"loop-body">>, Env, null),
+    Resume = fun(_State, _AttemptContext) ->
+        resume_nested_workflow(Child, Opts, ChildCheckpoint, Input, Context)
+    end,
+    case run_action(Resume, maps:get(state, Env), Context,
+                    action_policy(Body), Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {nested_pause, Pause, NextCheckpoint}} ->
+            loop_pause_nested(Iteration, Pause, NextCheckpoint, Env);
+        {ok, {output, Output, Delta}} ->
+            loop_after_body(Iteration, Delta, Output, Env);
+        {error, Reason} -> {failed, {loop_body_failed, Reason}, Env};
+        {ok, Control} ->
+            {failed, {loop_body_failed,
+                      {invalid_control, control_name(Control)}}, Env}
+    end.
+
+loop_resume_tool_confirmation(Iteration, Input, Env) ->
+    Body = maps:get(body, workflow_data(Env)),
+    case run_resumed_tool_confirmation(
+           Body, <<"loop-body">>, null, Input, Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {ok, Delta}} -> loop_after_body(Iteration, Delta, Env);
+        {ok, {output, Output, Delta}} ->
+            loop_after_body(Iteration, Delta, Output, Env);
+        {ok, {stop, Output, Delta}} ->
+            complete_loop_body(Output, Delta, Env);
+        {ok, {complete, Output, Delta}} ->
+            complete_loop_body(Output, Delta, Env);
+        {ok, {pause, Pause, Delta}} ->
+            loop_pause_branch(Iteration, Pause, Delta, Env);
+        {error, Reason} -> {failed, {loop_body_failed, Reason}, Env};
+        {ok, Control} ->
+            {failed, {loop_body_failed,
+                      {invalid_control, control_name(Control)}}, Env}
     end.
 
 normalize_predicate(true) -> done;
@@ -460,12 +867,18 @@ execute_transfer(Env) ->
     Cursor = maps:get(cursor, Env),
     Member = maps:get(<<"member">>, Cursor),
     Input = maps:get(<<"input">>, Cursor, null),
-    transfer_from(Member, Input, Env).
+    case maps:get(<<"phase">>, Cursor, <<"ready">>) of
+        <<"awaiting_resume">> -> transfer_resume_after_pause(Member, Env);
+        _ -> transfer_from(Member, Input, Env)
+    end.
 
 transfer_from(MemberId, Input, Env0) ->
     Members = maps:get(members, workflow_data(Env0)),
     Member = maps:get(MemberId, Members),
-    case consume_steps(1, Env0) of
+    emit_lifecycle(<<"node_started">>,
+                   #{<<"node_id">> => MemberId,
+                     <<"node_type">> => <<"transfer_member">>}, Env0),
+    case consume_action_step(MemberId, Env0) of
         {error, Reason, Env1} -> {failed, Reason, Env1};
         {ok, Env1} ->
             Context = action_context(MemberId, Env1, Input),
@@ -485,15 +898,16 @@ transfer_from(MemberId, Input, Env0) ->
                     complete_transfer_member(MemberId, Output, Delta, Env1);
                 {ok, {ok, Delta}} ->
                     %% A plain successful member result is terminal.
-                    case merge_delta(Delta, Env1) of
-                        {ok, Env2} ->
-                            {completed, maps:get(state, Env2), Env2};
-                        {error, Reason} ->
-                            {failed, {member_failed, MemberId, Reason}, Env1}
-                    end;
+                    complete_transfer_delta(MemberId, Delta, Env1);
                 {ok, {transfer, Target, NextInput, Delta}} ->
                     accept_transfer(MemberId, Target, NextInput, Delta,
                                     Members, Env1);
+                {ok, {pause, Pause, Delta}} ->
+                    transfer_pause_member(
+                      MemberId, Input, Pause, Delta, Env1);
+                {ok, {nested_pause, Pause, ChildCheckpoint}} ->
+                    transfer_pause_nested(
+                      MemberId, Input, Pause, ChildCheckpoint, Env1);
                 {ok, Control} ->
                     {failed,
                      {member_failed, MemberId,
@@ -504,7 +918,19 @@ transfer_from(MemberId, Input, Env0) ->
 complete_transfer_member(MemberId, Output, Delta, Env1) ->
     case merge_delta(Delta, Env1) of
         {ok, Env2} ->
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> => MemberId}, Env2),
             {completed, maps:get(state, Env2), Env2#{output => Output}};
+        {error, Reason} ->
+            {failed, {member_failed, MemberId, Reason}, Env1}
+    end.
+
+complete_transfer_delta(MemberId, Delta, Env1) ->
+    case merge_delta(Delta, Env1) of
+        {ok, Env2} ->
+            emit_lifecycle(<<"node_completed">>,
+                           #{<<"node_id">> => MemberId}, Env2),
+            {completed, maps:get(state, Env2), Env2};
         {error, Reason} ->
             {failed, {member_failed, MemberId, Reason}, Env1}
     end.
@@ -525,6 +951,9 @@ accept_transfer(From, Target, NextInput, Delta, Members, Env1) ->
                                 {error, Reason, Env3} ->
                                     {failed, Reason, Env3};
                                 {ok, Env3} ->
+                                    emit_lifecycle(<<"node_completed">>,
+                                                   #{<<"node_id">> => From},
+                                                   Env3),
                                     emit_transfer_event(From, Target, Env3),
                                     Cursor = #{<<"type">> => <<"transfer">>,
                                                <<"member">> => Target,
@@ -534,6 +963,111 @@ accept_transfer(From, Target, NextInput, Delta, Members, Env1) ->
                             end
                     end
             end
+    end.
+
+transfer_pause_member(MemberId, MemberInput, Pause0, Delta, Env) ->
+    case normalize_delta(Delta) of
+        {error, Reason} -> {failed, {member_failed, MemberId, Reason}, Env};
+        {ok, SafeDelta} ->
+            Pause = Pause0#{<<"member_id">> => MemberId},
+            Cursor = #{<<"type">> => <<"transfer">>,
+                       <<"member">> => MemberId,
+                       <<"input">> => MemberInput,
+                       <<"phase">> => <<"awaiting_resume">>,
+                       <<"resume_kind">> =>
+                           pause_resume_kind(Pause, <<"member">>),
+                       <<"pause">> => Pause,
+                       <<"paused_delta">> => SafeDelta},
+            Env1 = commit(Cursor, Env),
+            emit_lifecycle(<<"workflow_paused">>,
+                           #{<<"node_id">> => MemberId,
+                             <<"pause_kind">> => <<"transfer_member">>},
+                           Env1),
+            {paused, Pause, Env1}
+    end.
+
+transfer_pause_nested(MemberId, MemberInput, Pause0, ChildCheckpoint, Env) ->
+    Pause = Pause0#{<<"member_id">> => MemberId},
+    Cursor = #{<<"type">> => <<"transfer">>,
+               <<"member">> => MemberId,
+               <<"input">> => MemberInput,
+               <<"phase">> => <<"awaiting_resume">>,
+               <<"resume_kind">> => <<"nested_workflow">>,
+               <<"pause">> => Pause,
+               <<"nested_checkpoint">> => ChildCheckpoint},
+    Env1 = commit(Cursor, Env),
+    emit_lifecycle(<<"workflow_paused">>,
+                   #{<<"node_id">> => MemberId,
+                     <<"pause_kind">> => <<"nested_workflow">>}, Env1),
+    {paused, Pause, Env1}.
+
+transfer_resume_after_pause(MemberId, Env) ->
+    Cursor = maps:get(cursor, Env),
+    case maps:find(<<"resume_input">>, Cursor) of
+        error -> {failed, {resume_input_required, MemberId}, Env};
+        {ok, Input} ->
+            emit_lifecycle(<<"workflow_resumed">>,
+                           #{<<"node_id">> => MemberId}, Env),
+            case maps:get(<<"resume_kind">>, Cursor) of
+                <<"member">> ->
+                    complete_transfer_member(
+                      MemberId, Input,
+                      maps:get(<<"paused_delta">>, Cursor, #{}), Env);
+                <<"tool_confirmation">> ->
+                    transfer_resume_tool_confirmation(MemberId, Input, Env);
+                <<"nested_workflow">> ->
+                    transfer_resume_nested(MemberId, Input, Env)
+            end
+    end.
+
+transfer_resume_nested(MemberId, Input, Env) ->
+    Member = maps:get(MemberId, maps:get(members, workflow_data(Env))),
+    {workflow, Child, Opts} = maps:get(run, Member),
+    Cursor = maps:get(cursor, Env),
+    ChildCheckpoint = maps:get(<<"nested_checkpoint">>, Cursor),
+    MemberInput = maps:get(<<"input">>, Cursor, null),
+    Context = action_context(MemberId, Env, MemberInput),
+    Resume = fun(_State, _AttemptContext) ->
+        resume_nested_workflow(Child, Opts, ChildCheckpoint, Input, Context)
+    end,
+    case run_action(Resume, maps:get(state, Env), Context,
+                    action_policy(Member), Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {nested_pause, Pause, NextCheckpoint}} ->
+            transfer_pause_nested(
+              MemberId, MemberInput, Pause, NextCheckpoint, Env);
+        {ok, {output, Output, Delta}} ->
+            complete_transfer_member(MemberId, Output, Delta, Env);
+        {error, Reason} -> {failed, {member_failed, MemberId, Reason}, Env};
+        {ok, Control} ->
+            {failed, {member_failed, MemberId,
+                      {invalid_control, control_name(Control)}}, Env}
+    end.
+
+transfer_resume_tool_confirmation(MemberId, Input, Env) ->
+    Member = maps:get(MemberId, maps:get(members, workflow_data(Env))),
+    MemberInput = maps:get(<<"input">>, maps:get(cursor, Env), null),
+    case run_resumed_tool_confirmation(
+           Member, MemberId, MemberInput, Input, Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {ok, Delta}} ->
+            complete_transfer_delta(MemberId, Delta, Env);
+        {ok, {output, Output, Delta}} ->
+            complete_transfer_member(MemberId, Output, Delta, Env);
+        {ok, {stop, Output, Delta}} ->
+            complete_transfer_member(MemberId, Output, Delta, Env);
+        {ok, {complete, Output, Delta}} ->
+            complete_transfer_member(MemberId, Output, Delta, Env);
+        {ok, {transfer, Target, NextInput, Delta}} ->
+            accept_transfer(
+              MemberId, Target, NextInput, Delta,
+              maps:get(members, workflow_data(Env)), Env);
+        {ok, {pause, Pause, Delta}} ->
+            transfer_pause_member(MemberId, MemberInput, Pause, Delta, Env);
+        {error, Reason} -> {failed, {member_failed, MemberId, Reason}, Env};
+        {ok, Control} ->
+            {failed, {member_failed, MemberId,
+                      {invalid_control, control_name(Control)}}, Env}
     end.
 
 consume_transfer(Env = #{transfers_remaining := 0}) ->
@@ -576,23 +1110,35 @@ execute_graph(Env) ->
 graph_from(NodeId, Env0) ->
     Data = workflow_data(Env0),
     Node = maps:get(NodeId, maps:get(nodes, Data)),
-    case maps:get(type, Node, action) of
-        fork -> graph_fork(NodeId, Node, Env0);
-        branch -> graph_router(NodeId, Node, Env0);
-        dynamic -> graph_router(NodeId, Node, Env0);
-        loop -> graph_loop(NodeId, Node, Env0);
-        _ -> graph_action(NodeId, Node, Env0)
+    case validate_graph_node_input(Node, graph_node_input(Env0)) of
+        {error, Reason} ->
+            {failed, {node_input_schema_validation_failed,
+                      NodeId, Reason}, Env0};
+        ok ->
+            emit_lifecycle(<<"node_started">>,
+                           #{<<"node_id">> => NodeId,
+                             <<"node_type">> =>
+                                 atom_to_binary(
+                                   maps:get(type, Node, action), utf8)},
+                           Env0),
+            case maps:get(type, Node, action) of
+                fork -> graph_fork(NodeId, Node, Env0);
+                branch -> graph_router(NodeId, Node, Env0);
+                dynamic -> graph_router(NodeId, Node, Env0);
+                loop -> graph_loop(NodeId, Node, Env0);
+                _ -> graph_action(NodeId, Node, Env0)
+            end
     end.
 
 graph_action(NodeId, #{run := noop}, Env0) ->
-    case consume_steps(1, Env0) of
+    case consume_action_step(NodeId, Env0) of
         {error, Reason, Env1} -> {failed, Reason, Env1};
         {ok, Env1} ->
             graph_after_node(
               NodeId, default, graph_node_input(Env1), #{}, Env1)
     end;
 graph_action(NodeId, Node, Env0) ->
-    case consume_steps(1, Env0) of
+    case consume_action_step(NodeId, Env0) of
         {error, Reason, Env1} -> {failed, Reason, Env1};
         {ok, Env1} ->
             Context = action_context(NodeId, Env1,
@@ -630,24 +1176,42 @@ graph_after_node_output(NodeId, Output, Delta, Env1) ->
       NodeId, default, Output, Delta, Env1#{output => Output}).
 
 complete_graph_node(NodeId, Output, Delta, Env1) ->
-    case merge_delta(Delta, Env1) of
-        {ok, Env2} ->
-            {completed, maps:get(state, Env2), Env2#{output => Output}};
+    case validate_graph_node_output(NodeId, Output, Env1) of
         {error, Reason} ->
-            {failed, {node_failed, NodeId, Reason}, Env1}
+            {failed, {node_output_schema_validation_failed,
+                      NodeId, Reason}, Env1};
+        ok ->
+            case merge_delta(Delta, Env1) of
+                {ok, Env2} ->
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => NodeId}, Env2),
+                    {completed, maps:get(state, Env2),
+                     Env2#{output => Output}};
+                {error, Reason} ->
+                    {failed, {node_failed, NodeId, Reason}, Env1}
+            end
     end.
 
 graph_after_node(NodeId, RouteChoice, NodeOutput, Delta, Env1) ->
-    case merge_delta(Delta, Env1) of
-        {error, Reason} -> {failed, {node_failed, NodeId, Reason}, Env1};
-        {ok, Env2} ->
-            %% Persist the action result before invoking a potentially
-            %% blocking route callback. A resumed workflow therefore skips
-            %% the already committed action and only repeats routing.
-            RoutingCursor = graph_routing_cursor(
-                              NodeId, RouteChoice, NodeOutput, Env2),
-            Env3 = commit(RoutingCursor, Env2),
-            graph_route_committed_node(NodeId, Env3)
+    case validate_graph_node_output(NodeId, NodeOutput, Env1) of
+        {error, Reason} ->
+            {failed, {node_output_schema_validation_failed,
+                      NodeId, Reason}, Env1};
+        ok ->
+            case merge_delta(Delta, Env1) of
+                {error, Reason} ->
+                    {failed, {node_failed, NodeId, Reason}, Env1};
+                {ok, Env2} ->
+                    %% Persist the action result before invoking a potentially
+                    %% blocking route callback. A resumed workflow therefore
+                    %% skips the already committed action and repeats routing.
+                    RoutingCursor = graph_routing_cursor(
+                                      NodeId, RouteChoice, NodeOutput, Env2),
+                    Env3 = commit(RoutingCursor, Env2),
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => NodeId}, Env3),
+                    graph_route_committed_node(NodeId, Env3)
+            end
     end.
 
 graph_route_committed_node(NodeId, Env) ->
@@ -665,8 +1229,14 @@ graph_route_to_next(NodeId, RouteChoice, Input, Env) ->
                 {error, Reason} ->
                     {failed, {route_failed, NodeId, Reason}, Env};
                 {ok, end_node} ->
+                    emit_lifecycle(<<"route_selected">>,
+                                   #{<<"from">> => NodeId,
+                                     <<"to">> => <<"$end">>}, Env),
                     {completed, maps:get(state, Env), Env};
                 {ok, Target} ->
+                    emit_lifecycle(<<"route_selected">>,
+                                   #{<<"from">> => NodeId,
+                                     <<"to">> => Target}, Env),
                     Env1 = commit(
                              graph_ready_cursor(Target, Input, Env), Env),
                     graph_from(Target, Env1)
@@ -696,7 +1266,12 @@ graph_pause_node(NodeId, Pause0, Delta, Env1) ->
             Pause = Pause0#{<<"node_id">> => NodeId},
             Cursor = graph_cursor_base(NodeId, <<"awaiting_resume">>, Env2),
             Env3 = commit(Cursor#{<<"pause">> => Pause,
-                                  <<"resume_kind">> => <<"node">>}, Env2),
+                                  <<"resume_kind">> =>
+                                      pause_resume_kind(Pause, <<"node">>)},
+                                  Env2),
+            emit_lifecycle(<<"workflow_paused">>,
+                           #{<<"node_id">> => NodeId,
+                             <<"pause_kind">> => <<"node">>}, Env3),
             {paused, Pause, Env3}
     end.
 
@@ -711,6 +1286,9 @@ graph_pause_nested_workflow(NodeId, Pause0, ChildCheckpoint, Env) ->
     Env1 = commit(Cursor#{<<"pause">> => Pause,
                            <<"resume_kind">> => <<"nested_workflow">>,
                            <<"nested_checkpoint">> => ChildCheckpoint}, Env),
+    emit_lifecycle(<<"workflow_paused">>,
+                   #{<<"node_id">> => NodeId,
+                     <<"pause_kind">> => <<"nested_workflow">>}, Env1),
     {paused, Pause, Env1}.
 
 graph_resume_after_pause(NodeId, Env) ->
@@ -718,6 +1296,8 @@ graph_resume_after_pause(NodeId, Env) ->
     case maps:find(<<"resume_input">>, Cursor) of
         error -> {failed, {resume_input_required, NodeId}, Env};
         {ok, Input} ->
+            emit_lifecycle(<<"workflow_resumed">>,
+                           #{<<"node_id">> => NodeId}, Env),
             case maps:get(<<"resume_kind">>, Cursor, <<"node">>) of
                 <<"fork_branch">> ->
                     Results0 = maps:get(<<"fork_results">>, Cursor, #{}),
@@ -729,18 +1309,35 @@ graph_resume_after_pause(NodeId, Env) ->
                                     <<"paused_delta">>, Cursor,
                                     fork_result_delta(
                                       maps:get(BranchId, Results0, #{}))),
-                    Results = (maps:remove(BranchId, Results0))#{
-                                BranchId =>
-                                    fork_result(Input, PausedDelta)},
-                    ForkCursor = graph_cursor_base(NodeId, <<"fork">>, Env),
-                    Env1 = commit(ForkCursor#{<<"results">> => Results}, Env),
-                    graph_from(NodeId, Env1);
+                    case validate_fork_branch_output(
+                           BranchId, Input, Env) of
+                        {error, Reason} ->
+                            {failed, {fork_branch_failed, BranchId,
+                                      {output_schema_validation_failed,
+                                       Reason}}, Env};
+                        ok ->
+                            Results = (maps:remove(BranchId, Results0))#{
+                                        BranchId =>
+                                            fork_result(Input, PausedDelta)},
+                            ForkCursor = graph_fork_cursor(
+                                           NodeId, Results, Env),
+                            Env1 = commit(ForkCursor, Env),
+                            emit_lifecycle(
+                              <<"node_completed">>,
+                              #{<<"node_id">> => BranchId,
+                                <<"parent">> => NodeId}, Env1),
+                            graph_from(NodeId, Env1)
+                    end;
                 <<"fork_nested_workflow">> ->
                     graph_resume_fork_nested_workflow(NodeId, Input, Env);
+                <<"fork_tool_confirmation">> ->
+                    graph_resume_fork_tool_confirmation(NodeId, Input, Env);
                 <<"nested_workflow">> ->
                     graph_resume_nested_workflow(NodeId, Input, Env);
                 <<"node">> ->
-                    graph_route_to_next(NodeId, default, Input, Env)
+                    graph_after_node(NodeId, default, Input, #{}, Env);
+                <<"tool_confirmation">> ->
+                    graph_resume_tool_confirmation(NodeId, Input, Env)
             end
     end.
 
@@ -767,7 +1364,30 @@ graph_resume_nested_workflow(NodeId, Input, Env) ->
         {ok, Control} ->
             {failed,
              {node_failed, NodeId,
-              {invalid_control, control_name(Control)}}, Env}
+             {invalid_control, control_name(Control)}}, Env}
+    end.
+
+graph_resume_tool_confirmation(NodeId, Input, Env) ->
+    Node = maps:get(NodeId, maps:get(nodes, workflow_data(Env))),
+    case run_resumed_tool_confirmation(
+           Node, NodeId, graph_node_input(Env), Input, Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {ok, Delta}} ->
+            graph_after_node(NodeId, default, null, Delta, Env);
+        {ok, {route, Target, Delta}} ->
+            graph_after_node(NodeId, {explicit, Target}, null, Delta, Env);
+        {ok, {output, Output, Delta}} ->
+            graph_after_node_output(NodeId, Output, Delta, Env);
+        {ok, {stop, Output, Delta}} ->
+            complete_graph_node(NodeId, Output, Delta, Env);
+        {ok, {complete, Output, Delta}} ->
+            complete_graph_node(NodeId, Output, Delta, Env);
+        {ok, {pause, Pause, Delta}} ->
+            graph_pause_node(NodeId, Pause, Delta, Env);
+        {error, Reason} -> {failed, {node_failed, NodeId, Reason}, Env};
+        {ok, Control} ->
+            {failed, {node_failed, NodeId,
+                      {invalid_control, control_name(Control)}}, Env}
     end.
 
 graph_resume_fork_nested_workflow(NodeId, Input, Env) ->
@@ -789,27 +1409,88 @@ graph_resume_fork_nested_workflow(NodeId, Input, Env) ->
               NodeId, BranchId, Pause, NextChildCheckpoint,
               maps:get(<<"fork_results">>, Cursor, #{}), Env);
         {ok, {output, Output, Delta}} ->
-            case normalize_delta(Delta) of
-                {error, Reason} ->
-                    {failed, {fork_branch_failed, BranchId, Reason}, Env};
-                {ok, SafeDelta} ->
-                    Results0 = maps:get(<<"fork_results">>, Cursor, #{}),
-                    Results = Results0#{BranchId =>
-                                           fork_result(Output, SafeDelta)},
-                    ForkCursor = graph_cursor_base(NodeId, <<"fork">>, Env),
-                    Env1 = commit(ForkCursor#{<<"results">> => Results}, Env),
-                    graph_from(NodeId, Env1)
-            end;
+            graph_resume_fork_record(
+              NodeId, BranchId, Output, Delta,
+              maps:get(<<"fork_results">>, Cursor, #{}), Env);
         {error, Reason} ->
             {failed, {fork_branch_failed, BranchId, Reason}, Env};
         {ok, Control} ->
             {failed,
              {fork_branch_failed, BranchId,
-              {invalid_control, control_name(Control)}}, Env}
+             {invalid_control, control_name(Control)}}, Env}
+    end.
+
+graph_resume_fork_tool_confirmation(NodeId, Input, Env) ->
+    Cursor = maps:get(cursor, Env),
+    BranchId = maps:get(<<"paused_branch">>, Cursor),
+    Results0 = maps:get(<<"fork_results">>, Cursor, #{}),
+    Branch = maps:get(BranchId, maps:get(nodes, workflow_data(Env))),
+    case run_resumed_tool_confirmation(
+           Branch, BranchId, graph_node_input(Env), Input, Env) of
+        timed_out -> {timed_out, Env};
+        {ok, {ok, Delta}} ->
+            graph_resume_fork_record(
+              NodeId, BranchId, null, Delta, Results0, Env);
+        {ok, {output, Output, Delta}} ->
+            graph_resume_fork_record(
+              NodeId, BranchId, Output, Delta, Results0, Env);
+        {ok, {stop, Output, Delta}} ->
+            graph_resume_fork_record(
+              NodeId, BranchId, Output, Delta, Results0, Env);
+        {ok, {complete, Output, Delta}} ->
+            graph_resume_fork_record(
+              NodeId, BranchId, Output, Delta, Results0, Env);
+        {ok, {pause, Pause0, Delta}} ->
+            case normalize_delta(Delta) of
+                {ok, SafeDelta} ->
+                    Pause = Pause0#{<<"node_id">> => BranchId,
+                                    <<"fork_id">> => NodeId},
+                    PauseCursor = graph_cursor_base(
+                                    NodeId, <<"awaiting_resume">>, Env),
+                    Env1 = commit(
+                             PauseCursor#{
+                               <<"pause">> => Pause,
+                               <<"resume_kind">> =>
+                                   fork_pause_resume_kind(Pause),
+                               <<"fork_results">> => Results0,
+                               <<"failed_branches">> =>
+                                   graph_failed_branches(Env),
+                               <<"paused_branch">> => BranchId,
+                               <<"paused_delta">> => SafeDelta}, Env),
+                    {paused, Pause, Env1};
+                {error, Reason} ->
+                    {failed, {fork_branch_failed, BranchId, Reason}, Env}
+            end;
+        {error, Reason} ->
+            {failed, {fork_branch_failed, BranchId, Reason}, Env};
+        {ok, Control} ->
+            {failed, {fork_branch_failed, BranchId,
+                      {invalid_control, control_name(Control)}}, Env}
+    end.
+
+graph_resume_fork_record(NodeId, BranchId, Output, Delta, Results0, Env) ->
+    case validate_fork_branch_output(BranchId, Output, Env) of
+        {error, Reason} ->
+            {failed, {fork_branch_failed, BranchId,
+                      {output_schema_validation_failed, Reason}}, Env};
+        ok ->
+            case normalize_delta(Delta) of
+                {error, Reason} ->
+                    {failed, {fork_branch_failed, BranchId, Reason}, Env};
+                {ok, SafeDelta} ->
+                    Results = Results0#{
+                                BranchId => fork_result(Output, SafeDelta)},
+                    ForkCursor = graph_fork_cursor(NodeId, Results, Env),
+                    Env1 = commit(ForkCursor, Env),
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => BranchId,
+                                     <<"parent">> => NodeId}, Env1),
+                    graph_from(NodeId, Env1)
+            end
     end.
 
 graph_router(NodeId, Node, Env0) ->
-    case consume_steps(1, Env0) of
+    case consume_action_step(NodeId, Env0) of
         {error, Reason, Env1} -> {failed, Reason, Env1};
         {ok, Env1} ->
             Context = action_context(NodeId, Env1,
@@ -847,18 +1528,11 @@ graph_router_commit(NodeId, Node, Target0, Delta, Env1) ->
     end.
 
 graph_after_routed_node(NodeId, Target, Delta, Env1) ->
-    case merge_delta(Delta, Env1) of
-        {error, Reason} -> {failed, {node_failed, NodeId, Reason}, Env1};
-        {ok, Env2} ->
-            Env3 = commit(
-                     graph_routing_cursor(
-                       NodeId, {explicit, Target},
-                       graph_node_input(Env1), Env2), Env2),
-            graph_route_committed_node(NodeId, Env3)
-    end.
+    graph_after_node(NodeId, {explicit, Target},
+                     graph_node_input(Env1), Delta, Env1).
 
 graph_loop(NodeId, Node, Env0) ->
-    case consume_steps(1, Env0) of
+    case consume_action_step(NodeId, Env0) of
         {error, Reason, Env1} -> {failed, Reason, Env1};
         {ok, Env1} ->
             Context = action_context(NodeId, Env1,
@@ -874,17 +1548,17 @@ graph_loop(NodeId, Node, Env0) ->
 
 graph_loop_decision(NodeId, Node, Reply, Env) ->
     case normalize_graph_while(Reply) of
-        done -> graph_loop_target(maps:get(done, Node), Env);
+        done -> graph_loop_target(NodeId, maps:get(done, Node), Env);
         continue ->
             Visits = graph_visits(Env),
             Count = maps:get(NodeId, Visits, 0),
             Max = maps:get(max_iterations, Node),
             case Count >= Max of
                 true ->
-                    graph_loop_target(maps:get(done, Node), Env);
+                    graph_loop_target(NodeId, maps:get(done, Node), Env);
                 false ->
                     graph_loop_target(
-                      maps:get(body, Node),
+                      NodeId, maps:get(body, Node),
                       Env#{cursor => (maps:get(cursor, Env))#{
                               <<"visits">> => Visits#{NodeId => Count + 1}}})
             end;
@@ -901,17 +1575,10 @@ normalize_graph_while(done) -> done;
 normalize_graph_while({ok, false}) -> done;
 normalize_graph_while(_) -> invalid.
 
-graph_loop_target(Target0, Env) ->
+graph_loop_target(NodeId, Target0, Env) ->
     Target = decode_end_target(Target0),
-    case validate_graph_target(Target, Env) of
-        {ok, end_node} -> {completed, maps:get(state, Env), Env};
-        {ok, Target} ->
-            Env1 = commit(
-                     graph_ready_cursor(
-                       Target, graph_node_input(Env), Env), Env),
-            graph_from(Target, Env1);
-        {error, Reason} -> {failed, Reason, Env}
-    end.
+    graph_after_node(NodeId, {explicit, Target},
+                     graph_node_input(Env), #{}, Env).
 
 graph_fork(NodeId, Node, Env0) ->
     Cursor0 = maps:get(cursor, Env0),
@@ -919,19 +1586,29 @@ graph_fork(NodeId, Node, Env0) ->
         <<"fork">> -> maps:get(<<"results">>, Cursor0, #{});
         _ -> #{}
     end,
+    FailedBranches = case maps:get(<<"phase">>, Cursor0, <<"ready">>) of
+        <<"fork">> -> graph_failed_branches(Env0);
+        _ -> #{}
+    end,
+    emit_lifecycle(<<"fork_started">>,
+                   #{<<"node_id">> => NodeId,
+                     <<"branch_count">> => length(maps:get(branches, Node)),
+                     <<"completed_count">> => map_size(Results)}, Env0),
     Env1 = case maps:get(<<"phase">>, Cursor0, <<"ready">>) of
         <<"fork">> -> Env0;
-        _ -> commit((graph_cursor_base(NodeId, <<"fork">>, Env0))#{
-                        <<"results">> => Results}, Env0)
+        _ -> commit(graph_fork_cursor(NodeId, Results, Env0), Env0)
     end,
     Branches = maps:get(branches, Node),
     Pending0 = [{Index, Id} || {Index, Id} <-
                                   lists:zip(lists:seq(1, length(Branches)),
                                             Branches),
-                              not maps:is_key(Id, Results)],
-    case Pending0 of
-        [] -> graph_fork_finish(NodeId, Node, Results, Env1);
-        _ ->
+                              not maps:is_key(Id, Results),
+                              not maps:is_key(Id, FailedBranches)],
+    case fork_join_ready(Node, Results) of
+        true -> graph_fork_finish(NodeId, Node, Results, Env1);
+        false when Pending0 =:= [] ->
+            {failed, {fork_join_unsatisfied, NodeId}, Env1};
+        false ->
             RuntimeMax = maps:get(max_concurrency, maps:get(runtime, Env1)),
             Max = erlang:min(maps:get(max_concurrency, Node), RuntimeMax),
             case graph_fork_fill(Pending0, #{}, Max, Node, Env1) of
@@ -948,26 +1625,56 @@ graph_fork_fill(Pending, Active, Max, _Node, Env)
   when map_size(Active) >= Max; Pending =:= [] ->
     {ok, Pending, Active, Env};
 graph_fork_fill([{Index, BranchId} | Rest], Active, Max, Node, Env0) ->
-    case consume_steps(1, Env0) of
-        {error, Reason, Env1} -> {error, Reason, Active, Env1};
-        {ok, Env1} ->
-            Branch = maps:get(BranchId, maps:get(nodes, workflow_data(Env1))),
-            Context = action_context(BranchId, Env1,
-                                     graph_node_input(Env1)),
-            Job = spawn_action_worker(maps:get(run, Branch),
-                                      maps:get(state, Env1), Context,
-                                      Index, BranchId,
-                                      action_policy(Branch)),
-            graph_fork_fill(Rest,
-                            Active#{maps:get(job_ref, Job) => Job},
-                            Max, Node, Env1)
+    Branch = maps:get(BranchId, maps:get(nodes, workflow_data(Env0))),
+    case validate_graph_node_input(Branch, graph_node_input(Env0)) of
+        {error, Reason} ->
+            BranchReason = {input_schema_validation_failed, Reason},
+            case maps:get(join_policy, Node, all) of
+                first_success ->
+                    Env1 = record_graph_fork_failure(
+                             maps:get(id, Node), BranchId, Env0),
+                    emit_lifecycle(<<"node_failed">>,
+                                   #{<<"node_id">> => BranchId,
+                                     <<"parent">> => maps:get(id, Node)},
+                                   Env1),
+                    graph_fork_fill(Rest, Active, Max, Node, Env1);
+                _ ->
+                    {error, {fork_branch_failed, BranchId, BranchReason},
+                     Active, Env0}
+            end;
+        ok ->
+            case consume_action_step(BranchId, Env0) of
+                {error, Reason, Env1} -> {error, Reason, Active, Env1};
+                {ok, Env1} ->
+                    emit_lifecycle(<<"node_started">>,
+                                   #{<<"node_id">> => BranchId,
+                                     <<"parent">> => maps:get(id, Node)},
+                                   Env1),
+                    Context = action_context(BranchId, Env1,
+                                             graph_node_input(Env1)),
+                    Job = spawn_action_worker(maps:get(run, Branch),
+                                              maps:get(state, Env1), Context,
+                                              Index, BranchId,
+                                              action_policy(Branch)),
+                    graph_fork_fill(
+                      Rest, Active#{maps:get(job_ref, Job) => Job},
+                      Max, Node, Env1)
+            end
     end.
 
 graph_fork_collect(NodeId, Node, Pending, Active, Results, Max, Env) ->
-    case {Pending, map_size(Active)} of
-        {[], 0} -> graph_fork_finish(NodeId, Node, Results, Env);
-        _ -> graph_fork_receive(NodeId, Node, Pending, Active,
-                                Results, Max, Env)
+    case fork_join_ready(Node, Results) of
+        true ->
+            cancel_active_attempts(Active),
+            kill_active(Active),
+            graph_fork_finish(NodeId, Node, Results, Env);
+        false ->
+            case {Pending, map_size(Active)} of
+                {[], 0} ->
+                    {failed, {fork_join_unsatisfied, NodeId}, Env};
+                _ -> graph_fork_receive(NodeId, Node, Pending, Active,
+                                        Results, Max, Env)
+            end
     end.
 
 graph_fork_receive(NodeId, Node, Pending, Active, Results, Max, Env) ->
@@ -975,10 +1682,21 @@ graph_fork_receive(NodeId, Node, Pending, Active, Results, Max, Env) ->
     CoordinatorRef = maps:get(coordinator_ref, Env),
     Coordinator = maps:get(coordinator, Env),
     receive
+        {adk_workflow_attempt_started, Pid, AttemptRef, JobRef,
+         Id, Attempt}
+          when is_pid(Pid), is_reference(AttemptRef),
+               is_map_key(JobRef, Active) ->
+            Job = maps:get(JobRef, Active),
+            true = maps:get(pid, Job) =:= Pid,
+            record_attempt(Job, Id, Attempt, Env),
+            Pid ! {adk_workflow_attempt_ack, AttemptRef},
+            graph_fork_collect(NodeId, Node, Pending, Active,
+                               Results, Max, Env);
         {adk_workflow_worker, JobRef, Pid, Raw}
           when is_map_key(JobRef, Active) ->
             Job = maps:get(JobRef, Active),
             true = maps:get(pid, Job) =:= Pid,
+            complete_attempt(Job, Raw),
             cleanup_job(Job),
             Active1 = maps:remove(JobRef, Active),
             graph_fork_worker_result(NodeId, Node, Pending, Active1,
@@ -992,12 +1710,12 @@ graph_fork_receive(NodeId, Node, Pending, Active, Results, Max, Env) ->
                 {ok, JobRef, Job} ->
                     Active1 = maps:remove(JobRef, Active),
                     flush_exit(maps:get(pid, Job)),
-                    kill_active(Active1),
-                    {failed,
-                     {fork_branch_failed, maps:get(id, Job),
+                    graph_fork_failed(
+                      NodeId, Node, Pending, Active1, Results, Max, Env,
+                      Job,
                       {worker_down,
                        adk_workflow:external_reason(
-                         adk_workflow_action, process_down, Reason)}}, Env};
+                         adk_workflow_action, process_down, Reason)});
                 error ->
                     graph_fork_collect(NodeId, Node, Pending, Active,
                                        Results, Max, Env)
@@ -1038,8 +1756,11 @@ graph_fork_worker_result(NodeId, _Node, _Pending, Active, Results, _Max,
                             <<"fork_id">> => NodeId},
             Cursor = graph_cursor_base(NodeId, <<"awaiting_resume">>, Env),
             Env1 = commit(Cursor#{<<"pause">> => Pause,
-                                  <<"resume_kind">> => <<"fork_branch">>,
+                                  <<"resume_kind">> =>
+                                      fork_pause_resume_kind(Pause),
                                   <<"fork_results">> => Results,
+                                  <<"failed_branches">> =>
+                                      graph_failed_branches(Env),
                                   <<"paused_branch">> => BranchId,
                                   <<"paused_delta">> => SafeDelta}, Env),
             {paused, Pause, Env1}
@@ -1050,15 +1771,15 @@ graph_fork_worker_result(NodeId, _Node, _Pending, Active, Results, _Max,
     kill_active(Active),
     graph_pause_fork_nested_workflow(
       NodeId, maps:get(id, Job), Pause, ChildCheckpoint, Results, Env);
-graph_fork_worker_result(_NodeId, _Node, _Pending, Active, _Results, _Max,
+graph_fork_worker_result(NodeId, Node, Pending, Active, Results, Max,
                          Env, Job, {ok, Control}) ->
-    kill_active(Active),
-    {failed, {fork_branch_failed, maps:get(id, Job),
-              {invalid_control, control_name(Control)}}, Env};
-graph_fork_worker_result(_NodeId, _Node, _Pending, Active, _Results, _Max,
+    graph_fork_failed(
+      NodeId, Node, Pending, Active, Results, Max, Env, Job,
+      {invalid_control, control_name(Control)});
+graph_fork_worker_result(NodeId, Node, Pending, Active, Results, Max,
                          Env, Job, {error, Reason}) ->
-    kill_active(Active),
-    {failed, {fork_branch_failed, maps:get(id, Job), Reason}, Env};
+    graph_fork_failed(NodeId, Node, Pending, Active, Results, Max,
+                      Env, Job, Reason);
 graph_fork_worker_result(_NodeId, _Node, _Pending, Active, _Results, _Max,
                          Env, _Job, timed_out) ->
     kill_active(Active),
@@ -1078,48 +1799,114 @@ graph_pause_fork_nested_workflow(NodeId, BranchId, Pause0,
                            <<"resume_kind">> =>
                                <<"fork_nested_workflow">>,
                            <<"fork_results">> => Results,
+                           <<"failed_branches">> =>
+                               graph_failed_branches(Env),
                            <<"paused_branch">> => BranchId,
                            <<"nested_checkpoint">> => ChildCheckpoint}, Env),
     {paused, Pause, Env1}.
 
 graph_fork_record(NodeId, Node, Pending0, Active0, Results0, Max,
                   Env0, Job, Output, Delta) ->
-    case normalize_delta(Delta) of
+    BranchId = maps:get(id, Job),
+    case validate_fork_branch_output(BranchId, Output, Env0) of
         {error, Reason} ->
-            kill_active(Active0),
-            {failed, {fork_branch_failed, maps:get(id, Job), Reason}, Env0};
-        {ok, SafeDelta} ->
-            Results = Results0#{maps:get(id, Job) =>
-                                   fork_result(Output, SafeDelta)},
-            Cursor = (graph_cursor_base(NodeId, <<"fork">>, Env0))#{
-                         <<"results">> => Results},
-            Env1 = commit(Cursor, Env0),
-            case graph_fork_fill(Pending0, Active0, Max, Node, Env1) of
-                {error, Reason, Active, Env2} ->
-                    kill_active(Active),
-                    {failed, Reason, Env2};
-                {ok, Pending, Active, Env2} ->
-                    graph_fork_collect(NodeId, Node, Pending, Active,
-                                       Results, Max, Env2)
+            graph_fork_failed(
+              NodeId, Node, Pending0, Active0, Results0, Max,
+              Env0, Job, {output_schema_validation_failed, Reason});
+        ok ->
+            case normalize_delta(Delta) of
+                {error, Reason} ->
+                    graph_fork_failed(
+                      NodeId, Node, Pending0, Active0, Results0, Max,
+                      Env0, Job, Reason);
+                {ok, SafeDelta} ->
+                    Results = Results0#{
+                                BranchId => fork_result(Output, SafeDelta)},
+                    Cursor = graph_fork_cursor(NodeId, Results, Env0),
+                    Env1 = commit(Cursor, Env0),
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => BranchId,
+                                     <<"parent">> => NodeId}, Env1),
+                    case fork_join_ready(Node, Results) of
+                        true ->
+                            cancel_active_attempts(Active0),
+                            kill_active(Active0),
+                            graph_fork_finish(
+                              NodeId, Node, Results, Env1);
+                        false ->
+                            case graph_fork_fill(
+                                   Pending0, Active0, Max, Node, Env1) of
+                                {error, Reason, Active, Env2} ->
+                                    kill_active(Active),
+                                    {failed, Reason, Env2};
+                                {ok, Pending, Active, Env2} ->
+                                    graph_fork_collect(
+                                      NodeId, Node, Pending, Active,
+                                      Results, Max, Env2)
+                            end
+                    end
             end
     end.
 
+graph_fork_failed(NodeId, Node, Pending0, Active0, Results, Max,
+                  Env0, Job, Reason) ->
+    fail_attempt(Job),
+    case maps:get(join_policy, Node, all) of
+        first_success ->
+            Env1 = record_graph_fork_failure(
+                     NodeId, maps:get(id, Job), Env0),
+            emit_lifecycle(<<"node_failed">>,
+                           #{<<"node_id">> => maps:get(id, Job),
+                             <<"parent">> => NodeId}, Env1),
+            case graph_fork_fill(Pending0, Active0, Max, Node, Env1) of
+                {error, FillReason, Active, Env2} ->
+                    kill_active(Active),
+                    {failed, FillReason, Env2};
+                {ok, Pending, Active, Env2} ->
+                    graph_fork_collect(NodeId, Node, Pending, Active,
+                                       Results, Max, Env2)
+            end;
+        _ ->
+            kill_active(Active0),
+            {failed, {fork_branch_failed, maps:get(id, Job), Reason}, Env0}
+    end.
+
 graph_fork_finish(NodeId, Node, Results, Env0) ->
+    CompletedIds = [Id || Id <- maps:get(branches, Node),
+                          maps:is_key(Id, Results)],
     Ordered = [{Id, fork_result_delta(maps:get(Id, Results))}
-               || Id <- maps:get(branches, Node)],
+               || Id <- CompletedIds],
     Outputs = maps:from_list(
                 [{Id, fork_result_output(maps:get(Id, Results))}
-                 || Id <- maps:get(branches, Node)]),
+                 || Id <- CompletedIds]),
+    case validate_graph_node_output(Node, Outputs) of
+        {error, Reason} ->
+            {failed, {node_output_schema_validation_failed,
+                      NodeId, Reason}, Env0};
+        ok ->
+            graph_fork_finish_validated(
+              NodeId, Node, Results, Ordered, Outputs, Env0)
+    end.
+
+graph_fork_finish_validated(NodeId, Node, Results, Ordered, Outputs, Env0) ->
     case merge_parallel(maps:get(merge, Node), Ordered,
                         maps:get(state, Env0), Env0) of
         timed_out -> {timed_out, Env0};
-        {error, Reason} -> {failed, {fork_merge_failed, NodeId, Reason}, Env0};
+        {error, Reason} ->
+            {failed, {fork_merge_failed, NodeId, Reason}, Env0};
         {ok, Delta} ->
             case merge_delta(Delta, Env0) of
                 {error, Reason} ->
                     {failed, {fork_merge_failed, NodeId, Reason}, Env0};
                 {ok, Env1} ->
                     Join = maps:get(join, Node),
+                    emit_lifecycle(<<"node_completed">>,
+                                   #{<<"node_id">> => NodeId}, Env1),
+                    emit_lifecycle(<<"join_completed">>,
+                                   #{<<"fork_id">> => NodeId,
+                                     <<"join_id">> => Join,
+                                     <<"branch_count">> =>
+                                         map_size(Results)}, Env1),
                     EnvWithOutput = Env1#{output => Outputs},
                     Env2 = commit(
                              graph_ready_cursor(
@@ -1127,6 +1914,41 @@ graph_fork_finish(NodeId, Node, Results, Env0) ->
                              EnvWithOutput),
                     graph_from(Join, Env2)
             end
+    end.
+
+fork_join_ready(Node, Results) ->
+    Count = map_size(Results),
+    case maps:get(join_policy, Node, all) of
+        all -> Count =:= length(maps:get(branches, Node));
+        any -> Count >= 1;
+        first_success -> Count >= 1;
+        {quorum, Required} -> Count >= Required
+    end.
+
+cancel_active_attempts(Active) ->
+    lists:foreach(
+      fun(Job) ->
+          AttemptKey = maps:get(attempt_key, Job),
+          case maps:get(AttemptKey, attempts(), undefined) of
+              #{<<"status">> := <<"running">>} = Entry ->
+                  put(?ATTEMPTS_KEY,
+                      (attempts())#{
+                        AttemptKey =>
+                            Entry#{<<"status">> => <<"cancelled">>}});
+              _ -> ok
+          end
+      end, maps:values(Active)),
+    ok.
+
+fail_attempt(Job) ->
+    AttemptKey = maps:get(attempt_key, Job),
+    case maps:get(AttemptKey, attempts(), undefined) of
+        Entry when is_map(Entry) ->
+            put(?ATTEMPTS_KEY,
+                (attempts())#{AttemptKey =>
+                                  Entry#{<<"status">> => <<"failed">>}}),
+            ok;
+        _ -> ok
     end.
 
 fork_result(Output, Delta) ->
@@ -1143,10 +1965,31 @@ fork_result_delta(#{<<"result_version">> := 1,
 fork_result_delta(LegacyDelta) when is_map(LegacyDelta) -> LegacyDelta.
 
 graph_cursor_base(NodeId, Phase, Env) ->
-    #{<<"type">> => <<"graph">>,
-      <<"node">> => NodeId,
-      <<"phase">> => Phase,
-      <<"visits">> => graph_visits(Env)}.
+    Base = #{<<"type">> => <<"graph">>,
+             <<"node">> => NodeId,
+             <<"phase">> => Phase,
+             <<"visits">> => graph_visits(Env)},
+    case maps:find(<<"input">>, maps:get(cursor, Env)) of
+        {ok, Input} -> Base#{<<"input">> => Input};
+        error -> Base
+    end.
+
+graph_fork_cursor(NodeId, Results, Env) ->
+    (graph_cursor_base(NodeId, <<"fork">>, Env))#{
+      <<"results">> => Results,
+      <<"failed_branches">> => graph_failed_branches(Env)}.
+
+graph_failed_branches(Env) ->
+    maps:get(<<"failed_branches">>, maps:get(cursor, Env), #{}).
+
+record_graph_fork_failure(NodeId, BranchId, Env) ->
+    Cursor = maps:get(cursor, Env),
+    Results = maps:get(<<"results">>, Cursor,
+                       maps:get(<<"fork_results">>, Cursor, #{})),
+    Failed = graph_failed_branches(Env),
+    commit((graph_cursor_base(NodeId, <<"fork">>, Env))#{
+             <<"results">> => Results,
+             <<"failed_branches">> => Failed#{BranchId => true}}, Env).
 
 graph_ready_cursor(NodeId, Input, Env) ->
     (graph_cursor_base(NodeId, <<"ready">>, Env))#{
@@ -1162,6 +2005,28 @@ graph_routing_cursor(NodeId, {explicit, Target}, NodeOutput, Env) ->
 
 graph_node_input(Env) ->
     maps:get(<<"input">>, maps:get(cursor, Env), null).
+
+validate_graph_node_input(Node, Input) ->
+    Schema = maps:get(input_schema, Node, undefined),
+    validate_graph_schema(Schema, Input).
+
+validate_graph_node_output(NodeId, Output, Env) ->
+    Node = maps:get(NodeId, maps:get(nodes, workflow_data(Env))),
+    validate_graph_node_output(Node, Output).
+
+validate_graph_node_output(Node, Output) ->
+    Schema = maps:get(output_schema, Node, undefined),
+    validate_graph_schema(Schema, Output).
+
+validate_fork_branch_output(BranchId, Output, Env) ->
+    Branch = maps:get(BranchId, maps:get(nodes, workflow_data(Env))),
+    validate_graph_node_output(Branch, Output).
+
+validate_graph_schema(Schema, Value) ->
+    case adk_json_schema:validate_compiled(Schema, Value) of
+        {ok, _} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
 
 graph_visits(Env) ->
     maps:get(<<"visits">>, maps:get(cursor, Env), #{}).
@@ -1205,16 +2070,27 @@ run_raw(Action, State, Context, Policy, Env) ->
 spawn_action_worker(Action, State, Context, Index, Id, Policy) ->
     Parent = self(),
     JobRef = make_ref(),
+    AttemptKey = maps:get(?ATTEMPT_KEY_OVERRIDE, Context,
+                          attempt_key(Id, Context)),
+    AttemptStart = attempt_start(AttemptKey),
+    PublicContext = maps:remove(?ATTEMPT_KEY_OVERRIDE, Context),
+    WorkerContext = PublicContext#{attempt_key => AttemptKey,
+                                   attempt_job_ref => JobRef,
+                                   attempt_start => AttemptStart},
     {Pid, Monitor} = spawn_opt(
                        fun() ->
                            process_flag(trap_exit, true),
                            Raw = invoke_with_policy(
-                                   Parent, Action, State, Context, Policy),
+                                   Parent, Action, State, WorkerContext,
+                                   Policy),
                            Parent ! {adk_workflow_worker, JobRef,
                                      self(), Raw}
                        end, [link, monitor]),
     #{job_ref => JobRef, pid => Pid, monitor => Monitor,
-      index => Index, id => Id}.
+      index => Index, id => Id, attempt_key => AttemptKey,
+      attempt_cursor_fingerprint =>
+          attempt_cursor_fingerprint(
+            maps:get(checkpoint_cursor, PublicContext, #{}))}.
 
 default_action_policy() ->
     #{timeout => infinity, max_attempts => 1, backoff_ms => 0}.
@@ -1223,9 +2099,16 @@ action_policy(ActionSpec) ->
     maps:get(policy, ActionSpec, default_action_policy()).
 
 invoke_with_policy(Engine, Action, State, Context, Policy) ->
-    invoke_attempt(Engine, Action, State, Context, Policy, 1).
+    Start = maps:get(attempt_start, Context, 1),
+    case Start =< maps:get(max_attempts, Policy) of
+        true -> invoke_attempt(Engine, Action, State, Context, Policy, Start);
+        false ->
+            {callback_retry_exhausted, maps:get(max_attempts, Policy),
+             resumed_attempt_budget_exhausted}
+    end.
 
 invoke_attempt(Engine, Action, State, Context, Policy, Attempt) ->
+    ok = announce_attempt(Engine, Context, Attempt),
     Raw = run_attempt(Engine, Action, State,
                       Context#{attempt => Attempt}, Policy),
     MaxAttempts = maps:get(max_attempts, Policy),
@@ -1244,6 +2127,16 @@ invoke_attempt(Engine, Action, State, Context, Policy, Attempt) ->
             {callback_retry_exhausted, Attempt,
              attempt_failure_reason(Raw)};
         _ -> Raw
+    end.
+
+announce_attempt(Engine, Context, Attempt) ->
+    Ref = make_ref(),
+    Engine ! {adk_workflow_attempt_started, self(), Ref,
+              maps:get(attempt_job_ref, Context),
+              maps:get(step_id, Context), Attempt},
+    receive
+        {adk_workflow_attempt_ack, Ref} -> ok;
+        {'EXIT', Engine, Reason} -> exit(Reason)
     end.
 
 run_attempt(Engine, Action, State, Context, Policy) ->
@@ -1406,9 +2299,8 @@ execute_workflow_tool(Module, Args, Context, ResultKey) ->
         {ok, Requirement} ->
             case adk_tool_confirmation:is_required(Requirement) of
                 true ->
-                    {error,
-                     {tool_confirmation_requires_runner,
-                      confirmation_failure_details(Requirement)}};
+                    execute_confirmed_workflow_tool(
+                      Module, Args, Context, ResultKey, Requirement);
                 false ->
                     execute_unconfirmed_workflow_tool(
                       Module, Args, Context, ResultKey)
@@ -1420,11 +2312,63 @@ execute_workflow_tool(Module, Args, Context, ResultKey) ->
                 tool_confirmation, evaluate, Reason)}}
     end.
 
-confirmation_failure_details(Requirement) ->
-    case maps:find(hint, Requirement) of
-        {ok, Hint} -> #{hint => Hint};
-        error -> #{}
+execute_confirmed_workflow_tool(Module, Args, Context, ResultKey,
+                                Requirement) ->
+    Name = atom_to_binary(Module, utf8),
+    InvocationId = maps:get(invocation_id, Context,
+                            maps:get(session_id, Context)),
+    ActionId = adk_tool_confirmation:action_id(
+                 Name, Args, InvocationId, null),
+    Details0 = #{<<"type">> => <<"tool_confirmation">>,
+                 <<"action_id">> => ActionId},
+    Details = case maps:find(hint, Requirement) of
+        {ok, Hint} -> Details0#{<<"hint">> => Hint};
+        error -> Details0
+    end,
+    case maps:get(tool_confirmation, Context, undefined) of
+        undefined ->
+            {adk_pause, Details,
+             adk_tool_confirmation:summary(Name, Requirement)};
+        #{details := StoredDetails, input := ResumeInput} ->
+            case {StoredDetails =:= Details,
+                  confirmation_decision(ResumeInput)} of
+                {true, approved} ->
+                    execute_unconfirmed_workflow_tool(
+                      Module, Args, Context, ResultKey);
+                {true, rejected} ->
+                    {error, {tool_confirmation_rejected, ActionId}};
+                {true, invalid} ->
+                    {error, invalid_tool_confirmation_input};
+                {false, _} ->
+                    {error, tool_confirmation_action_mismatch}
+            end
     end.
+
+confirmation_decision(#{<<"approved">> := true}) -> approved;
+confirmation_decision(#{<<"approved">> := false}) -> rejected;
+confirmation_decision(_) -> invalid.
+
+pause_resume_kind(#{<<"reason">> :=
+                        #{<<"type">> := <<"tool_confirmation">>}},
+                  _Default) ->
+    <<"tool_confirmation">>;
+pause_resume_kind(_Pause, Default) -> Default.
+
+fork_pause_resume_kind(Pause) ->
+    case pause_resume_kind(Pause, <<"fork_branch">>) of
+        <<"tool_confirmation">> -> <<"fork_tool_confirmation">>;
+        Kind -> Kind
+    end.
+
+run_resumed_tool_confirmation(ActionSpec, Id, ActionInput, ResumeInput, Env) ->
+    Cursor = maps:get(cursor, Env),
+    Pause = maps:get(<<"pause">>, Cursor),
+    Details = maps:get(<<"reason">>, Pause),
+    Context0 = action_context(Id, Env, ActionInput),
+    Context = Context0#{tool_confirmation =>
+                            #{details => Details, input => ResumeInput}},
+    run_action(maps:get(run, ActionSpec), maps:get(state, Env), Context,
+               action_policy(ActionSpec), Env).
 
 execute_unconfirmed_workflow_tool(Module, Args, Context, ResultKey) ->
     case Module:execute(Args, Context) of
@@ -1474,7 +2418,7 @@ run_nested_workflow(Compiled, Opts, State, Context) ->
 
 resume_nested_workflow(Compiled, Opts, Checkpoint, Input, Context) ->
     run_nested_workflow({resume, Checkpoint, Input}, Compiled, Opts,
-                        undefined, Context).
+                        maps:get(state, Context), Context).
 
 run_nested_workflow(Mode, Compiled, Opts, State, Context) ->
     Owner = self(),
@@ -1488,7 +2432,8 @@ run_nested_workflow(Mode, Compiled, Opts, State, Context) ->
     receive
         {adk_nested_workflow, Ref, Helper, Result} ->
             erlang:demonitor(Monitor, [flush]),
-            nested_workflow_result(Result);
+            nested_workflow_result(
+              Result, State, maps:get(state_reducers, Context, #{}));
         {'DOWN', Monitor, process, Helper, Reason} ->
             {error, {nested_workflow_guardian_down,
                      adk_workflow:external_reason(
@@ -1550,22 +2495,93 @@ nested_workflow_options(Opts0, Context) ->
                   retention_ms => maps:get(retention_ms, Opts0, 0)},
     maps:remove(resume_checkpoint, Base).
 
-nested_workflow_result({completed, ChildState, Checkpoint}) ->
+nested_workflow_result({completed, ChildState, Checkpoint},
+                       ParentState, StateReducers) ->
     Output = maps:get(<<"output">>, Checkpoint, ChildState),
-    {output, Output, ChildState};
-nested_workflow_result({paused, Details, Checkpoint}) ->
+    case nested_state_delta(ParentState, ChildState, StateReducers) of
+        {ok, Delta} -> {output, Output, Delta};
+        {error, _} = Error -> Error
+    end;
+nested_workflow_result({paused, Details, Checkpoint},
+                       _ParentState, _StateReducers) ->
     {nested_pause, Details, Checkpoint};
-nested_workflow_result({failed, Reason, _Checkpoint}) ->
+nested_workflow_result({failed, Reason, _Checkpoint},
+                       _ParentState, _StateReducers) ->
     {error, {nested_workflow_failed, Reason}};
-nested_workflow_result({timed_out, _Checkpoint}) ->
+nested_workflow_result({timed_out, _Checkpoint},
+                       _ParentState, _StateReducers) ->
     {error, nested_workflow_timed_out};
-nested_workflow_result({cancelled, Reason, _Checkpoint}) ->
+nested_workflow_result({cancelled, Reason, _Checkpoint},
+                       _ParentState, _StateReducers) ->
     {error, {nested_workflow_cancelled, Reason}};
-nested_workflow_result({error, _} = Error) -> Error;
-nested_workflow_result(Other) ->
+nested_workflow_result({error, _} = Error,
+                       _ParentState, _StateReducers) -> Error;
+nested_workflow_result(Other, _ParentState, _StateReducers) ->
     {error, {invalid_nested_workflow_result,
              adk_workflow:external_reason(
                adk_workflow, nested_result, Other)}}.
+
+nested_state_delta(ParentState, ChildState, StateReducers)
+  when is_map(ParentState), is_map(ChildState), is_map(StateReducers) ->
+    maps:fold(
+      fun(Key, ChildValue, {ok, Delta}) ->
+              case maps:find(Key, ParentState) of
+                  {ok, ChildValue} -> {ok, Delta};
+                  ParentValue ->
+                      nested_state_delta_value(
+                        maps:get(Key, StateReducers, overwrite),
+                        Key, ParentValue, ChildValue, Delta)
+              end;
+         (_Key, _Value, {error, _} = Error) -> Error
+      end, {ok, #{}}, ChildState);
+nested_state_delta(_ParentState, _ChildState, _StateReducers) ->
+    {error, invalid_nested_workflow_state}.
+
+nested_state_delta_value(overwrite, Key, _Parent, ChildValue, Delta) ->
+    {ok, Delta#{Key => ChildValue}};
+nested_state_delta_value(sum, Key, error, ChildValue, Delta)
+  when is_number(ChildValue) ->
+    {ok, Delta#{Key => ChildValue}};
+nested_state_delta_value(sum, Key, {ok, ParentValue}, ChildValue, Delta)
+  when is_number(ParentValue), is_number(ChildValue) ->
+    case safe_numeric_difference(ChildValue, ParentValue) of
+        {ok, Difference} -> {ok, Delta#{Key => Difference}};
+        error ->
+            {error, {nested_state_reducer_incompatible, Key, sum}}
+    end;
+nested_state_delta_value(sum, Key, _Parent, _ChildValue, _Delta) ->
+    {error, {nested_state_reducer_incompatible, Key, sum}};
+nested_state_delta_value(append, Key, error, ChildValue, Delta)
+  when is_list(ChildValue) ->
+    {ok, Delta#{Key => ChildValue}};
+nested_state_delta_value(append, Key, {ok, ParentValue}, ChildValue, Delta)
+  when is_list(ParentValue), is_list(ChildValue) ->
+    case list_suffix_after_prefix(ParentValue, ChildValue) of
+        {ok, Suffix} -> {ok, Delta#{Key => Suffix}};
+        error ->
+            {error, {nested_state_reducer_incompatible, Key, append}}
+    end;
+nested_state_delta_value(append, Key, _Parent, _ChildValue, _Delta) ->
+    {error, {nested_state_reducer_incompatible, Key, append}};
+nested_state_delta_value(reject_conflict, Key, _Parent,
+                         ChildValue, Delta) ->
+    {ok, Delta#{Key => ChildValue}}.
+
+safe_numeric_difference(Left, Right) ->
+    try Left - Right of
+        Difference ->
+            case adk_json:normalize(Difference) of
+                {ok, Difference} -> {ok, Difference};
+                _ -> error
+            end
+    catch
+        error:badarith -> error
+    end.
+
+list_suffix_after_prefix([], List) -> {ok, List};
+list_suffix_after_prefix([Head | ParentRest], [Head | ChildRest]) ->
+    list_suffix_after_prefix(ParentRest, ChildRest);
+list_suffix_after_prefix(_Parent, _Child) -> error.
 
 resolve_agent_prompt(Prompt, _State, _Context)
   when is_binary(Prompt); is_list(Prompt) -> Prompt;
@@ -1627,7 +2643,15 @@ await_job(Job, Env) ->
     Coordinator = maps:get(coordinator, Env),
     Timeout = remaining_timeout(Deadline),
     receive
+        {adk_workflow_attempt_started, Pid, AttemptRef, AttemptJobRef,
+         Id, Attempt}
+          when is_reference(AttemptRef),
+               AttemptJobRef =:= JobRef ->
+            record_attempt(Job, Id, Attempt, Env),
+            Pid ! {adk_workflow_attempt_ack, AttemptRef},
+            await_job(Job, Env);
         {adk_workflow_worker, JobRef, Pid, Raw} ->
+            complete_attempt(Job, Raw),
             cleanup_job(Job),
             normalize_worker_raw(Raw);
         {'DOWN', Monitor, process, Pid, Reason} ->
@@ -1704,6 +2728,15 @@ normalize_action({nested_pause, Details, Checkpoint})
             {error, {invalid_nested_checkpoint, Reason}};
         _ -> {error, invalid_nested_pause}
     end;
+normalize_action(
+  {error, {nested_state_reducer_incompatible, Key, Policy} = Reason})
+  when is_binary(Key), byte_size(Key) =< 4096,
+       (Policy =:= sum orelse Policy =:= append) ->
+    %% This reason is generated by the trusted nested-workflow adapter after
+    %% comparing parent and child state. Preserve its bounded structural
+    %% fields so operators can correct the reducer contract; arbitrary action
+    %% errors still cross the external-error sanitization boundary below.
+    {error, Reason};
 normalize_action({error, Reason}) ->
     {error, adk_workflow:external_reason(
               adk_workflow_action, returned_error, Reason)};
@@ -1748,20 +2781,129 @@ normalize_json_value(Value) ->
 merge_delta(Delta, Env) ->
     case normalize_delta(Delta) of
         {ok, SafeDelta} ->
-            {ok, Env#{state => maps:merge(maps:get(state, Env), SafeDelta)}};
+            State = maps:get(state, Env),
+            Reducers = maps:get(state_reducers, workflow_data(Env), #{}),
+            case reduce_state_delta(
+                   maps:to_list(SafeDelta), State, Reducers) of
+                {ok, NewState} -> {ok, Env#{state => NewState}};
+                {error, _} = Error -> Error
+            end;
         {error, _} = Error -> Error
+    end.
+
+reduce_state_delta([], State, _Reducers) -> {ok, State};
+reduce_state_delta([{Key, Incoming} | Rest], State0, Reducers) ->
+    Policy = maps:get(Key, Reducers, overwrite),
+    case reduce_state_value(Policy, Key, Incoming, State0) of
+        {ok, State} -> reduce_state_delta(Rest, State, Reducers);
+        {error, _} = Error -> Error
+    end.
+
+reduce_state_value(overwrite, Key, Incoming, State) ->
+    {ok, State#{Key => Incoming}};
+reduce_state_value(append, Key, Incoming, State) when is_list(Incoming) ->
+    case maps:find(Key, State) of
+        error -> {ok, State#{Key => Incoming}};
+        {ok, Current} when is_list(Current) ->
+            {ok, State#{Key => Current ++ Incoming}};
+        {ok, _} -> {error, {state_reducer_type_mismatch, Key, append}}
+    end;
+reduce_state_value(append, Key, _Incoming, _State) ->
+    {error, {state_reducer_type_mismatch, Key, append}};
+reduce_state_value(sum, Key, Incoming, State) when is_number(Incoming) ->
+    case maps:find(Key, State) of
+        error -> {ok, State#{Key => Incoming}};
+        {ok, Current} when is_number(Current) ->
+            case safe_numeric_sum(Current, Incoming) of
+                {ok, Sum} -> {ok, State#{Key => Sum}};
+                error -> {error, {state_reducer_numeric_overflow, Key}}
+            end;
+        {ok, _} -> {error, {state_reducer_type_mismatch, Key, sum}}
+    end;
+reduce_state_value(sum, Key, _Incoming, _State) ->
+    {error, {state_reducer_type_mismatch, Key, sum}};
+reduce_state_value(reject_conflict, Key, Incoming, State) ->
+    case maps:find(Key, State) of
+        error -> {ok, State#{Key => Incoming}};
+        {ok, Incoming} -> {ok, State};
+        {ok, _} -> {error, {state_reducer_conflict, Key}}
+    end.
+
+safe_numeric_sum(Left, Right) ->
+    try Left + Right of
+        Sum ->
+            case adk_json:normalize(Sum) of
+                {ok, Sum} -> {ok, Sum};
+                _ -> error
+            end
+    catch
+        error:badarith -> error
     end.
 
 %% Budgets and checkpoints
 
-consume_steps(Count, Env) ->
+begin_parallel(Count, Env) ->
     Remaining = maps:get(steps_remaining, Env),
     case Remaining >= Count of
         false -> {error, {budget_exhausted, steps}, Env};
         true ->
-            Env1 = Env#{steps_remaining => Remaining - Count},
+            %% Persist the scheduler transition and its aggregate budget debit
+            %% as one boundary. A crash can therefore observe neither change
+            %% or both, but never a debited `pending' cursor that is charged a
+            %% second time on resume.
+            Env1 = Env#{steps_remaining => Remaining - Count,
+                        cursor => parallel_running_cursor(#{})},
             notify_checkpoint(Env1),
             {ok, Env1}
+    end.
+
+consume_action_step(Id, Env) ->
+    case find_running_attempt(Id, Env) of
+        {ok, AttemptKey} ->
+            %% The budget was committed before this ambiguous in-flight
+            %% attempt. Re-run the same numbered attempt without charging the
+            %% logical node twice.
+            put({?ATTEMPT_KEY_OVERRIDE, Id}, AttemptKey),
+            {ok, Env};
+        error ->
+            reserve_action_step(Id, Env)
+    end.
+
+reserve_action_step(Id, Env) ->
+    _ = erase({?ATTEMPT_KEY_OVERRIDE, Id}),
+    Remaining = maps:get(steps_remaining, Env),
+    case Remaining >= 1 of
+        false -> {error, {budget_exhausted, steps}, Env};
+        true ->
+            Env1 = Env#{steps_remaining => Remaining - 1},
+            AttemptKey = attempt_key_for_env(Id, Env1),
+            Attempt = attempt_start(AttemptKey),
+            Entry = #{<<"node_id">> => Id,
+                      <<"count">> => Attempt,
+                      <<"status">> => <<"running">>,
+                      <<"cursor_fingerprint">> =>
+                          attempt_cursor_fingerprint(
+                            maps:get(cursor, Env1))},
+            put(?ATTEMPTS_KEY, (attempts())#{AttemptKey => Entry}),
+            %% The debit and reservation share one durable checkpoint. The
+            %% worker cannot execute until its later attempt announcement is
+            %% also acknowledged by the coordinator.
+            notify_checkpoint(Env1),
+            {ok, Env1}
+    end.
+
+find_running_attempt(Id, Env) ->
+    Fingerprint = attempt_cursor_fingerprint(maps:get(cursor, Env)),
+    Matches = [Key || {Key, Entry} <- maps:to_list(attempts()),
+                      is_map(Entry),
+                      maps:get(<<"node_id">>, Entry, undefined) =:= Id,
+                      maps:get(<<"status">>, Entry, undefined)
+                          =:= <<"running">>,
+                      maps:get(<<"cursor_fingerprint">>, Entry, undefined)
+                          =:= Fingerprint],
+    case lists:sort(Matches) of
+        [Key | _] -> {ok, Key};
+        [] -> error
     end.
 
 commit(Cursor, Env) ->
@@ -1770,31 +2912,54 @@ commit(Cursor, Env) ->
     Env1.
 
 notify_checkpoint(Env) ->
+    advance_checkpoint_sequence(),
     Coordinator = maps:get(coordinator, Env),
     CoordinatorRef = maps:get(coordinator_ref, Env),
     AckRef = make_ref(),
     Coordinator ! {adk_workflow_checkpoint, self(), AckRef,
                    checkpoint(Env, false)},
     receive
-        {adk_workflow_checkpoint_ack, AckRef} -> ok;
+        {adk_workflow_checkpoint_ack, AckRef} ->
+            emit_lifecycle(
+              <<"checkpoint_committed">>,
+              #{<<"sequence">> => checkpoint_sequence()}, Env),
+            ok;
         {'DOWN', CoordinatorRef, process, Coordinator, _Reason} ->
             erlang:exit(coordinator_down)
     end.
 
 checkpoint(Env, Completed) ->
     Compiled = maps:get(compiled, Env),
-    Base = #{<<"schema_version">> => 1,
+    Cursor = case Completed of
+        true -> #{<<"type">> => <<"complete">>};
+        false -> maps:get(cursor, Env)
+    end,
+    RuntimeState = checkpoint_runtime_state(Cursor, Completed),
+    Base = #{<<"schema_version">> => 2,
              <<"workflow_id">> => maps:get(id, Compiled),
              <<"workflow_version">> => maps:get(version, Compiled),
              <<"kind">> => atom_to_binary(maps:get(kind, Compiled), utf8),
-             <<"cursor">> => case Completed of
-                 true -> #{<<"type">> => <<"complete">>};
-                 false -> maps:get(cursor, Env)
-             end,
+             <<"definition_fingerprint">> =>
+                 adk_workflow:definition_fingerprint(Compiled),
+             <<"execution_id">> =>
+                 maps:get(invocation_id, maps:get(runtime, Env),
+                          maps:get(execution_id, maps:get(runtime, Env))),
+             <<"sequence">> => checkpoint_sequence(),
+             <<"parent_sequence">> => checkpoint_parent_sequence(),
+             <<"created_at">> => erlang:system_time(millisecond),
+             <<"cursor">> => Cursor,
              <<"state">> => maps:get(state, Env),
              <<"remaining">> =>
                  #{<<"steps">> => maps:get(steps_remaining, Env),
                    <<"transfers">> => maps:get(transfers_remaining, Env)},
+             <<"attempts">> => attempts(),
+             <<"node_status">> => maps:get(node_status, RuntimeState),
+             <<"runnable">> => maps:get(runnable, RuntimeState),
+             <<"waiting">> => maps:get(waiting, RuntimeState),
+             <<"join_accumulators">> =>
+                 maps:get(join_accumulators, RuntimeState),
+             <<"cycle_counters">> => maps:get(cycle_counters, RuntimeState),
+             <<"interruptions">> => maps:get(interruptions, RuntimeState),
              <<"completed">> => Completed},
     case maps:find(output, Env) of
         {ok, Output} -> Base#{<<"output">> => Output};
@@ -1817,6 +2982,251 @@ env_from_checkpoint(Coordinator, Compiled, InitialState, Runtime,
         error -> Env
     end.
 
+initialize_execution_metadata(Checkpoint) ->
+    Sequence = maps:get(<<"sequence">>, Checkpoint, 0),
+    put(?CHECKPOINT_SEQUENCE_KEY, Sequence),
+    put(?CHECKPOINT_PARENT_KEY,
+        maps:get(<<"parent_sequence">>, Checkpoint, null)),
+    put(?ATTEMPTS_KEY, maps:get(<<"attempts">>, Checkpoint, #{})),
+    put(?LIFECYCLE_SEQUENCE_KEY, 0),
+    ok.
+
+terminal_checkpoint(Env, Completed) ->
+    advance_checkpoint_sequence(),
+    checkpoint(Env, Completed).
+
+advance_checkpoint_sequence() ->
+    Current = checkpoint_sequence(),
+    put(?CHECKPOINT_PARENT_KEY, Current),
+    put(?CHECKPOINT_SEQUENCE_KEY, Current + 1),
+    ok.
+
+checkpoint_sequence() ->
+    case get(?CHECKPOINT_SEQUENCE_KEY) of
+        Value when is_integer(Value), Value >= 0 -> Value;
+        _ -> 0
+    end.
+
+checkpoint_parent_sequence() ->
+    case get(?CHECKPOINT_PARENT_KEY) of
+        Value when is_integer(Value), Value >= 0 -> Value;
+        _ -> null
+    end.
+
+attempts() ->
+    case get(?ATTEMPTS_KEY) of
+        Value when is_map(Value) -> Value;
+        _ -> #{}
+    end.
+
+attempt_key(Id, Context) ->
+    Budgets = maps:get(budgets, Context, #{}),
+    Material = {workflow_attempt_v1, Id,
+                stable_attempt_cursor(
+                  maps:get(checkpoint_cursor, Context, #{})),
+                maps:get(steps_remaining, Budgets, 0),
+                maps:get(transfers_remaining, Budgets, 0)},
+    binary:encode_hex(
+      crypto:hash(sha256, term_to_binary(Material, [deterministic])),
+      lowercase).
+
+attempt_key_for_env(Id, Env) ->
+    attempt_key(
+      Id,
+      #{checkpoint_cursor => maps:get(cursor, Env),
+        budgets => #{steps_remaining => maps:get(steps_remaining, Env),
+                     transfers_remaining =>
+                         maps:get(transfers_remaining, Env)}}).
+
+stable_attempt_cursor(Cursor) when is_map(Cursor) ->
+    %% Parallel/fork completion mutates accumulator fields while already
+    %% running siblings retain their original logical attempt identity.
+    maps:without([<<"results">>, <<"fork_results">>,
+                  <<"failed_branches">>], Cursor);
+stable_attempt_cursor(Cursor) -> Cursor.
+
+attempt_cursor_fingerprint(Cursor) ->
+    binary:encode_hex(
+      crypto:hash(
+        sha256,
+        term_to_binary(stable_attempt_cursor(Cursor), [deterministic])),
+      lowercase).
+
+attempt_start(AttemptKey) ->
+    case maps:get(AttemptKey, attempts(), undefined) of
+        #{<<"count">> := Count, <<"status">> := <<"running">>}
+          when is_integer(Count), Count > 0 ->
+            %% A crash can leave an attempt in the ambiguous in-flight state.
+            %% Re-run that same numbered attempt under the documented
+            %% at-least-once boundary; only a committed failed attempt consumes
+            %% the next retry slot.
+            Count;
+        #{<<"count">> := Count} when is_integer(Count), Count >= 0 ->
+            Count + 1;
+        _ -> 1
+    end.
+
+record_attempt(Job, Id, Attempt, Env) ->
+    AttemptKey = maps:get(attempt_key, Job),
+    Entry = #{<<"node_id">> => Id,
+              <<"count">> => Attempt,
+              <<"status">> => <<"running">>,
+              <<"cursor_fingerprint">> =>
+                  maps:get(attempt_cursor_fingerprint, Job)},
+    put(?ATTEMPTS_KEY, (attempts())#{AttemptKey => Entry}),
+    notify_checkpoint(Env),
+    EventType = case Attempt of
+        1 -> <<"attempt_started">>;
+        _ -> <<"retry_started">>
+    end,
+    emit_lifecycle(EventType,
+                   #{<<"node_id">> => Id,
+                     <<"attempt">> => Attempt}, Env),
+    ok.
+
+complete_attempt(Job, Raw) ->
+    AttemptKey = maps:get(attempt_key, Job),
+    case maps:get(AttemptKey, attempts(), undefined) of
+        Entry when is_map(Entry) ->
+            Status = attempt_terminal_status(Raw),
+            put(?ATTEMPTS_KEY,
+                (attempts())#{AttemptKey => Entry#{<<"status">> => Status}}),
+            ok;
+        _ -> ok
+    end.
+
+attempt_terminal_status({callback_ok, {error, _}}) -> <<"failed">>;
+attempt_terminal_status({callback_exception, _, _}) -> <<"failed">>;
+attempt_terminal_status({callback_action_timeout, _}) -> <<"failed">>;
+attempt_terminal_status({callback_attempt_down, _}) -> <<"failed">>;
+attempt_terminal_status({callback_retry_exhausted, _, _}) -> <<"failed">>;
+attempt_terminal_status({callback_global_timeout}) -> <<"failed">>;
+attempt_terminal_status(_) -> <<"completed">>.
+
+checkpoint_runtime_state(_Cursor, true) ->
+    #{node_status => #{}, runnable => [], waiting => [],
+      join_accumulators => #{}, cycle_counters => #{}, interruptions => []};
+checkpoint_runtime_state(Cursor, false) ->
+    Type = maps:get(<<"type">>, Cursor, <<"unknown">>),
+    Phase = case Type of
+        <<"parallel">> -> maps:get(<<"status">>, Cursor, <<"pending">>);
+        _ -> maps:get(<<"phase">>, Cursor, <<"ready">>)
+    end,
+    Node = checkpoint_node_id(Type, Cursor),
+    Status = checkpoint_node_status(Phase),
+    NodeStatus = case Node of
+        undefined -> #{};
+        _ -> #{Node => Status}
+    end,
+    Runnable = case {Node, Phase} of
+        {undefined, _} -> [];
+        {_, <<"awaiting_resume">>} -> [];
+        {_, _} -> [Node]
+    end,
+    Waiting = case {Node, Phase} of
+        {undefined, _} -> [];
+        {_, <<"awaiting_resume">>} -> [Node];
+        _ -> []
+    end,
+    JoinAccumulators = case maps:find(<<"results">>, Cursor) of
+        {ok, Results} when is_map(Results) -> #{Node => Results};
+        _ -> #{}
+    end,
+    Interruptions = case maps:find(<<"pause">>, Cursor) of
+        {ok, Pause} when is_map(Pause) -> [Pause];
+        _ -> []
+    end,
+    #{node_status => NodeStatus,
+      runnable => Runnable,
+      waiting => Waiting,
+      join_accumulators => JoinAccumulators,
+      cycle_counters => maps:get(<<"visits">>, Cursor, #{}),
+      interruptions => Interruptions}.
+
+checkpoint_node_id(<<"graph">>, Cursor) ->
+    maps:get(<<"node">>, Cursor, undefined);
+checkpoint_node_id(<<"sequential">>, Cursor) ->
+    <<"step-", (integer_to_binary(
+                  maps:get(<<"next_index">>, Cursor, 0)))/binary>>;
+checkpoint_node_id(<<"loop">>, _Cursor) -> <<"loop-body">>;
+checkpoint_node_id(<<"transfer">>, Cursor) ->
+    maps:get(<<"member">>, Cursor, undefined);
+checkpoint_node_id(<<"parallel">>, _Cursor) -> <<"parallel">>;
+checkpoint_node_id(_, _Cursor) -> undefined.
+
+checkpoint_node_status(<<"awaiting_resume">>) -> <<"paused">>;
+checkpoint_node_status(<<"fork">>) -> <<"running">>;
+checkpoint_node_status(<<"routing">>) -> <<"routing">>;
+checkpoint_node_status(_) -> <<"ready">>.
+
+emit_lifecycle(Type, Fields, Env)
+  when is_binary(Type), is_map(Fields) ->
+    Runtime = maps:get(runtime, Env),
+    case maps:get(lifecycle_receiver, Runtime, undefined) of
+        undefined -> ok;
+        _Receiver ->
+            Sequence = lifecycle_sequence() + 1,
+            put(?LIFECYCLE_SEQUENCE_KEY, Sequence),
+            Compiled = maps:get(compiled, Env),
+            Event0 = Fields#{
+                <<"schema_version">> => 1,
+                <<"type">> => Type,
+                <<"sequence">> => Sequence,
+                <<"timestamp">> => erlang:system_time(millisecond),
+                <<"workflow_id">> => maps:get(id, Compiled),
+                <<"workflow_kind">> =>
+                    atom_to_binary(maps:get(kind, Compiled), utf8),
+                <<"invocation_id">> =>
+                    invocation_id(Env, maps:get(id, Compiled))},
+            case adk_json:normalize(Event0) of
+                {ok, Event} ->
+                    maps:get(coordinator, Env) !
+                        {adk_workflow_lifecycle, self(), Event},
+                    ok;
+                {error, _} -> ok
+            end
+    end.
+
+emit_terminal_node_failure({failed, Reason}, Env) ->
+    case terminal_failure_node(Reason) of
+        {ok, NodeId} ->
+            emit_lifecycle(<<"node_failed">>,
+                           #{<<"node_id">> => NodeId}, Env);
+        error -> ok
+    end;
+emit_terminal_node_failure(_Outcome, _Env) -> ok.
+
+terminal_failure_node({step_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({branch_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({member_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({node_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({route_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({graph_loop_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({fork_branch_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({fork_merge_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node(
+  {node_input_schema_validation_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node(
+  {node_output_schema_validation_failed, NodeId, _Reason}) -> {ok, NodeId};
+terminal_failure_node({fork_join_unsatisfied, NodeId}) -> {ok, NodeId};
+terminal_failure_node({loop_body_failed, _Reason}) -> {ok, <<"loop-body">>};
+terminal_failure_node({loop_predicate_failed, _Reason}) ->
+    {ok, <<"loop-body">>};
+terminal_failure_node(invalid_loop_predicate_result) ->
+    {ok, <<"loop-body">>};
+terminal_failure_node(_Reason) -> error.
+
+lifecycle_sequence() ->
+    case get(?LIFECYCLE_SEQUENCE_KEY) of
+        Value when is_integer(Value), Value >= 0 -> Value;
+        _ -> 0
+    end.
+
+outcome_name({completed, _}) -> <<"completed">>;
+outcome_name({failed, _}) -> <<"failed">>;
+outcome_name(timed_out) -> <<"timed_out">>;
+outcome_name({paused, _}) -> <<"paused">>.
+
 workflow_data(Env) -> maps:get(data, maps:get(compiled, Env)).
 
 action_context(Id, Env, Input) ->
@@ -1834,16 +3244,25 @@ action_context(Id, Env, Input) ->
              checkpoint_cursor => maps:get(cursor, Env),
              deadline => maps:get(deadline, Env),
              input => Input,
+             state_reducers =>
+                 maps:get(state_reducers, workflow_data(Env), #{}),
              budgets => #{steps_remaining => maps:get(steps_remaining, Env),
                           transfers_remaining =>
                               maps:get(transfers_remaining, Env)}},
-    case maps:find(invocation_id, Runtime) of
+    WithInvocation = case maps:find(invocation_id, Runtime) of
         {ok, InvocationId} -> Base#{invocation_id => InvocationId};
         error -> Base
+    end,
+    case erase({?ATTEMPT_KEY_OVERRIDE, Id}) of
+        AttemptKey when is_binary(AttemptKey) ->
+            WithInvocation#{?ATTEMPT_KEY_OVERRIDE => AttemptKey};
+        _ -> WithInvocation
     end.
 
 invocation_id(Env, Default) ->
-    maps:get(invocation_id, maps:get(runtime, Env), Default).
+    Runtime = maps:get(runtime, Env),
+    maps:get(invocation_id, Runtime,
+             maps:get(execution_id, Runtime, Default)).
 
 remaining_timeout(infinity) -> infinity;
 remaining_timeout(Deadline) ->

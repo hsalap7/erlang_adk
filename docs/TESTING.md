@@ -160,6 +160,37 @@ After the final audit repairs, the seven-module targeted regression set passed
 `max_tokens >= 1` validation, and synchronous/streaming Gun header and trailer
 limits.
 
+## Focused v0.9 graph, durability, and model gates
+
+Use this focused set when maintaining the released 0.9 line:
+
+```bash
+./rebar3 eunit \
+  --module=adk_workflow_v09_runtime_test,adk_workflow_data_contract_test,adk_workflow_first_success_recovery_test,adk_workflow_join_policy_test,adk_workflow_graph_test,adk_graph_foundation_test
+
+./rebar3 eunit \
+  --module=adk_agent_provider_capability_test,adk_provider_profile_test,adk_provider_registry_live_test,adk_provider_request_options_test,adk_provider_vertex_test,adk_local_model_endpoint_test,adk_google_adc_test,adk_model_http_client_test,adk_llm_vertex_test,adk_cli_test
+```
+
+These tests cover checkpoint-v2 identity and v1 migration, durable attempts,
+lifecycle ordering, nested continuation, typed workflow tool confirmation,
+join policies, node schemas, state reducers, graph inspection/CLI, effective
+provider capabilities, loopback-only local endpoints, and injected-transport
+Vertex/ADC behavior. They are diagnostic; they do not replace the clean EUnit,
+Common Test, Dialyzer, coverage, xref, package, and documentation gates.
+
+The Vertex and local-server cases are deterministic configuration/codec/
+transport-boundary evidence. They are not evidence that a paid Vertex project
+or every Ollama, vLLM, LiteLLM, compatible gateway, or model version accepted a
+request. Record optional remote smokes separately, including exact project,
+region, server/version/model, date, and failure/skip status.
+
+The recorded 0.9 deterministic release validation compiled 242 production and
+271 test modules with `-Werror`, passed all 1,495 EUnit tests and all 6 Common
+Test cases, and reported 0 Dialyzer warnings and 0 undefined or deprecated
+call/function findings from `./rebar3 xref`. These direct gates do not
+substitute for the unrecorded coverage, package, or paid-provider gates.
+
 Every current README recipe and sanity command is mapped to its prerequisites
 and validation in
 [`README_EXAMPLE_COVERAGE.md`](README_EXAMPLE_COVERAGE.md).
@@ -183,7 +214,7 @@ _build/default/bin/adk config validate examples/agent.json
 ./scripts/verify_hex_package.sh
 ```
 
-For v0.8, `adk doctor` must report application version `0.8.0`, OTP 27, the
+For v0.9, `adk doctor` must report application version `0.9.0`, OTP 27, the
 REST default `gemini-3.1-flash-lite`, required dependencies, and whether a
 Gemini, OpenAI, or Anthropic key is configured without exposing any key. The
 configuration validator must accept configured binary profiles through their
@@ -194,9 +225,13 @@ exports as unused errors. ExDoc must be warning-free. The non-publishing Hex
 build and artifact verifier must prove required contents, excluded
 caches/secrets, and a clean compile from the extracted package.
 
-On 2026-07-17, xref, escript assembly, `adk doctor` reporting 0.8.0, checked
+Historically, on 2026-07-17, xref, escript assembly, `adk doctor` reporting
+0.8.0, checked
 configuration validation, ExDoc, the 0.8.0 Hex build, and compilation from the
 verified extracted package all passed.
+
+No equivalent 0.9 package result was recorded for this release. Run all
+commands above before making a later package-evidence claim.
 
 ## Paid Gemini REST gate
 
@@ -273,10 +308,11 @@ historical and must not be carried forward as v0.8 evidence.
 
 ## OpenAI, Anthropic, and compatible provider evidence
 
-The 0.8 repository currently provides deterministic injected-transport and
+The 0.9 repository currently provides deterministic injected-transport and
 codec coverage for OpenAI Responses, Anthropic Messages, compatible Chat
-Completions, and OpenAI Realtime. It does not currently provide a first-party
-opt-in paid Common Test suite for those providers. Therefore:
+Completions, OpenAI Realtime, and Vertex AI GenerateContent/SSE. It does not
+currently provide a first-party opt-in paid Common Test suite for those
+providers. Therefore:
 
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` being present is not itself a test;
 - deterministic fixture success must be reported as deterministic evidence,
@@ -314,15 +350,23 @@ modes passed. Those counts are historical. On 2026-07-17 the v0.8
 Production assets, release assembly, and both trusted-proxy and direct-TLS
 loopback smokes also passed.
 
-`mix hex.audit` is expected to remain non-zero at the current lock only for
-the two Cowlib 2.18.0 advisories documented in [`SECURITY.md`](../SECURITY.md).
-The wrapper enforces that exact exception and fails for new or stale findings;
-it does not make the underlying audit a pass. The root Rebar3 project has
-no equivalent `rebar3 hex audit` command; do not describe this Mix result as a
-root dependency audit.
+The v0.9.0 companion gate passed with the refreshed security locks: 103 ExUnit
+tests, 40 dependency-free Node browser/audio tests, warnings-as-errors
+compilation, production assets, release assembly, and both trusted-proxy and
+verified direct-TLS health smokes. `mix deps --check-locked` reports every
+dependency current, including the path dependency as Erlang ADK 0.9.0.
 
-For the recorded v0.8 gate, raw `mix hex.audit` was non-zero only for those
-same two advisories, and the exact-exception verifier passed.
+The current locks resolve Bandit 1.12.4, Cowboy 2.18.0, Cowlib 2.19.0, and Gun
+2.4.1. `mix hex.audit` is expected to remain non-zero only for the three package
+findings covering the two unresolved Cowlib advisories documented in
+[`SECURITY.md`](../SECURITY.md): EEF-CVE-2026-43969, EEF-CVE-2026-43966, and
+Gun's GHSA-w4f7-4cxr-rv3c alias for the latter. The wrapper enforces that exact
+package/advisory set and fails for new or stale findings; it does not make the
+underlying audit a pass. The root Rebar3 project has no equivalent `rebar3 hex
+audit` command; do not describe this Mix result as a root dependency audit.
+
+For the recorded v0.8 gate, raw `mix hex.audit` was non-zero only for the two
+Cowlib advisories then present, and the prior exact-exception verifier passed.
 
 The companion's local-auth mode is for interactive development, but its
 authorization, CSRF, session, gateway, socket, LiveView, static-asset, and

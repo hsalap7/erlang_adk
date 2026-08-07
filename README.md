@@ -3,7 +3,10 @@
 Erlang ADK (Agent Development Kit) helps you build AI agents in Erlang. An
 agent can ask a model for a response, call Erlang functions, remember session
 data, stream progress, and work with other agents. The project supports
-Gemini, OpenAI, Anthropic, and selected OpenAI-compatible APIs.
+Gemini, Vertex AI, OpenAI, Anthropic, and selected OpenAI-compatible APIs,
+including an explicit loopback-only local-server mode.
+
+The current release is **v0.9.0**.
 
 Agents and workflows use Erlang's lightweight processes, supervision, and
 message passing. The project follows useful behavior from Google ADK, but it
@@ -14,7 +17,7 @@ is designed for OTP rather than copied from the Python package.
 | If you want to... | Use | Start here |
 | --- | --- | --- |
 | Build an agent that can call Erlang code | Agents and tools | [Your first agent](#your-first-agent), [Add an Erlang tool](#add-an-erlang-tool) |
-| Switch between model companies or endpoints | Gemini, OpenAI, Anthropic, compatible APIs, and named provider settings | [Choose a model provider](#choose-a-model-provider) |
+| Switch between model companies or endpoints | Gemini, Vertex AI, OpenAI, Anthropic, compatible/local APIs, and named provider settings | [Choose a model provider](#choose-a-model-provider) |
 | Split work between agents | Delegation, sequential agents, and concurrent agents | [Run multiple agents](#run-multiple-agents) |
 | Control a multi-step job in application code | Sequential, parallel, loop, transfer, graph, and resumable workflows | [Run a workflow](#run-a-workflow) |
 | Keep a run's events and allow pause, resume, or cancellation | The Runner and supervised runs | [Use the Runner](#use-the-runner) |
@@ -31,8 +34,8 @@ is designed for OTP rather than copied from the Python package.
 
 - **Agent**: a supervised Erlang process with a model, instructions, and
   tools.
-- **Model provider**: the API that runs the model, such as Gemini, OpenAI, or
-  Anthropic.
+- **Model provider**: the API that runs the model, such as Gemini, Vertex AI,
+  OpenAI, or Anthropic.
 - **Tool**: an Erlang module or external operation that an agent is allowed to
   call.
 - **Runner**: executes an agent for one app, user, and session while recording
@@ -67,19 +70,18 @@ From this repository:
 
 The shell starts the `erlang_adk` application automatically.
 
-To use the project as a Git dependency before the release tag exists, pin the
-reviewed commit rather than a moving branch:
+Use the released Git tag as a dependency:
 
 ```erlang
 {deps, [
     {erlang_adk,
      {git, "https://github.com/hsalap7/erlang_adk.git",
-      {ref, "REVIEWED_COMMIT_SHA"}}}
+      {tag, "v0.9.0"}}}
 ]}.
 ```
 
-After `v0.8.0` is tagged, the Git reference can be `{tag, "v0.8.0"}`. After
-the package is published to Hex, use `{erlang_adk, "0.8.0"}`.
+For installations from Hex, use `{erlang_adk, "0.9.0"}` once the package is
+available in the configured Hex repository.
 
 In an application that does not use the repository shell configuration, start
 the library before creating agents:
@@ -125,17 +127,19 @@ not a successful text response.
 For a small trusted Erlang application, the direct provider modules are the
 shortest setup:
 
-| Provider | Module | Default credential variable |
+| Provider | Module | Credential source |
 | --- | --- | --- |
 | Gemini | `adk_llm_gemini` | `GEMINI_API_KEY` |
+| Vertex AI | `adk_llm_vertex` | OAuth access token or trusted Google ADC |
 | OpenAI Responses | `adk_llm_openai` | `OPENAI_API_KEY` |
 | Anthropic Messages | `adk_llm_anthropic` | `ANTHROPIC_API_KEY` |
 | OpenAI-compatible Chat Completions | `adk_llm_compatible` | Configured explicitly |
 
 For production or an application that uses more than one provider, use
 provider profiles. A profile gives a simple name to a provider, model,
-endpoint, and API-key source. Configure profiles in `sys.config` or application
-environment. Agent code then selects the simple profile and model names.
+endpoint, and credential source. Configure profiles in `sys.config` or
+application environment. Agent code then selects the simple profile and model
+names.
 
 This example configures four request-provider profiles. Replace the
 placeholder model IDs with models enabled for your accounts:
@@ -187,9 +191,17 @@ io:format("~ts~n", [Reply]),
 ok = erlang_adk:stop_agent(Agent).
 ```
 
-See [Model provider profiles](docs/PROVIDER_PROFILES.md) for OpenAI
-Realtime, compatible endpoints, structured output, provider-specific options,
-and production configuration.
+Vertex profiles use a complete
+`projects/PROJECT/locations/LOCATION/publishers/google/models/MODEL` resource
+and the `vertex` endpoint preset, so trusted configuration owns both authority
+and path. Keyless local compatible profiles are restricted to numeric
+`127.0.0.1` or `::1`, auth `none`, and non-Live requests.
+
+See [Model provider profiles](docs/PROVIDER_PROFILES.md) for Vertex/ADC,
+OpenAI Realtime, compatible endpoints, structured output, provider-specific
+options, and production configuration. See
+[Model support](docs/MODEL_SUPPORT.md) for evidence tiers and local-server
+recipes; it does not promise support for every model a vendor exposes.
 
 ## Common tasks
 
@@ -303,7 +315,21 @@ WorkflowSpec = #{
 
 Workflow kinds include `sequential`, `parallel`, `loop`, `transfer`, and
 `graph`. Workflows support cancellation, saved checkpoints, pause/resume,
-retry, and optional Mnesia-backed run history.
+durable retry attempts, optional per-node schemas and state reducers, ordered
+lifecycle events, and optional Mnesia-backed run history. Checkpoint schema v2
+binds resume to a compiled definition fingerprint; legacy v1 checkpoints are
+accepted for the 0.8-to-0.9 migration and rewritten at the next boundary.
+
+Compiled graphs can be inspected without exposing callbacks or tool arguments:
+
+```erlang
+{ok, Description} = erlang_adk:inspect_graph(Workflow),
+{ok, Mermaid} = erlang_adk:render_graph(Workflow, mermaid).
+```
+
+The packaged CLI also provides `adk graph validate`, `adk graph describe`, and
+`adk graph render` for an already available module's exported zero-arity graph
+factory.
 
 See [Graph workflows](docs/GRAPH_WORKFLOWS.md),
 [planning](docs/PLANNING_RUNTIME.md), and
@@ -342,9 +368,11 @@ See [Durable invocations](docs/DURABLE_INVOCATIONS.md),
 
 ### Human approval and long-running work
 
-An agent tool that needs confirmation can pause only when it runs through the
-Runner or stable-run API. Direct `prompt`, delegation, and agent-as-tool calls
-return `tool_confirmation_requires_runner` instead of bypassing approval.
+An agent tool that needs confirmation can pause when it runs through the
+Runner or stable-run API. A protected tool node inside a typed workflow also
+produces a correlated `tool_confirmation` pause and can resume from its
+checkpoint. Direct `prompt`, delegation, and agent-as-tool calls still return
+`tool_confirmation_requires_runner` instead of bypassing approval.
 
 A workflow action can independently pause with structured details. Runner
 runs and workflows can later resume from the returned run ID or checkpoint.
@@ -661,6 +689,16 @@ old data, reruns EUnit and Common Test with coverage, and enforces the
 repository floor. The repeated test run is intentional: it gathers fresh
 coverage data. Running `rebar3 cover --verbose` alone does not execute tests.
 
+The v0.9.0 deterministic release validation succeeded: 242 production and 271
+test modules compiled with warnings treated as errors, all 1,495 EUnit tests
+and all 6 deterministic Common Test cases passed, Dialyzer reported 0 warnings,
+and `./rebar3 xref` reported 0 undefined or deprecated calls or functions. See
+the
+[v0.9.0 release evidence](docs/VERSION_0_9_0.md#release-evidence-ledger) for the
+separately tracked coverage, packaging, Phoenix, and paid-provider gates. The
+Phoenix companion additionally passed 103 ExUnit tests, 40 browser/audio tests,
+production asset/release assembly, and both release health smokes.
+
 ### If README examples changed
 
 Run the two focused modules above and compile the checked example modules with
@@ -692,8 +730,8 @@ The first setup needs network access:
 
 `mix precommit` checks formatting, compilation warnings, browser/audio
 JavaScript, assets, and ExUnit with fake providers. It does not use model
-quota. The audit verifier accepts only the exact documented dependency
-exception and fails if the set changes.
+quota. The audit verifier accepts only the exact three documented package
+findings for the two unresolved Cowlib advisories and fails if the set changes.
 
 ### Documentation, CLI, and package checks
 
@@ -758,6 +796,7 @@ interpretation.
 | --- | --- |
 | All documentation | [Documentation index](docs/README.md) |
 | Provider profiles and vendor setup | [Provider profiles](docs/PROVIDER_PROFILES.md) |
+| Model/endpoint support and evidence | [Model support](docs/MODEL_SUPPORT.md) |
 | Supported and partial features | [Feature support](docs/FEATURE_PARITY.md) |
 | Runtime limits, failures, and cancellation | [Runtime safety](docs/RUNTIME_SAFETY.md) |
 | Workflows, planning, and durable runs | [Graph workflows](docs/GRAPH_WORKFLOWS.md), [planning](docs/PLANNING_RUNTIME.md), [durable invocations](docs/DURABLE_INVOCATIONS.md) |
@@ -772,7 +811,7 @@ interpretation.
 | Upgrading | [Upgrade guide](docs/UPGRADING.md) |
 | Security | [Security policy](SECURITY.md) |
 | Source and test layout | [Source layout](src/README.md), [test layout](docs/TEST_LAYOUT.md) |
-| Current release scope | [v0.8.0 release details](docs/VERSION_0_8_0.md) |
+| Current release scope | [v0.9.0 release details](docs/VERSION_0_9_0.md) |
 
 ## Project status and security
 

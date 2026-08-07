@@ -143,9 +143,38 @@ resolve_live_transport(#{adapter := Adapter,
         true ->
             case adapter_transport(Adapter) of
                 {ok, Transport} ->
-                    {ok, Resolved#{transport => Transport}};
+                    case adapter_live_capabilities(
+                           Adapter, maps:get(capabilities, Resolved, #{})) of
+                        {ok, Capabilities} ->
+                            {ok, Resolved#{transport => Transport,
+                                           capabilities => Capabilities}};
+                        {error, _} = Error -> Error
+                    end;
                 {error, _} = Error -> Error
             end
+    end.
+
+adapter_live_capabilities(Adapter, ProfileCapabilities) ->
+    try Adapter:capabilities() of
+        AdapterCapabilities when is_map(AdapterCapabilities) ->
+            case adk_provider_capabilities:constrain(
+                   AdapterCapabilities, ProfileCapabilities) of
+                {ok, Capabilities} ->
+                    case adk_provider_capabilities:supports(
+                           Capabilities, live) of
+                        true -> {ok, Capabilities};
+                        false ->
+                            {error,
+                             {provider_profile_capability_unavailable,
+                              live}}
+                    end;
+                {error, _} ->
+                    {error, invalid_provider_live_capabilities}
+            end;
+        _ ->
+            {error, invalid_provider_live_capabilities}
+    catch
+        _:_ -> {error, invalid_provider_live_capabilities}
     end.
 
 %% The bundled Live transports have fixed TLS origins. A profile must name
@@ -188,6 +217,8 @@ request_caller_allowlist(adk_llm_compatible) ->
     {ok, compatible_request_options() ++ agent_runtime_options()};
 request_caller_allowlist(adk_llm_gemini) ->
     {ok, gemini_request_options() ++ agent_runtime_options()};
+request_caller_allowlist(adk_llm_vertex) ->
+    {ok, vertex_request_options() ++ agent_runtime_options()};
 request_caller_allowlist(Adapter) ->
     custom_request_caller_allowlist(Adapter).
 
@@ -214,6 +245,12 @@ gemini_request_options() ->
      stop_sequences, response_mime_type, response_schema,
      thinking_config, safety_settings, builtin_tools, content_limits,
      request_timeout, context_cache].
+
+vertex_request_options() ->
+    [temperature, top_p, top_k, max_tokens, max_output_tokens,
+     stop_sequences, response_mime_type, response_schema,
+     safety_settings, content_limits, max_stream_events,
+     request_timeout, max_response_bytes].
 
 agent_runtime_options() ->
     [instructions, global_instruction, input_schema, output_schema,
@@ -260,7 +297,9 @@ request_authority_key(Key) ->
        provider_profile, profile, model_id, request_options,
        api_key, auth_scheme, organization, project, store,
        anthropic_version, http_transport, transport,
-       allow_private_hosts, cacertfile, tls_opts, ssl_options,
+       adc_token_provider,
+       allow_private_hosts, local_endpoint_policy,
+       cacertfile, tls_opts, ssl_options,
        input_audio_sample_rate, input_audio_sample_rate_hz]).
 
 prohibited_overrides(Config) ->
@@ -268,7 +307,8 @@ prohibited_overrides(Config) ->
                 base_url, url, headers, credential, credential_source,
                 provider_profile, profile, model_id,
                 input_audio_sample_rate, input_audio_sample_rate_hz,
-                http_transport, transport, allow_private_hosts],
+                http_transport, transport, allow_private_hosts,
+                local_endpoint_policy, adc_token_provider],
     [Key || Key <- maps:keys(Config),
             lists:member(Key, Explicit) orelse
             adk_context_guard:sensitive_key(Key)].

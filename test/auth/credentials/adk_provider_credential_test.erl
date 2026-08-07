@@ -99,6 +99,14 @@ missing_and_invalid_credentials_have_data_free_errors_test() ->
          #{},
          fun() -> adk_provider_credential:resolve(<<"unknown">>) end)).
 
+google_adc_is_an_opaque_trusted_source_marker_test() ->
+    ?assertEqual({ok, #{source => google_adc}},
+                 adk_provider_credential:describe(google_adc)),
+    ?assertEqual({ok, google_adc},
+                 adk_provider_credential:resolve(google_adc, trusted)),
+    ?assertEqual({error, credential_source_not_allowed},
+                 adk_provider_credential:resolve(google_adc, untrusted)).
+
 base_profile(Credential) ->
     #{request_adapter => adk_llm_dummy,
       endpoint => openai,

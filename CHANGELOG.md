@@ -5,18 +5,92 @@ All notable changes to Erlang ADK are documented here. The project follows
 
 Versions 0.3.0 through 0.7.0 below are frozen delivery milestones in the
 development history; their presence does not claim that a package was
-published for each milestone. Version 0.8.0 is the current cumulative release
-candidate. The detailed evidence and remaining limitations are in the
-corresponding documents under [`docs/`](docs/README.md).
-
-The `0.8.0` and `Unreleased` references at the end of this file intentionally
-target the prospective `v0.8.0` tag. They become usable only after the release
-checklist is approved and that tag is created; this candidate does not claim
-the tag or Hex package already exists.
+published for each milestone. Version 0.9.0 is the current released version.
+The detailed evidence and remaining limitations are in the corresponding
+documents under [`docs/`](docs/README.md).
 
 ## [Unreleased]
 
 No changes have been assigned to the next release.
+
+## [0.9.0] - 2026-08-06
+
+### Added
+
+- Definition-bound workflow checkpoint schema v2 with a stable execution ID,
+  ordered lineage, durable attempt/node/runnable/waiting/join/cycle/interruption
+  state, optional portable definition revisions, and one-step v1 migration.
+- Ordered schema-v1 workflow lifecycle delivery through the opt-in
+  `lifecycle_receiver`, separate from the legacy event receiver.
+- Checkpoint-resumable nested workflow pauses in parallel, loop, transfer,
+  graph, and graph-fork execution, plus typed tool-confirmation pauses in every
+  typed workflow shape.
+- Canonical graph validation and non-executable JSON inspection, deterministic
+  DOT/Mermaid rendering, public inspection APIs, and `adk graph validate`,
+  `describe`, and `render` commands.
+- Fork `all`, `any`, `first_success`, and quorum join policies; per-node input
+  and output JSON Schemas; and per-key `overwrite`, `append`, `sum`, or
+  conflict-rejecting state reducers.
+- A constrained keyless loopback policy for local OpenAI-compatible servers,
+  with model-support recipes and explicit evidence tiers.
+- Native Vertex AI publisher-model GenerateContent/SSE with fixed authority
+  derivation and bounded OAuth/Google ADC token acquisition.
+- [`docs/VERSION_0_9_0.md`](docs/VERSION_0_9_0.md), the 0.9 release contract.
+
+### Changed
+
+- Agent generation features are checked against adapter capability
+  declarations, and profile-selected Live capabilities cannot exceed the
+  selected adapter's implementation ceiling.
+- Workflow retry attempt numbers survive checkpoints. An ambiguous in-flight
+  attempt repeats at the same number after recovery rather than receiving a
+  fresh retry budget.
+- Root and Phoenix locks now resolve Cowboy 2.18.0, Cowlib 2.19.0, Ranch 2.2.1,
+  and Gun 2.4.1; the companion additionally resolves Bandit 1.12.4 and
+  Plug.Crypto 2.2.0.
+- The application and OTLP instrumentation versions are now `0.9.0`.
+
+### Security
+
+- Graph inspection omits executable callbacks, captures, tool arguments,
+  nested options, credentials, and provider configuration.
+- Graph factory CLI lookup is limited to already available modules and
+  exported zero-arity functions, avoiding unbounded atom creation from command
+  input.
+- Keyless cleartext compatible endpoints are restricted to numeric IPv4/IPv6
+  loopback with auth `none`; existing HTTPS, verified-TLS, redirect, and
+  private-address policy remains in force elsewhere.
+- Vertex profiles cannot expose OAuth tokens, ADC handles, arbitrary origins,
+  headers, executables, or command arguments to public configuration.
+- Dependency upgrades remove Bandit EEF-CVE-2026-65623, Cowboy
+  EEF-CVE-2026-65624, and Cowlib EEF-CVE-2026-59248 from the Phoenix audit.
+  The exact-exception verifier now matches package/advisory pairs, so a new
+  GHSA-only finding cannot hide behind the two documented unresolved Cowlib
+  advisories.
+
+### Validation
+
+- Release validation compiled 242 production modules and 271 test modules with
+  warnings treated as errors. All 1,495 EUnit tests and all 6 deterministic
+  Common Test cases passed.
+- A fresh Dialyzer run completed with 0 warnings, and `./rebar3 xref` reported
+  0 undefined or deprecated calls or functions. The passing aggregate includes
+  the focused graph, durability, provider, model, and CLI regression suites.
+- The Phoenix companion passed 103 ExUnit and 40 browser/audio tests,
+  production asset and release assembly, locked-dependency validation, and
+  trusted-proxy plus verified direct-TLS health smokes.
+
+### Compatibility and known limitations
+
+- Checkpoint recovery and lifecycle delivery remain at least once, never
+  exactly once for external effects. A v1 checkpoint is readable for migration
+  and is rewritten as definition-bound v2 at its next commit.
+- There is no visual graph editor, arbitrary multi-node branch-region
+  scheduler, automatic cross-vendor router, blanket 100+ model guarantee, or
+  Agent Skills implementation.
+- Coverage, package, and optional paid-provider results were not recorded for
+  this release; deterministic fixtures do not prove arbitrary Vertex or
+  OpenAI-compatible deployments.
 
 ## [0.8.0] - 2026-07-17
 
@@ -327,7 +401,8 @@ No changes have been assigned to the next release.
 - Explicit process ownership and secret-isolation rules used by later
   releases.
 
-[Unreleased]: https://github.com/hsalap7/erlang_adk/compare/v0.8.0...version_0.8.0
+[Unreleased]: https://github.com/hsalap7/erlang_adk/compare/v0.9.0...main
+[0.9.0]: https://github.com/hsalap7/erlang_adk/tree/v0.9.0
 [0.8.0]: https://github.com/hsalap7/erlang_adk/tree/v0.8.0
 [0.7.0]: https://github.com/hsalap7/erlang_adk/tree/v0.7.0
 [0.6.0]: https://github.com/hsalap7/erlang_adk/tree/6448793

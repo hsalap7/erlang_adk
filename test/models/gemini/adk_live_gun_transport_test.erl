@@ -190,7 +190,7 @@ gun_up_resolves_credential_and_starts_strict_upgrade_test() ->
             ?assertEqual([{<<"key">>, Secret}],
                          uri_string:dissect_query(Query)),
             ?assert(lists:member(
-                      {<<"user-agent">>, <<"erlang-adk/0.8">>},
+                      {<<"user-agent">>, <<"erlang-adk/0.9">>},
                       Headers)),
             ?assertEqual(3, maps:get(flow, WsOptions)),
             ?assertEqual(false, maps:get(compress, WsOptions)),

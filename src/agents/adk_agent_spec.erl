@@ -291,7 +291,8 @@ decode_json(Binary) ->
 check_capabilities(#spec{required_capabilities = Required}, Capabilities)
   when is_map(Capabilities) ->
     Missing = [Capability || Capability <- Required,
-                             maps:get(Capability, Capabilities, false) =/= true],
+                             not adk_provider_capabilities:supports(
+                                   Capabilities, Capability)],
     case Missing of
         [] -> ok;
         _ -> {error, {missing_capabilities, Missing}}

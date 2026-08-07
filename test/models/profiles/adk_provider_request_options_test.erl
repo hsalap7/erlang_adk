@@ -56,6 +56,7 @@ caller_cannot_override_locked_or_unknown_request_options_test() ->
                #{api_key => <<"caller-secret">>},
                #{http_transport => adk_model_fixture_transport},
                #{allow_private_hosts => true},
+               #{local_endpoint_policy => loopback_keyless},
                #{temperatur => 0.2}],
           lists:foreach(
             fun(Override) ->
@@ -139,6 +140,44 @@ invalid_compatible_locked_response_format_is_rejected_test() ->
     ?assertEqual(
        {error, invalid_provider_request_options},
        adk_provider_profile:validate(<<"compatible">>, Profile)).
+
+local_compatible_profile_is_valid_without_caller_authority_test() ->
+    Endpoint = #{scheme => http,
+                 host => <<"127.0.0.1">>,
+                 port => 11434,
+                 base_path => <<"/v1">>,
+                 policy => loopback_keyless},
+    Profile = #{request_adapter => adk_llm_compatible,
+                endpoint => Endpoint,
+                models => #{<<"chat">> => <<"configured-local-model">>},
+                credential => none,
+                request_options => #{auth_scheme => none,
+                                     response_format => unsupported}},
+    with_profiles(
+      #{<<"ollama-local">> => Profile},
+      fun() ->
+          Public = #{provider => <<"ollama-local">>, model => <<"chat">>,
+                     temperature => 0.2, max_tokens => 128},
+          {ok, Resolved} = adk_provider_registry:resolve_config(Public),
+          ?assertEqual(Endpoint, maps:get(endpoint, Resolved)),
+          ?assertEqual(none,
+                       maps:get(source, maps:get(credential, Resolved))),
+          ?assertEqual(none,
+                       maps:get(auth_scheme, maps:get(options, Resolved))),
+          ?assertEqual(ok, adk_llm:validate_config(Public)),
+          lists:foreach(
+            fun(Override) ->
+                ?assertEqual(
+                   {error, provider_profile_override_not_allowed},
+                   adk_provider_registry:resolve_config(
+                     maps:merge(Public, Override)))
+            end,
+            [#{base_url => <<"http://127.0.0.1:9999/v1">>},
+             #{allow_private_hosts => true},
+             #{local_endpoint_policy => loopback_keyless},
+             #{auth_scheme => bearer},
+             #{api_key => <<"caller-key">>}])
+      end).
 
 invalid_operator_request_options_are_bounded_and_data_free_test() ->
     Secret = <<"operator-request-option-secret-must-not-leak">>,

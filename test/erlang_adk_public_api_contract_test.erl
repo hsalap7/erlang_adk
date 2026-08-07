@@ -8,7 +8,7 @@ documented_facade_exports_remain_available_test() ->
       [{spawn_agent, 3}, {stop_agent, 1}, {prompt, 2}, {invoke, 3},
        {delegate, 2}, {delegate, 3}, {delegate, 4},
        {sequential, 2}, {parallel, 2}, {parallel, 3}, {loop, 4},
-       {compile_workflow, 1},
+       {compile_workflow, 1}, {inspect_graph, 1}, {render_graph, 2},
        {start_workflow, 2}, {start_workflow, 3},
        {run_workflow, 2}, {run_workflow, 3},
        {await_workflow, 1}, {await_workflow, 2},
@@ -47,7 +47,7 @@ supported_model_provider_contracts_remain_available_test() ->
               {capabilities, 0}, {validate_config, 1},
               {public_config, 1}],
     [assert_exports(Module, Common)
-     || Module <- [adk_llm_gemini, adk_llm_openai,
+     || Module <- [adk_llm_gemini, adk_llm_vertex, adk_llm_openai,
                    adk_llm_anthropic, adk_llm_compatible]],
     assert_exports(adk_llm_compatible, [{capabilities, 1}]).
 
