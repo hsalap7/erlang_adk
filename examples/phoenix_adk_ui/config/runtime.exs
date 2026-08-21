@@ -32,7 +32,9 @@ if config_env() == :dev and local_auth do
     "adk.live.read",
     "adk.live.control",
     "adk.observability.read",
-    "adk.evaluation.read"
+    "adk.evaluation.read",
+    "adk.graph.read",
+    "adk.trace.read"
   ]
 
   config :erlang_adk_ui,
@@ -73,7 +75,8 @@ if config_env() != :test and not (config_env() == :dev and local_auth) do
     System.get_env(
       "OIDC_SCOPES",
       "openid adk.agents.read adk.run.start adk.run.read adk.run.control " <>
-        "adk.live.read adk.live.control adk.observability.read adk.evaluation.read"
+        "adk.live.read adk.live.control adk.observability.read adk.evaluation.read " <>
+        "adk.graph.read adk.trace.read"
     )
     |> String.split(" ", trim: true)
 

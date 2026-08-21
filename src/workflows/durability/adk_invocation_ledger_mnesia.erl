@@ -246,9 +246,35 @@ ensure_disk_schema() ->
 
 wait_for_table(Table) ->
     case mnesia:wait_for_tables([Table], ?TABLE_WAIT_MS) of
-        ok -> {ok, #{table => Table}};
+        ok ->
+            case validate_table(Table) of
+                ok -> {ok, #{table => Table}};
+                {error, _} = Error -> Error
+            end;
         {timeout, Tables} -> {error, {table_wait_timeout, Tables}};
         {error, Reason} -> {error, {table_wait_failed, Reason}}
+    end.
+
+validate_table(Table) ->
+    Expected = [
+        {attributes, record_info(fields, adk_durable_invocation)},
+        {record_name, adk_durable_invocation},
+        {type, set},
+        {majority, true},
+        {storage_type, disc_copies}
+    ],
+    validate_table_properties(Table, Expected).
+
+validate_table_properties(_Table, []) ->
+    ok;
+validate_table_properties(Table, [{Property, Expected} | Rest]) ->
+    Actual = mnesia:table_info(Table, Property),
+    case Actual =:= Expected of
+        true -> validate_table_properties(Table, Rest);
+        false ->
+            {error,
+             {invocation_ledger_table_schema_mismatch, Table,
+              Property, Expected, Actual}}
     end.
 
 with_table(#{table := Table}, Fun) when is_atom(Table), is_function(Fun, 1) ->

@@ -2,9 +2,12 @@
 %%
 %% The CLI deliberately consumes JSON configuration with a small, checked key
 %% set. It never accepts model API keys in files; providers read their normal
-%% environment-backed credentials. `inspect' talks to the authenticated local
-%% developer API, while `run' and `evaluate' execute in the current VM.
+%% environment-backed credentials. `inspect' and stored evaluation reports use
+%% the authenticated local Developer API, while `run' and `evaluate' execute
+%% in the current VM.
 -module(adk_cli).
+
+-include("adk_eval_report.hrl").
 
 -export([main/1, command/1, command/2, usage/0]).
 
@@ -29,6 +32,9 @@ main(Args) ->
                 0 -> ok;
                 ExitCode -> erlang:halt(ExitCode)
             end;
+        {ok, #{command := eval_report} = Result} ->
+            write_eval_run_result(Result),
+            ok;
         {ok, Result} ->
             write_result(Result),
             ok;
@@ -93,6 +99,14 @@ command_noninteractive(["evaluate" | Args]) ->
         "--concurrency" => concurrency,
         "--timeout" => timeout},
       fun evaluate_command/1);
+command_noninteractive(["eval", "report", JobId | Args]) ->
+    with_options(
+      Args,
+      #{"--url" => base_url,
+        "--format" => format,
+        "--output" => output,
+        "--suite-name" => suite_name},
+      fun(Opts) -> eval_report_command(JobId, Opts) end);
 command_noninteractive(["eval", "run" | Args]) ->
     with_options(
       Args,
@@ -119,6 +133,20 @@ command_noninteractive(["eval", "run" | Args]) ->
         "--max-pass-rate-drop" => max_pass_rate_drop,
         "--metric-tolerances" => metric_tolerances},
       fun eval_run_command/1);
+command_noninteractive(["deploy", "cloud_run" | Args]) ->
+    with_deploy_options(
+      Args,
+      #{"--manifest" => manifest,
+        "--project" => project,
+        "--region" => region},
+      fun deploy_cloud_run_command/1);
+command_noninteractive(["deploy", "gke" | Args]) ->
+    with_deploy_options(
+      Args,
+      #{"--manifest" => manifest,
+        "--context" => context,
+        "--namespace" => namespace},
+      fun deploy_gke_command/1);
 command_noninteractive(["serve" | Args]) ->
     with_options(
       Args,
@@ -255,7 +283,10 @@ usage() ->
       "  adk run --config AGENT.json --message TEXT [--user ID --session ID]\n"
       "  adk console --config AGENT.json [--user ID --session ID]\n"
       "  adk evaluate --config AGENT.json --dataset DATASET.json\n"
+      "  adk eval report JOB_ID [--format json|markdown|junit|sarif|annotations --output REPORT --url URL]\n"
       "  adk eval run --config AGENT.json --eval-set SET.json [--criteria CRITERIA.json]\n"
+      "  adk deploy cloud_run --manifest FILE --project PROJECT --region REGION [--apply]\n"
+      "  adk deploy gke --manifest FILE --context CONTEXT --namespace NS [--apply]\n"
       "  adk serve [--config AGENT.json] [--port 8080 --ip 127.0.0.1]\n"
       "  adk inspect agents [--url URL]\n"
       "  adk inspect diagnostics [--url URL]\n"
@@ -287,6 +318,43 @@ usage() ->
 with_options(Args, Allowed, Fun) ->
     case parse_options(Args, Allowed, #{}) of
         {ok, Opts} -> Fun(Opts);
+        {error, _} = Error -> Error
+    end.
+
+with_deploy_options(Args, Allowed, Fun) ->
+    case parse_deploy_options(Args, Allowed, #{apply => false}) of
+        {ok, Opts} -> Fun(Opts);
+        {error, _} = Error -> Error
+    end.
+
+parse_deploy_options([], _Allowed, Acc) -> {ok, Acc};
+parse_deploy_options(["--apply" | Rest], Allowed, Acc) ->
+    case maps:get(apply, Acc, false) of
+        false -> parse_deploy_options(Rest, Allowed, Acc#{apply => true});
+        true -> {error, {duplicate_option, "--apply"}}
+    end;
+parse_deploy_options([Flag, Value | Rest], Allowed, Acc) ->
+    case maps:find(Flag, Allowed) of
+        {ok, Key} ->
+            case maps:is_key(Key, Acc) of
+                true -> {error, {duplicate_option, Flag}};
+                false ->
+                    parse_deploy_options(Rest, Allowed, Acc#{Key => Value})
+            end;
+        error -> {error, {unknown_option, Flag}}
+    end;
+parse_deploy_options([Flag], _Allowed, _Acc) ->
+    {error, {missing_option_value, Flag}}.
+
+deploy_cloud_run_command(Options) ->
+    case adk_deploy:cloud_run(Options) of
+        {ok, Result} -> {ok, Result#{command => deploy_cloud_run}};
+        {error, _} = Error -> Error
+    end.
+
+deploy_gke_command(Options) ->
+    case adk_deploy:gke(Options) of
+        {ok, Result} -> {ok, Result#{command => deploy_gke}};
         {error, _} = Error -> Error
     end.
 
@@ -361,6 +429,15 @@ validate_config_command(Path) ->
         {ok, Agent} ->
             {ok, #{command => config_validate,
                    status => valid,
+                   schema_version => maps:get(schema_version, Agent),
+                   fingerprint => maps:get(fingerprint, Agent),
+                   registry_generation => maps:get(registry_generation,
+                                                   Agent),
+                   registry_instance_id => maps:get(
+                                             registry_instance_id, Agent),
+                   registry_snapshot_revision_id => maps:get(
+                                                     registry_snapshot_revision_id,
+                                                     Agent),
                    name => maps:get(name, Agent),
                    provider => maps:get(provider_name, Agent),
                    model => maps:get(model, Agent),
@@ -519,36 +596,40 @@ run_loaded_agent(Opts, Timeout) ->
     end.
 
 execute_cli_run(Agent, Opts, Timeout) ->
-    Name = maps:get(name, Agent),
-    Config = maps:get(config, Agent),
-    Tools = maps:get(tools, Agent),
-    case erlang_adk:spawn_agent(Name, Config, Tools) of
+    case spawn_cli_composition(Agent) of
         {error, Reason} -> {error, {agent_start_failed, public_reason(Reason)}};
-        {ok, AgentPid} ->
+        {ok, AgentPid, RunnerOptions0, Composition} ->
             try
                 AppName = option_binary(Opts, app_name, <<"adk-cli">>),
                 UserId = option_binary(Opts, user_id, <<"local-user">>),
                 SessionId = option_binary(
                               Opts, session_id, generate_id(<<"session">>)),
-                RunnerOptions0 = maps:get(runner_options, Agent, #{}),
-                RunnerOptions = RunnerOptions0#{run_timeout => Timeout},
-                Runner = adk_runner:new(
-                           AgentPid, AppName, erlang_adk_session,
-                           RunnerOptions),
                 Message = unicode:characters_to_binary(
                             maps:get(message, Opts)),
-                case adk_run:start(
-                       Runner, UserId, SessionId, Message,
-                       #{retention_ms => erlang:max(60000, Timeout + 1000),
-                         max_buffered_events => 256}) of
-                    {ok, RunId} ->
-                        Outcome = adk_run:await(RunId, Timeout + 1000),
-                        cli_run_result(RunId, SessionId, Outcome);
+                case build_runtime_runner(
+                       AgentPid, AppName, RunnerOptions0,
+                       #{run_timeout => Timeout}) of
+                    {ok, Runner, _SessionService} ->
+                        case adk_run:start(
+                               Runner, UserId, SessionId, Message,
+                               #{retention_ms =>
+                                     erlang:max(60000, Timeout + 1000),
+                                 max_buffered_events => 256}) of
+                            {ok, RunId} ->
+                                Outcome = adk_run:await(
+                                            RunId, Timeout + 1000),
+                                cli_run_result(RunId, SessionId, Outcome);
+                            {error, Reason} ->
+                                {error,
+                                 {run_start_failed,
+                                  public_reason(Reason)}}
+                        end;
                     {error, Reason} ->
-                        {error, {run_start_failed, public_reason(Reason)}}
+                        {error, {runner_start_failed,
+                                 public_reason(Reason)}}
                 end
             after
-                _ = catch erlang_adk:stop_agent(AgentPid)
+                _ = catch adk_agent_composition:stop(Composition)
             end
     end.
 
@@ -599,34 +680,71 @@ start_console(Opts, Timeout, Io) ->
     end.
 
 run_console(Agent, Opts, Timeout, Io) ->
-    case erlang_adk:spawn_agent(
-           maps:get(name, Agent), maps:get(config, Agent),
-           maps:get(tools, Agent)) of
+    case spawn_cli_composition(Agent) of
         {error, Reason} ->
             {error, {agent_start_failed, public_reason(Reason)}};
-        {ok, AgentPid} ->
+        {ok, AgentPid, RunnerOptions, Composition} ->
             try
                 AppName = option_binary(Opts, app_name, <<"adk-cli">>),
                 UserId = option_binary(Opts, user_id, <<"local-user">>),
                 SessionId = option_binary(
                               Opts, session_id,
                               generate_id(<<"session">>)),
-                RunnerOptions = (maps:get(runner_options, Agent, #{}))#{
-                    run_timeout => Timeout},
-                Runner = adk_runner:new(
-                           AgentPid, AppName, erlang_adk_session,
-                           RunnerOptions),
-                console_write(
-                  Io,
-                  <<"Erlang ADK console. /help lists commands; /exit closes.\n">>),
-                console_loop(
-                  #{runner => Runner, app_name => AppName,
-                    user_id => UserId, session_id => SessionId,
-                    timeout => Timeout, io => Io, turns => 0,
-                    paused_run_id => undefined})
+                case build_runtime_runner(
+                       AgentPid, AppName, RunnerOptions,
+                       #{run_timeout => Timeout}) of
+                    {ok, Runner, SessionService} ->
+                        console_write(
+                          Io,
+                          <<"Erlang ADK console. /help lists commands; "
+                            "/exit closes.\n">>),
+                        console_loop(
+                          #{runner => Runner, app_name => AppName,
+                            user_id => UserId, session_id => SessionId,
+                            session_service => SessionService,
+                            timeout => Timeout, io => Io, turns => 0,
+                            paused_run_id => undefined});
+                    {error, Reason} ->
+                        {error, {runner_start_failed,
+                                 public_reason(Reason)}}
+                end
             after
-                _ = catch erlang_adk:stop_agent(AgentPid)
+                _ = catch adk_agent_composition:stop(Composition)
             end
+    end.
+
+spawn_cli_composition(Agent) ->
+    case adk_agent_composition:spawn(Agent) of
+        {ok, Composition} ->
+            case {adk_agent_composition:root(Composition),
+                  adk_agent_composition:runner_options(Composition)} of
+                {{ok, AgentPid}, {ok, RunnerOptions}} ->
+                    {ok, AgentPid, RunnerOptions, Composition};
+                _ ->
+                    _ = adk_agent_composition:stop(Composition),
+                    {error, invalid_agent_composition}
+            end;
+        {error, _} = Error -> Error
+    end.
+
+build_runtime_runner(AgentPid, AppName, AgentOptions, Overrides)
+  when is_map(AgentOptions), is_map(Overrides) ->
+    case erlang_adk:runtime_runner_spec() of
+        {ok, #{session_service := SessionService,
+               runner_options := ServiceOptions}}
+          when is_atom(SessionService), is_map(ServiceOptions) ->
+            %% Profile-owned service references are authoritative. Explicit
+            %% command bounds (for example --timeout) are applied last.
+            Options0 = maps:merge(AgentOptions, ServiceOptions),
+            Options = maps:merge(Options0, Overrides),
+            try adk_runner:new(
+                  AgentPid, AppName, SessionService, Options) of
+                Runner -> {ok, Runner, SessionService}
+            catch
+                _:_ -> {error, invalid_runtime_runner_options}
+            end;
+        {error, _} = Error -> Error;
+        _ -> {error, invalid_runtime_runner_spec}
     end.
 
 console_loop(State = #{io := Io, session_id := SessionId}) ->
@@ -741,8 +859,10 @@ console_outcome(_RunId, Other, State = #{io := Io}) ->
     console_loop(State#{paused_run_id => undefined}).
 
 console_inspect(#{app_name := App, user_id := User,
-                  session_id := Session, io := Io}) ->
-    case erlang_adk_session:get_session(App, User, Session) of
+                  session_id := Session, session_service := SessionService,
+                  io := Io}) ->
+    case safe_session_call(
+           SessionService, get_session, [App, User, Session]) of
         {ok, Stored} -> console_write_json(Io, Stored);
         {error, not_found} ->
             console_write_json(Io, #{status => not_found,
@@ -750,6 +870,13 @@ console_inspect(#{app_name := App, user_id := User,
         {error, Reason} ->
             console_write_json(Io, #{status => error,
                                      reason => public_reason(Reason)})
+    end.
+
+safe_session_call(Module, Function, Args) when is_atom(Module) ->
+    try apply(Module, Function, Args) of
+        Reply -> Reply
+    catch
+        _:_ -> {error, session_service_unavailable}
     end.
 
 console_action(<<>>) -> empty;
@@ -852,6 +979,69 @@ evaluate_command(Opts) ->
           end
       end).
 
+%% Render a result that is already persisted by the supervised evaluation
+%% service. The Developer API returns the canonical bytes; the CLI preserves
+%% them exactly for stdout and file delivery.
+eval_report_command(JobId0, Opts) ->
+    JobId = safe_binary(JobId0),
+    case {adk_eval_store:valid_job_id(JobId),
+          parse_eval_format(maps:get(format, Opts, "json")),
+          parse_eval_output(maps:get(output, Opts, "-")),
+          parse_eval_suite_name(Opts)} of
+        {true, {ok, Format}, {ok, Output}, {ok, SuiteName}} ->
+            FormatBin = atom_to_binary(Format, utf8),
+            Query0 = [{<<"format">>, quote(FormatBin)}],
+            Query = case SuiteName of
+                undefined -> Query0;
+                _ -> Query0 ++ [{<<"suite_name">>, quote(SuiteName)}]
+            end,
+            Path = <<"/dev/v1/evaluation/jobs/", (quote(JobId))/binary,
+                     "/report", (query_parts(Query))/binary>>,
+            case remote_binary(get, Path, undefined, Opts,
+                               ?ADK_EVAL_REPORT_MAX_BYTES) of
+                {error, _} = Error -> Error;
+                {ok, Rendered} ->
+                    case deliver_eval_report(Output, Rendered) of
+                        {error, _} = Error -> Error;
+                        {ok, Delivery, OutputPath} ->
+                            Base = #{command => eval_report,
+                                     job_id => JobId,
+                                     format => Format,
+                                     delivery => Delivery,
+                                     report => Rendered},
+                            case OutputPath of
+                                undefined -> {ok, Base};
+                                _ -> {ok, Base#{output_path => OutputPath}}
+                            end
+                    end
+            end;
+        {false, _, _, _} -> {error, invalid_eval_job_id};
+        {_, {error, _} = Error, _, _} -> Error;
+        {_, _, {error, _} = Error, _} -> Error;
+        {_, _, _, {error, _} = Error} -> Error
+    end.
+
+parse_eval_suite_name(Opts) ->
+    case maps:find(suite_name, Opts) of
+        error -> {ok, undefined};
+        {ok, Value0} ->
+            Value = safe_binary(Value0),
+            case valid_eval_suite_name(Value) of
+                true -> {ok, Value};
+                false -> {error, invalid_eval_suite_name}
+            end
+    end.
+
+valid_eval_suite_name(Value)
+  when is_binary(Value), byte_size(Value) > 0, byte_size(Value) =< 256 ->
+    try unicode:characters_to_binary(Value, utf8, utf8) of
+        Value -> true;
+        _ -> false
+    catch
+        _:_ -> false
+    end;
+valid_eval_suite_name(_) -> false.
+
 %% Versioned evaluation is a separate command so the historical evaluate
 %% dataset contract and its output remain unchanged.
 eval_run_command(Opts) ->
@@ -923,8 +1113,7 @@ execute_eval_run(Prepared) ->
                             ?DEFAULT_EVAL_CASE_TIMEOUT),
             Adapter = #{
                 module => adk_eval_agent_adapter,
-                target => maps:with(
-                            [name, config, tools, runner_options], Agent),
+                target => Agent,
                 config => #{run_timeout_ms => CaseTimeout}
             },
             case adk_eval_set:run(
@@ -944,7 +1133,9 @@ finish_eval_run(Prepared, Current) ->
         {error, _} = Error -> Error;
         {ok, ReportValue, Comparison, Passed} ->
             Format = maps:get(format, Prepared),
-            case adk_eval_set:report(ReportValue, Format) of
+            case render_eval_run_report(
+                   Format, ReportValue, Current,
+                   maps:get(eval_options, Prepared)) of
                 {error, Reason} ->
                     {error, {report_render_failed, Reason}};
                 {ok, Rendered0} ->
@@ -993,7 +1184,24 @@ eval_gate_report(Baseline, Current, ComparisonOptions) ->
 
 parse_eval_format("json") -> {ok, json};
 parse_eval_format("markdown") -> {ok, markdown};
+parse_eval_format("junit") -> {ok, junit};
+parse_eval_format("sarif") -> {ok, sarif};
+parse_eval_format("annotations") -> {ok, annotations};
 parse_eval_format(_) -> {error, invalid_eval_report_format}.
+
+render_eval_run_report(Format, ReportValue, Current, EvalOptions) ->
+    Value = case Format of
+        json -> ReportValue;
+        markdown -> ReportValue;
+        _ -> Current
+    end,
+    adk_eval_export:render(
+      Value, Format,
+      #{max_bytes => eval_report_byte_limit(EvalOptions)}).
+
+eval_report_byte_limit(EvalOptions) ->
+    maps:get(max_report_bytes, EvalOptions,
+             ?ADK_EVAL_REPORT_MAX_BYTES).
 
 parse_eval_output("-") -> {ok, stdout};
 parse_eval_output(Path0) ->
@@ -1222,11 +1430,11 @@ load_metric_tolerances(Path) ->
 
 read_eval_json_file(Path0) ->
     Path = unicode:characters_to_list(Path0),
-    case file:read_file(Path) of
-        {ok, Binary} when byte_size(Binary) =< ?MAX_EVAL_FILE_BYTES ->
+    case adk_bounded_file:read(Path, ?MAX_EVAL_FILE_BYTES) of
+        {ok, Binary} ->
             decode_json_binary(Binary);
-        {ok, _Binary} -> {error, eval_file_too_large};
-        {error, Reason} -> {error, {file_read_failed, Reason}}
+        {error, file_too_large} -> {error, eval_file_too_large};
+        {error, _} = Error -> Error
     end.
 
 deliver_eval_report(stdout, _Rendered) ->
@@ -1274,11 +1482,9 @@ evaluate_loaded(Opts, Timeout, Concurrency) ->
     end.
 
 execute_evaluation(Agent, Dataset, Timeout, Concurrency) ->
-    case erlang_adk:spawn_agent(
-           maps:get(name, Agent), maps:get(config, Agent),
-           maps:get(tools, Agent)) of
+    case spawn_cli_composition(Agent) of
         {error, Reason} -> {error, {agent_start_failed, public_reason(Reason)}};
-        {ok, AgentPid} ->
+        {ok, AgentPid, _RunnerOptions, Composition} ->
             try
                 Metric = fun(Expected, Actual) ->
                     case safe_binary(Expected) =:= safe_binary(Actual) of
@@ -1295,7 +1501,7 @@ execute_evaluation(Agent, Dataset, Timeout, Concurrency) ->
                         {error, {evaluation_failed, public_reason(Reason)}}
                 end
             after
-                _ = catch erlang_adk:stop_agent(AgentPid)
+                _ = catch adk_agent_composition:stop(Composition)
             end
     end.
 
@@ -1304,8 +1510,13 @@ serve_command(Opts) ->
           parse_loopback_ip(maps:get(ip, Opts, "127.0.0.1")),
           developer_token()} of
         {{ok, Port}, {ok, Ip}, ok} ->
-            case prepare_developer_application(Port, Ip) of
-                ok -> maybe_start_served_agent(Opts, Port, Ip);
+            case load_optional_served_agent(Opts) of
+                {ok, Agent, RunnerOptions} ->
+                    case prepare_developer_application(
+                           Port, Ip, RunnerOptions) of
+                        ok -> start_served_agent(Agent, Port, Ip);
+                        {error, _} = Error -> Error
+                    end;
                 {error, _} = Error -> Error
             end;
         {{error, _} = Error, _, _} -> Error;
@@ -1313,25 +1524,25 @@ serve_command(Opts) ->
         {_, _, {error, _} = Error} -> Error
     end.
 
-maybe_start_served_agent(Opts, Port, Ip) ->
+load_optional_served_agent(Opts) ->
     case maps:find(config, Opts) of
-        error ->
-            {ok, serve_result(Port, Ip, undefined)};
+        error -> {ok, undefined, #{}};
         {ok, Path} ->
             case load_agent_file(Path) of
                 {error, _} = Error -> Error;
                 {ok, Agent} ->
-                    case erlang_adk:spawn_agent(
-                           maps:get(name, Agent), maps:get(config, Agent),
-                           maps:get(tools, Agent)) of
-                        {ok, _Pid} ->
-                            {ok, serve_result(
-                                   Port, Ip, maps:get(name, Agent))};
-                        {error, Reason} ->
-                            {error, {agent_start_failed,
-                                     public_reason(Reason)}}
-                    end
+                    {ok, Agent, maps:get(runner_options, Agent, #{})}
             end
+    end.
+
+start_served_agent(undefined, Port, Ip) ->
+    {ok, serve_result(Port, Ip, undefined)};
+start_served_agent(Agent, Port, Ip) ->
+    case spawn_cli_composition(Agent) of
+        {ok, _Pid, _RunnerOptions, _Composition} ->
+            {ok, serve_result(Port, Ip, maps:get(name, Agent))};
+        {error, Reason} ->
+            {error, {agent_start_failed, public_reason(Reason)}}
     end.
 
 serve_result(Port, Ip, AgentName) ->
@@ -1741,6 +1952,22 @@ resume_remote_run(RunId0, Opts) ->
       end).
 
 remote_json(Method, Path, Body, Opts) ->
+    case remote_binary(Method, Path, Body, Opts) of
+        {ok, ResponseBody} ->
+            case decode_json_binary(ResponseBody) of
+                {ok, Json} -> {ok, Json};
+                {error, _} -> {error, invalid_developer_api_response}
+            end;
+        {error, _} = Error -> Error
+    end.
+
+remote_binary(Method, Path, Body, Opts) ->
+    remote_binary(Method, Path, Body, Opts,
+                  ?MAX_DEVELOPER_RESPONSE_BYTES).
+
+remote_binary(Method, Path, Body, Opts, MaxResponseBytes)
+  when is_integer(MaxResponseBytes), MaxResponseBytes > 0,
+       MaxResponseBytes =< ?ADK_EVAL_REPORT_MAX_BYTES ->
     Base0 = option_binary(Opts, base_url, ?DEFAULT_BASE_URL),
     case validate_base_url(Base0) of
         {error, _} = Error -> Error;
@@ -1749,14 +1976,11 @@ remote_json(Method, Path, Body, Opts) ->
                 {error, _} = Error -> Error;
                 {ok, Token} ->
                     case safe_developer_request(
-                           Method, Base, Path, Body, Token) of
+                           Method, Base, Path, Body, Token,
+                           MaxResponseBytes) of
                         {ok, Status, ResponseBody}
                           when Status >= 200, Status < 300 ->
-                            case decode_json_binary(ResponseBody) of
-                                {ok, Json} -> {ok, Json};
-                                {error, _} ->
-                                    {error, invalid_developer_api_response}
-                            end;
+                            {ok, ResponseBody};
                         {ok, Status, ResponseBody} ->
                             {error, {developer_api_http_error, Status,
                                      public_http_error(ResponseBody)}};
@@ -1776,22 +2000,26 @@ remote_json(Method, Path, Body, Opts) ->
 %% accumulated internally before the caller can enforce a limit.  Gun's
 %% per-stream flow credit lets the CLI apply the same hard cap to success and
 %% error responses while retaining verified TLS for HTTPS endpoints.
-safe_developer_request(Method, Base, Path, Body, Token) ->
-    try bounded_developer_request(Method, Base, Path, Body, Token) of
+safe_developer_request(Method, Base, Path, Body, Token,
+                       MaxResponseBytes) ->
+    try bounded_developer_request(Method, Base, Path, Body, Token,
+                                  MaxResponseBytes) of
         Result -> Result
     catch
         Class:Reason:_Stacktrace ->
             {error, {http_client_exception, Class, Reason}}
     end.
 
-bounded_developer_request(Method, Base, Path, Body, Token) ->
+bounded_developer_request(Method, Base, Path, Body, Token,
+                          MaxResponseBytes) ->
     case application:ensure_all_started(gun) of
         {ok, _} ->
             case developer_endpoint(Base, Path) of
                 {ok, Endpoint} ->
                     Deadline = developer_deadline(),
                     open_developer_connection(
-                      Endpoint, Method, Body, Token, Deadline);
+                      Endpoint, Method, Body, Token, Deadline,
+                      MaxResponseBytes);
                 {error, _} = Error -> Error
             end;
         {error, Reason} -> {error, {gun_start_failed, Reason}}
@@ -1818,7 +2046,8 @@ developer_endpoint(Base, Path) ->
         _:_ -> {error, invalid_base_url}
     end.
 
-open_developer_connection(Endpoint, Method, Body, Token, Deadline) ->
+open_developer_connection(Endpoint, Method, Body, Token, Deadline,
+                          MaxResponseBytes) ->
     case developer_gun_options(Endpoint, Deadline) of
         {error, _} = Error -> Error;
         {ok, GunOptions} ->
@@ -1827,7 +2056,7 @@ open_developer_connection(Endpoint, Method, Body, Token, Deadline) ->
                 {ok, Connection} ->
                     try await_developer_connection(
                           Connection, Endpoint, Method, Body, Token,
-                          Deadline)
+                          Deadline, MaxResponseBytes)
                     after
                         _ = catch gun:close(Connection)
                     end;
@@ -1836,7 +2065,7 @@ open_developer_connection(Endpoint, Method, Body, Token, Deadline) ->
     end.
 
 await_developer_connection(Connection, Endpoint, Method, Body, Token,
-                           Deadline) ->
+                           Deadline, MaxResponseBytes) ->
     case gun:await_up(Connection, developer_remaining(Deadline)) of
         {ok, http} ->
             Headers0 = [{<<"authorization">>,
@@ -1852,7 +2081,8 @@ await_developer_connection(Connection, Endpoint, Method, Body, Token,
                        Connection, developer_method(Method),
                        maps:get(path, Endpoint), Headers, RequestBody,
                        #{flow => 1}),
-            await_developer_response(Connection, Stream, Deadline);
+            await_developer_response(Connection, Stream, Deadline,
+                                     MaxResponseBytes);
         {ok, _OtherProtocol} -> {error, unsupported_protocol};
         {error, timeout} -> {error, timeout};
         {error, Reason} -> {error, Reason}
@@ -1862,20 +2092,22 @@ developer_method(get) -> <<"GET">>;
 developer_method(delete) -> <<"DELETE">>;
 developer_method(post) -> <<"POST">>.
 
-await_developer_response(Connection, Stream, Deadline) ->
+await_developer_response(Connection, Stream, Deadline, MaxResponseBytes) ->
     case gun:await(Connection, Stream, developer_remaining(Deadline)) of
         {inform, _Status, _Headers} ->
-            await_developer_response(Connection, Stream, Deadline);
+            await_developer_response(Connection, Stream, Deadline,
+                                     MaxResponseBytes);
         {response, fin, Status, _Headers} ->
             {ok, Status, <<>>};
         {response, nofin, Status, Headers} ->
-            case declared_body_too_large(Headers) of
+            case declared_body_too_large(Headers, MaxResponseBytes) of
                 true ->
                     cancel_developer_stream(Connection, Stream),
                     {error, {developer_response_too_large, Status}};
                 false ->
                     collect_developer_body(
-                      Connection, Stream, Status, Deadline, [], 0)
+                      Connection, Stream, Status, Deadline, [], 0,
+                      MaxResponseBytes)
             end;
         {error, timeout} ->
             cancel_developer_stream(Connection, Stream),
@@ -1884,11 +2116,12 @@ await_developer_response(Connection, Stream, Deadline) ->
         _ -> {error, invalid_http_response}
     end.
 
-collect_developer_body(Connection, Stream, Status, Deadline, Acc, Size) ->
+collect_developer_body(Connection, Stream, Status, Deadline, Acc, Size,
+                       MaxResponseBytes) ->
     case gun:await(Connection, Stream, developer_remaining(Deadline)) of
         {data, Fin, Chunk} when is_binary(Chunk) ->
             NewSize = Size + byte_size(Chunk),
-            case NewSize =< ?MAX_DEVELOPER_RESPONSE_BYTES of
+            case NewSize =< MaxResponseBytes of
                 false ->
                     cancel_developer_stream(Connection, Stream),
                     {error, {developer_response_too_large, Status}};
@@ -1899,7 +2132,7 @@ collect_developer_body(Connection, Stream, Status, Deadline, Acc, Size) ->
                     ok = gun:update_flow(Connection, Stream, 1),
                     collect_developer_body(
                       Connection, Stream, Status, Deadline,
-                      [Chunk | Acc], NewSize)
+                      [Chunk | Acc], NewSize, MaxResponseBytes)
             end;
         {trailers, _Headers} ->
             {ok, Status, iolist_to_binary(lists:reverse(Acc))};
@@ -1910,7 +2143,7 @@ collect_developer_body(Connection, Stream, Status, Deadline, Acc, Size) ->
         _ -> {error, invalid_http_response}
     end.
 
-declared_body_too_large(Headers) ->
+declared_body_too_large(Headers, MaxResponseBytes) ->
     lists:any(
       fun({Name0, Value0}) ->
               Name = string:lowercase(safe_binary(Name0)),
@@ -1918,7 +2151,7 @@ declared_body_too_large(Headers) ->
                   <<"content-length">> ->
                       case parse_content_length(safe_binary(Value0)) of
                           {ok, Length} ->
-                              Length > ?MAX_DEVELOPER_RESPONSE_BYTES;
+                              Length > MaxResponseBytes;
                           error -> false
                       end;
                   _ -> false
@@ -1995,325 +2228,15 @@ developer_remaining(Deadline) ->
     max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 load_agent_file(Path) ->
-    case read_json_file(Path) of
-        {ok, Value} when is_map(Value) -> build_agent_config(Value);
-        {ok, _} -> {error, agent_config_must_be_object};
-        {error, _} = Error -> Error
-    end.
-
-build_agent_config(Json) ->
-    Allowed = [<<"name">>, <<"provider">>, <<"model">>,
-               <<"instructions">>, <<"global_instruction">>,
-               <<"input_schema">>, <<"output_schema">>, <<"output_key">>,
-               <<"include_contents">>, <<"history_policy">>,
-               <<"generation_config">>,
-               <<"temperature">>, <<"top_p">>,
-               <<"top_k">>, <<"max_tokens">>, <<"candidate_count">>,
-               <<"max_output_tokens">>,
-               <<"seed">>, <<"presence_penalty">>,
-               <<"frequency_penalty">>, <<"stop_sequences">>,
-               <<"response_mime_type">>, <<"response_schema">>,
-               <<"thinking_config">>, <<"safety_settings">>,
-               <<"builtin_tools">>,
-               <<"required_capabilities">>,
-               <<"instruction_timeout_ms">>, <<"artifact_timeout_ms">>,
-               <<"max_instruction_bytes">>,
-               <<"request_timeout">>, <<"response">>, <<"tools">>,
-               <<"runner_options">>],
-    Unknown = maps:keys(maps:without(Allowed, Json)),
-    case {Unknown, contains_forbidden_secret(Json)} of
-        {_, true} -> {error, secret_in_config_file};
-        {[_ | _], false} -> {error, {unknown_agent_config_keys, Unknown}};
-        {[], false} -> build_checked_agent(Json)
-    end.
-
-build_checked_agent(Json) ->
-    Name = maps:get(<<"name">>, Json, <<"CliAgent">>),
-    ProviderName = maps:get(<<"provider">>, Json, <<"gemini">>),
-    Model = maps:get(<<"model">>, Json, ?DEFAULT_MODEL),
-    case {valid_nonempty_binary(Name), provider_module(ProviderName),
-          tools_from_json(maps:get(<<"tools">>, Json, [])),
-          runner_options_from_json(
-            maps:get(<<"runner_options">>, Json, #{}))} of
-        {true, {ok, Provider}, {ok, Tools}, {ok, RunnerOptions}} ->
-            Config0 = maps:fold(
-                        fun agent_config_field/3,
-                        #{provider => Provider, model => Model}, Json),
-            case adk_llm:validate_config(Config0) of
-                ok ->
-                    {ok, #{name => Name, provider_name => ProviderName,
-                           provider => Provider, model => Model,
-                           config => Config0, tools => Tools,
-                           runner_options => RunnerOptions}};
-                {error, Reason} ->
-                    {error, {invalid_provider_config,
-                             public_reason(Reason)}}
-            end;
-        {false, _, _, _} -> {error, invalid_agent_name};
-        {_, {error, _} = Error, _, _} -> Error;
-        {_, _, {error, _} = Error, _} -> Error;
-        {_, _, _, {error, _} = Error} -> Error
-    end.
-
-agent_config_field(<<"name">>, _Value, Acc) -> Acc;
-agent_config_field(<<"provider">>, _Value, Acc) -> Acc;
-agent_config_field(<<"tools">>, _Value, Acc) -> Acc;
-agent_config_field(<<"runner_options">>, _Value, Acc) -> Acc;
-agent_config_field(<<"include_contents">>, Value, Acc) ->
-    Acc#{include_contents => cli_history_value(Value)};
-agent_config_field(<<"history_policy">>, Value, Acc) ->
-    Acc#{history_policy => cli_history_value(Value)};
-agent_config_field(<<"generation_config">>, Value, Acc) ->
-    Acc#{generation_config => cli_generation_config(Value)};
-agent_config_field(<<"thinking_config">>, Value, Acc) ->
-    Acc#{thinking_config => cli_thinking_config(Value)};
-agent_config_field(<<"safety_settings">>, Value, Acc) ->
-    Acc#{safety_settings => cli_safety_settings(Value)};
-agent_config_field(<<"builtin_tools">>, Value, Acc) ->
-    Acc#{builtin_tools => cli_builtin_tools(Value)};
-agent_config_field(<<"required_capabilities">>, Value, Acc) ->
-    Acc#{required_capabilities => cli_capabilities(Value)};
-agent_config_field(Key, Value, Acc) ->
-    case config_atom(Key) of
-        undefined -> Acc;
-        AtomKey -> Acc#{AtomKey => Value}
-    end.
-
-config_atom(<<"model">>) -> model;
-config_atom(<<"instructions">>) -> instructions;
-config_atom(<<"global_instruction">>) -> global_instruction;
-config_atom(<<"input_schema">>) -> input_schema;
-config_atom(<<"output_schema">>) -> output_schema;
-config_atom(<<"output_key">>) -> output_key;
-config_atom(<<"temperature">>) -> temperature;
-config_atom(<<"top_p">>) -> top_p;
-config_atom(<<"top_k">>) -> top_k;
-config_atom(<<"max_tokens">>) -> max_tokens;
-config_atom(<<"max_output_tokens">>) -> max_output_tokens;
-config_atom(<<"candidate_count">>) -> candidate_count;
-config_atom(<<"seed">>) -> seed;
-config_atom(<<"presence_penalty">>) -> presence_penalty;
-config_atom(<<"frequency_penalty">>) -> frequency_penalty;
-config_atom(<<"stop_sequences">>) -> stop_sequences;
-config_atom(<<"response_mime_type">>) -> response_mime_type;
-config_atom(<<"response_schema">>) -> response_schema;
-config_atom(<<"instruction_timeout_ms">>) -> instruction_timeout_ms;
-config_atom(<<"artifact_timeout_ms">>) -> artifact_timeout_ms;
-config_atom(<<"max_instruction_bytes">>) -> max_instruction_bytes;
-config_atom(<<"request_timeout">>) -> request_timeout;
-config_atom(<<"response">>) -> response;
-config_atom(_) -> undefined.
-
-cli_history_value(<<"default">>) -> default;
-cli_history_value(<<"none">>) -> none;
-cli_history_value(<<"include">>) -> include;
-cli_history_value(<<"exclude">>) -> exclude;
-cli_history_value(Value) -> Value.
-
-cli_generation_config(Value) when is_map(Value) ->
-    maps:fold(
-      fun(Key, NestedValue, Acc) ->
-          case cli_generation_key(Key) of
-              undefined -> Acc#{Key => NestedValue};
-              thinking_config ->
-                  Acc#{thinking_config =>
-                           cli_thinking_config(NestedValue)};
-              safety_settings ->
-                  Acc#{safety_settings =>
-                           cli_safety_settings(NestedValue)};
-              Atom -> Acc#{Atom => NestedValue}
-          end
-      end, #{}, Value);
-cli_generation_config(Value) -> Value.
-
-cli_generation_key(<<"temperature">>) -> temperature;
-cli_generation_key(<<"top_p">>) -> top_p;
-cli_generation_key(<<"top_k">>) -> top_k;
-cli_generation_key(<<"max_tokens">>) -> max_tokens;
-cli_generation_key(<<"max_output_tokens">>) -> max_output_tokens;
-cli_generation_key(<<"candidate_count">>) -> candidate_count;
-cli_generation_key(<<"seed">>) -> seed;
-cli_generation_key(<<"presence_penalty">>) -> presence_penalty;
-cli_generation_key(<<"frequency_penalty">>) -> frequency_penalty;
-cli_generation_key(<<"stop_sequences">>) -> stop_sequences;
-cli_generation_key(<<"response_mime_type">>) -> response_mime_type;
-cli_generation_key(<<"thinking_config">>) -> thinking_config;
-cli_generation_key(<<"safety_settings">>) -> safety_settings;
-cli_generation_key(_) -> undefined.
-
-cli_thinking_config(Value) when is_map(Value) ->
-    maps:fold(
-      fun(<<"thinking_level">>, Nested, Acc) ->
-              Acc#{thinking_level => Nested};
-         (<<"thinking_budget">>, Nested, Acc) ->
-              Acc#{thinking_budget => Nested};
-         (<<"include_thoughts">>, Nested, Acc) ->
-              Acc#{include_thoughts => Nested};
-         (Key, Nested, Acc) -> Acc#{Key => Nested}
-      end, #{}, Value);
-cli_thinking_config(Value) -> Value.
-
-cli_safety_settings(Settings) when is_list(Settings) ->
-    [cli_safety_setting(Setting) || Setting <- Settings];
-cli_safety_settings(Value) -> Value.
-
-cli_safety_setting(Setting) when is_map(Setting) ->
-    maps:fold(
-      fun(<<"category">>, Value, Acc) -> Acc#{category => Value};
-         (<<"threshold">>, Value, Acc) -> Acc#{threshold => Value};
-         (Key, Value, Acc) -> Acc#{Key => Value}
-      end, #{}, Setting);
-cli_safety_setting(Value) -> Value.
-
-cli_builtin_tools(Values) when is_list(Values) ->
-    [cli_builtin_tool(Value) || Value <- Values];
-cli_builtin_tools(Value) -> Value.
-
-cli_builtin_tool(<<"google_search">>) -> google_search;
-cli_builtin_tool(Value) -> Value.
-
-cli_capabilities(Values) when is_list(Values) ->
-    [cli_capability(Value) || Value <- Values];
-cli_capabilities(Value) -> Value.
-
-cli_capability(<<"streaming">>) -> streaming;
-cli_capability(<<"function_calling">>) -> function_calling;
-cli_capability(<<"structured_output">>) -> structured_output;
-cli_capability(<<"generation_config">>) -> generation_config;
-cli_capability(<<"multimodal">>) -> multimodal;
-cli_capability(<<"thinking">>) -> thinking;
-cli_capability(<<"safety_settings">>) -> safety_settings;
-cli_capability(<<"content_streaming">>) -> content_streaming;
-cli_capability(<<"google_search_grounding">>) -> google_search_grounding;
-cli_capability(Value) -> Value.
-
-provider_module(Name) when is_binary(Name) ->
-    %% An operator-owned profile deliberately takes precedence over the four
-    %% convenient built-in CLI aliases. This lets a JSON config select the
-    %% documented `compatible' profile without accepting a caller-controlled
-    %% URL, credential, or header in that file. With no matching profile the
-    %% legacy aliases retain their existing fixed-adapter behavior.
-    case configured_provider_profile(Name) of
-        true -> profile_provider_module(Name);
-        false -> fallback_provider_module(Name)
-    end;
-provider_module(_Name) ->
-    {error, invalid_provider_name}.
-
-configured_provider_profile(Name) ->
-    case application:get_env(erlang_adk, provider_profiles, #{}) of
-        Profiles when is_map(Profiles) -> maps:is_key(Name, Profiles);
-        _InvalidProfiles -> false
-    end.
-
-profile_provider_module(Name) ->
-    case adk_provider_registry:lookup(Name) of
-        {ok, #{request_adapter := _}} -> {ok, Name};
-        {ok, _LiveOnlyProfile} ->
-            {error, {invalid_provider, Name,
-                     request_capability_unavailable}};
-        {error, unknown_provider_profile} ->
-            legacy_provider_module(Name);
-        {error, _} -> {error, {unknown_provider, Name}}
-    end.
-
-fallback_provider_module(<<"gemini">>) -> {ok, adk_llm_gemini};
-fallback_provider_module(<<"openai">>) -> {ok, adk_llm_openai};
-fallback_provider_module(<<"anthropic">>) -> {ok, adk_llm_anthropic};
-fallback_provider_module(<<"compatible">>) -> {ok, adk_llm_compatible};
-fallback_provider_module(<<"adk_llm_probe">> = Name) ->
-    checked_provider(adk_llm_probe, Name);
-fallback_provider_module(Name) ->
-    legacy_provider_module(Name).
-
-legacy_provider_module(<<"adk_llm_", _/binary>> = Name) ->
-    try binary_to_existing_atom(Name, utf8) of
-        Module -> checked_provider(Module, Name)
-    catch
-        error:badarg -> {error, {unknown_provider, Name}}
-    end;
-legacy_provider_module(Name) ->
-    {error, {unknown_provider, Name}}.
-
-checked_provider(Module, Name) ->
-    case adk_llm:capabilities(Module) of
-        {ok, _} -> {ok, Module};
-        {error, Reason} ->
-            {error, {invalid_provider, Name, public_reason(Reason)}}
-    end.
-
-tools_from_json(Tools) when is_list(Tools) ->
-    tools_from_json(Tools, []);
-tools_from_json(_Tools) ->
-    {error, tools_must_be_array}.
-
-tools_from_json([], Acc) -> {ok, lists:reverse(Acc)};
-tools_from_json([Name | Rest], Acc) when is_binary(Name) ->
-    try binary_to_existing_atom(Name, utf8) of
-        Module ->
-            case code:ensure_loaded(Module) of
-                {module, Module} ->
-                    case erlang:function_exported(Module, schema, 0) andalso
-                         erlang:function_exported(Module, execute, 2) of
-                        true -> tools_from_json(Rest, [Module | Acc]);
-                        false -> {error, {invalid_tool_module, Name}}
-                    end;
-                _ -> {error, {unknown_tool_module, Name}}
-            end
-    catch
-        error:badarg -> {error, {unknown_tool_module, Name}}
-    end;
-tools_from_json([_ | _], _Acc) ->
-    {error, invalid_tool_name}.
-
-runner_options_from_json(Options) when is_map(Options) ->
-    Allowed = [<<"run_timeout">>, <<"max_llm_calls">>,
-               <<"max_tool_rounds">>, <<"service_timeout">>,
-               <<"tool_execution">>],
-    case maps:keys(maps:without(Allowed, Options)) of
-        [] -> convert_runner_options(maps:to_list(Options), #{});
-        Unknown -> {error, {unknown_runner_options, Unknown}}
-    end;
-runner_options_from_json(_Options) ->
-    {error, runner_options_must_be_object}.
-
-convert_runner_options([], Acc) -> {ok, Acc};
-convert_runner_options([{<<"run_timeout">>, Value} | Rest], Acc)
-  when is_integer(Value), Value > 0 ->
-    convert_runner_options(Rest, Acc#{run_timeout => Value});
-convert_runner_options([{<<"max_llm_calls">>, Value} | Rest], Acc)
-  when is_integer(Value), Value > 0 ->
-    convert_runner_options(Rest, Acc#{max_llm_calls => Value});
-convert_runner_options([{<<"max_tool_rounds">>, Value} | Rest], Acc)
-  when is_integer(Value), Value > 0 ->
-    convert_runner_options(Rest, Acc#{max_tool_rounds => Value});
-convert_runner_options([{<<"service_timeout">>, Value} | Rest], Acc)
-  when is_integer(Value), Value > 0 ->
-    convert_runner_options(Rest, Acc#{service_timeout => Value});
-convert_runner_options([{<<"tool_execution">>, <<"serial">>} | Rest], Acc) ->
-    convert_runner_options(Rest, Acc#{tool_execution => serial});
-convert_runner_options([{<<"tool_execution">>, Value} | Rest], Acc)
-  when is_map(Value) ->
-    case parallel_tool_policy(Value) of
-        {ok, Policy} ->
-            convert_runner_options(Rest, Acc#{tool_execution => Policy});
-        {error, _} = Error -> Error
-    end;
-convert_runner_options([{Key, _Value} | _], _Acc) ->
-    {error, {invalid_runner_option, Key}}.
-
-parallel_tool_policy(Value) ->
-    Allowed = [<<"mode">>, <<"max_concurrency">>, <<"tool_timeout">>],
-    case {maps:keys(maps:without(Allowed, Value)),
-          maps:get(<<"mode">>, Value, undefined),
-          maps:get(<<"max_concurrency">>, Value, undefined),
-          maps:get(<<"tool_timeout">>, Value, undefined)} of
-        {[], <<"parallel">>, Max, Timeout}
-          when is_integer(Max), Max > 0,
-               is_integer(Timeout), Timeout > 0 ->
-            {ok, #{mode => parallel, max_concurrency => Max,
-                   tool_timeout => Timeout}};
-        _ -> {error, invalid_parallel_tool_policy}
+    %% Config compilation may resolve operator-owned registry IDs from the
+    %% application environment. Commands intentionally compile before they
+    %% start OTP services, so load the .app specification first in a fresh
+    %% escript VM instead of silently compiling against an empty registry.
+    case application:load(erlang_adk) of
+        ok -> adk_agent_config:load_file(Path);
+        {error, {already_loaded, erlang_adk}} ->
+            adk_agent_config:load_file(Path);
+        {error, _Reason} -> {error, application_config_unavailable}
     end.
 
 load_dataset(Path) ->
@@ -2342,11 +2265,10 @@ dataset_rows([_ | _], Index, _Acc) ->
 
 read_json_file(Path0) ->
     Path = unicode:characters_to_list(Path0),
-    case file:read_file(Path) of
-        {ok, Binary} when byte_size(Binary) =< ?MAX_CONFIG_BYTES ->
+    case adk_bounded_file:read(Path, ?MAX_CONFIG_BYTES) of
+        {ok, Binary} ->
             decode_json_binary(Binary);
-        {ok, _Binary} -> {error, file_too_large};
-        {error, Reason} -> {error, {file_read_failed, Reason}}
+        {error, _} = Error -> Error
     end.
 
 decode_json_binary(Binary) ->
@@ -2355,27 +2277,6 @@ decode_json_binary(Binary) ->
     catch
         _:_ -> {error, invalid_json}
     end.
-
-contains_forbidden_secret(Map) when is_map(Map) ->
-    lists:any(
-      fun({Key, Value}) ->
-          forbidden_secret_key(Key) orelse contains_forbidden_secret(Value)
-      end, maps:to_list(Map));
-contains_forbidden_secret(List) when is_list(List) ->
-    lists:any(fun contains_forbidden_secret/1, List);
-contains_forbidden_secret(_Value) -> false.
-
-forbidden_secret_key(Key) when is_binary(Key) ->
-    Normalized0 = string:lowercase(Key),
-    Normalized = binary:replace(
-                   Normalized0, <<"-">>, <<"_">>, [global]),
-    lists:member(
-      Normalized,
-      [<<"api_key">>, <<"apikey">>, <<"authorization">>,
-       <<"access_token">>, <<"refresh_token">>, <<"id_token">>,
-       <<"password">>, <<"client_secret">>, <<"secret">>,
-       <<"credential">>, <<"credentials">>, <<"private_key">>]);
-forbidden_secret_key(_Key) -> false.
 
 with_required(Opts, Keys, Fun) ->
     case [Key || Key <- Keys, not maps:is_key(Key, Opts)] of
@@ -2394,22 +2295,38 @@ ensure_application_started() ->
 %% loaded. application:set_env/3 accepts that state, but a later load of the
 %% .app file replaces the temporary values with its defaults. Load first so the
 %% developer listener settings survive the subsequent application start.
-prepare_developer_application(Port, Ip) ->
+prepare_developer_application(Port, Ip, AgentRunnerOptions) ->
     stop_application(),
     case application:load(erlang_adk) of
-        ok -> configure_and_start_developer_application(Port, Ip);
+        ok -> configure_and_start_developer_application(
+                Port, Ip, AgentRunnerOptions);
         {error, {already_loaded, erlang_adk}} ->
-            configure_and_start_developer_application(Port, Ip);
+            configure_and_start_developer_application(
+              Port, Ip, AgentRunnerOptions);
         {error, Reason} ->
             {error, #{code => application_load_failed,
                       reason => public_reason(Reason)}}
     end.
 
-configure_and_start_developer_application(Port, Ip) ->
-    ok = application:set_env(erlang_adk, dev_enabled, true),
-    ok = application:set_env(erlang_adk, a2a_ip, Ip),
-    ok = application:set_env(erlang_adk, a2a_port, Port),
-    ensure_application_started().
+configure_and_start_developer_application(Port, Ip, AgentRunnerOptions)
+  when is_map(AgentRunnerOptions) ->
+    OperatorOptions = application:get_env(
+                        erlang_adk, dev_runner_options, #{}),
+    case is_map(OperatorOptions) of
+        true ->
+            %% Declarative options are bounded by adk_agent_config. Trusted
+            %% operator settings win if both specify the same policy, while
+            %% runtime-profile service refs are merged authoritatively later.
+            DevRunnerOptions = maps:merge(
+                                 AgentRunnerOptions, OperatorOptions),
+            ok = application:set_env(erlang_adk, dev_enabled, true),
+            ok = application:set_env(erlang_adk, a2a_ip, Ip),
+            ok = application:set_env(erlang_adk, a2a_port, Port),
+            ok = application:set_env(
+                   erlang_adk, dev_runner_options, DevRunnerOptions),
+            ensure_application_started();
+        false -> {error, invalid_dev_runtime_config}
+    end.
 
 stop_application() ->
     case application:stop(erlang_adk) of

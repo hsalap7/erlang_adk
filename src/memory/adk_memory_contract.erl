@@ -86,6 +86,7 @@ capabilities(Adapter, Limits) ->
       search => lexical_overlap,
       idempotent_ingestion => true,
       incremental_events => true,
+      erasure_epoch_fencing => true,
       delete => [entry, session, user],
       limits => Limits}.
 
@@ -111,20 +112,23 @@ prepare_entry(_Scope, _Input, _Opts, _Limits) ->
 prepare_entry_scope(Scope, Input, Opts, Limits) ->
     UnknownInput = maps:keys(maps:without(
                               [content, metadata, provenance], Input)),
-    UnknownOpts = maps:keys(maps:without([idempotency_key], Opts)),
+    UnknownOpts = maps:keys(maps:without(
+                              [idempotency_key, erasure_epoch], Opts)),
     case {UnknownInput, UnknownOpts} of
         {[], []} ->
             Content = maps:get(content, Input, undefined),
             Metadata0 = maps:get(metadata, Input, #{}),
             Provenance0 = maps:get(provenance, Input, #{}),
             Idempotency = maps:get(idempotency_key, Opts, undefined),
+            ErasureEpoch = maps:get(erasure_epoch, Opts, undefined),
             case validate_entry_fields(Content, Metadata0, Provenance0,
-                                       Idempotency, Limits) of
+                                       Idempotency, ErasureEpoch, Limits) of
                 {ok, Metadata, Provenance} ->
                     Digest = hex(crypto:hash(sha256, Content)),
                     Id = case Idempotency of
                         undefined -> random_id();
-                        _ -> id_for(Scope, Idempotency)
+                        _ -> id_for(Scope, epoch_idempotency(
+                                              ErasureEpoch, Idempotency))
                     end,
                     Timestamp = maps:get(timestamp, Provenance,
                                          erlang:system_time(millisecond)),
@@ -137,7 +141,12 @@ prepare_entry_scope(Scope, Input, Opts, Limits) ->
                         undefined -> Entry0;
                         _ -> Entry0#{idempotency_key => Idempotency}
                     end,
-                    {ok, Entry#{storage_bytes => entry_storage_bytes(Entry)}};
+                    Fenced = case ErasureEpoch of
+                        undefined -> Entry;
+                        _ -> Entry#{erasure_epoch => ErasureEpoch}
+                    end,
+                    {ok, Fenced#{storage_bytes =>
+                                     entry_storage_bytes(Fenced)}};
                 {error, _} = Error -> Error
             end;
         {[_ | _], _} ->
@@ -148,16 +157,19 @@ prepare_entry_scope(Scope, Input, Opts, Limits) ->
                      {unknown_keys, lists:sort(UnknownOpts)}}}
     end.
 
-validate_entry_fields(Content, Metadata0, Provenance0, Idempotency, Limits) ->
+validate_entry_fields(Content, Metadata0, Provenance0, Idempotency,
+                      ErasureEpoch, Limits) ->
     MaxContent = maps:get(max_content_bytes, Limits),
-    case bounded_text(Content, MaxContent, false) of
-        ok ->
+    case {bounded_text(Content, MaxContent, false),
+          valid_erasure_epoch(ErasureEpoch)} of
+        {ok, true} ->
             case sensitive_text(Content) of
                 true -> {error, sensitive_memory_content};
                 false -> validate_metadata_and_provenance(
                            Metadata0, Provenance0, Idempotency, Limits)
             end;
-        {error, Reason} -> {error, {invalid_memory_content, Reason}}
+        {{error, Reason}, _} -> {error, {invalid_memory_content, Reason}};
+        {_, false} -> {error, invalid_memory_erasure_epoch}
     end.
 
 validate_metadata_and_provenance(Metadata0, Provenance0, Idempotency, Limits) ->
@@ -278,7 +290,7 @@ validate_search_fields(Scope, Query, Filter0, Limit, Limits) ->
 hit(Entry, QueryTokens) ->
     Score = lexical_score(QueryTokens,
                           search_tokens(maps:get(content, Entry))),
-    (maps:without([storage_bytes, idempotency_key], Entry))#{
+    (maps:without([storage_bytes, idempotency_key, erasure_epoch], Entry))#{
       score => Score, score_type => lexical_overlap}.
 
 metadata_matches(_Metadata, Filter) when map_size(Filter) =:= 0 -> true;
@@ -292,9 +304,16 @@ prepare_events(Scope, SessionId, Events, Opts, Limits) ->
     case {validate_scope(Scope), bounded_text(SessionId, 256, false),
           bounded_list(Events, MaxEvents), is_map(Opts)} of
         {{ok, CanonScope}, ok, {ok, _}, true} ->
-            case maps:keys(Opts) of
-                [] -> prepare_events_list(CanonScope, SessionId, Events,
-                                          Limits, [], 0);
+            case lists:sort(maps:keys(
+                              maps:without([erasure_epoch], Opts))) of
+                [] ->
+                    case valid_erasure_epoch(
+                           maps:get(erasure_epoch, Opts, undefined)) of
+                        true -> prepare_events_list(
+                                  CanonScope, SessionId, Events, Opts,
+                                  Limits, [], 0);
+                        false -> {error, invalid_memory_erasure_epoch}
+                    end;
                 Unknown -> {error, {invalid_memory_options,
                                     {unknown_keys, lists:sort(Unknown)}}}
             end;
@@ -305,18 +324,21 @@ prepare_events(Scope, SessionId, Events, Opts, Limits) ->
         _ -> {error, {invalid_memory_options, expected_map}}
     end.
 
-prepare_events_list(_Scope, _SessionId, [], _Limits, Acc, Skipped) ->
+prepare_events_list(_Scope, _SessionId, [], _Opts, _Limits, Acc, Skipped) ->
     {ok, lists:reverse(Acc), Skipped};
-prepare_events_list(Scope, SessionId, [Event | Rest], Limits, Acc, Skipped) ->
+prepare_events_list(Scope, SessionId, [Event | Rest], Opts, Limits,
+                    Acc, Skipped) ->
     case event_input(Event, SessionId) of
-        skip -> prepare_events_list(Scope, SessionId, Rest, Limits,
+        skip -> prepare_events_list(Scope, SessionId, Rest, Opts, Limits,
                                     Acc, Skipped + 1);
         {ok, Input, Idem} ->
-            case prepare_entry(Scope, Input, #{idempotency_key => Idem}, Limits) of
-                {ok, Entry} -> prepare_events_list(Scope, SessionId, Rest,
-                                                   Limits, [Entry | Acc], Skipped);
+            EntryOpts = Opts#{idempotency_key => Idem},
+            case prepare_entry(Scope, Input, EntryOpts, Limits) of
+                {ok, Entry} -> prepare_events_list(
+                                 Scope, SessionId, Rest, Opts, Limits,
+                                 [Entry | Acc], Skipped);
                 {error, sensitive_memory_content} ->
-                    prepare_events_list(Scope, SessionId, Rest, Limits,
+                    prepare_events_list(Scope, SessionId, Rest, Opts, Limits,
                                         Acc, Skipped + 1);
                 {error, _} = Error -> Error
             end
@@ -398,6 +420,14 @@ id_for({user, App, User}, Idempotency) ->
                            Idempotency/binary>>),
     <<Prefix:16/binary, _/binary>> = Digest,
     <<"mem-", (hex(Prefix))/binary>>.
+
+epoch_idempotency(undefined, Idempotency) -> Idempotency;
+epoch_idempotency(Epoch, Idempotency) ->
+    <<"epoch:", (integer_to_binary(Epoch))/binary, 0,
+      Idempotency/binary>>.
+
+valid_erasure_epoch(undefined) -> true;
+valid_erasure_epoch(Epoch) -> is_integer(Epoch) andalso Epoch >= 0.
 
 random_id() ->
     <<"mem-", (hex(crypto:strong_rand_bytes(16)))/binary>>.

@@ -9,6 +9,7 @@ config :erlang_adk_ui,
   live_gateway: ErlangAdkUi.LiveGateway.Local,
   live_credit: %{messages: 8, bytes: 262_144},
   evaluation_reports: %{},
+  graph_trace: :disabled,
   auth_provider_call: [timeout_ms: 15_000, max_heap_words: 1_000_000],
   login_flow_store: [ttl_ms: :timer.minutes(10), max_entries: 1_000],
   session_store: [ttl_ms: :timer.hours(8), max_entries: 10_000],
@@ -21,7 +22,11 @@ config :erlang_adk_ui,
     max_live_events: 100,
     max_live_event_bytes: 262_144,
     max_observability_bytes: 262_144,
-    max_evaluation_bytes: 1_048_576
+    max_evaluation_bytes: 1_048_576,
+    max_graphs: 100,
+    max_graph_bytes: 1_048_576,
+    max_trace_events: 1_000,
+    max_trace_bytes: 1_048_576
   ]
 
 config :erlang_adk_ui, ErlangAdkUiWeb.Endpoint,

@@ -52,10 +52,34 @@ dispatch(Req, State = #{endpoint := diagnostics}) ->
     handle_diagnostics(Req, State);
 dispatch(Req, State = #{endpoint := observability}) ->
     handle_observability(Req, State);
+dispatch(Req, State = #{endpoint := provider_payloads}) ->
+    handle_provider_payloads(Req, State);
+dispatch(Req, State = #{endpoint := graphs}) ->
+    handle_graphs(Req, State);
+dispatch(Req, State = #{endpoint := graph}) ->
+    handle_graph(Req, State);
+dispatch(Req, State = #{endpoint := graph_overlay}) ->
+    handle_graph_overlay(Req, State);
+dispatch(Req, State = #{endpoint := traces}) ->
+    handle_traces(Req, State);
 dispatch(Req, State = #{endpoint := evaluation_render}) ->
     handle_evaluation_render(Req, State);
 dispatch(Req, State = #{endpoint := evaluation_compare}) ->
     handle_evaluation_compare(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_jobs}) ->
+    handle_evaluation_jobs(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_job}) ->
+    handle_evaluation_job(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_job_report}) ->
+    handle_evaluation_job_report(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_job_result}) ->
+    handle_evaluation_job_result(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_sets}) ->
+    handle_evaluation_sets(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_set}) ->
+    handle_evaluation_set(Req, State);
+dispatch(Req, State = #{endpoint := evaluation_baseline}) ->
+    handle_evaluation_baseline(Req, State);
 dispatch(Req, State = #{endpoint := live_sessions}) ->
     handle_live_sessions(Req, State);
 dispatch(Req, State = #{endpoint := live_session_text}) ->
@@ -537,6 +561,298 @@ handle_observability(Req0, State) ->
         _ -> method_not_allowed(<<"GET">>, Req0, State)
     end.
 
+%% Graph publication is deliberately absent from HTTP. Trusted application
+%% code publishes compiled graphs into adk_dev_graph_catalog; this bearer can
+%% only inspect the owner bound into route state.
+handle_graphs(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            with_graph_catalog(
+              Req0, State,
+              fun(Catalog, Owner, Req) ->
+                  case graph_list_options(Req, State) of
+                      {ok, Options} ->
+                          case adk_dev_graph_catalog:list(
+                                 Catalog, Owner, Options) of
+                              {ok, Result} ->
+                                  json_reply(200, Result, #{}, Req, State);
+                              {error, _} -> graph_service_unavailable(Req, State)
+                          end;
+                      {error, Message} ->
+                          error_reply(400, <<"invalid_graph_query">>, Message,
+                                      #{}, Req, State)
+                  end
+              end);
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_graph(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            case validated_binding(graph_id, Req0, State) of
+                {error, Req1} -> {ok, Req1, State};
+                {ok, GraphId} ->
+                    with_graph_catalog(
+                      Req0, State,
+                      fun(Catalog, Owner, Req) ->
+                          case adk_dev_graph_catalog:get(
+                                 Catalog, Owner, GraphId) of
+                              {ok, Graph} ->
+                                  json_reply(200, Graph, #{}, Req, State);
+                              {error, not_found} ->
+                                  not_found(<<"graph_not_found">>, Req, State);
+                              {error, _} -> graph_service_unavailable(Req, State)
+                          end
+                      end)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_graph_overlay(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            case validated_binding(graph_id, Req0, State) of
+                {error, Req1} -> {ok, Req1, State};
+                {ok, GraphId} -> graph_overlay_query(GraphId, Req0, State)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+graph_overlay_query(GraphId, Req0, State) ->
+    case trace_query_options(Req0, State, [<<"workflow_id">>]) of
+        {error, Message} ->
+            error_reply(400, <<"invalid_trace_query">>, Message,
+                        #{}, Req0, State);
+        {ok, Selector, Options0} ->
+            Options = case Selector of
+                #{workflow_id := WorkflowId} ->
+                    Options0#{workflow_id => WorkflowId};
+                _ -> Options0
+            end,
+            case developer_graph_trace_handles(State) of
+                {ok, Catalog, Owner, Store, Principal} ->
+                    case adk_dev_trace_view:graph_overlay(
+                           Catalog, Owner, GraphId, Store, Principal,
+                           Options) of
+                        {ok, Overlay} ->
+                            json_reply(200, Overlay, #{}, Req0, State);
+                        {error, not_found} ->
+                            not_found(<<"graph_not_found">>, Req0, State);
+                        {error, {replay_gap, Gap}} ->
+                            trace_replay_gap_reply(Gap, Req0, State);
+                        {error, {cursor_ahead, Gap}} ->
+                            trace_cursor_ahead_reply(Gap, Req0, State);
+                        {error, _} -> graph_service_unavailable(Req0, State)
+                    end;
+                error -> graph_service_unavailable(Req0, State)
+            end
+    end.
+
+handle_traces(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            Allowed = [<<"run_id">>, <<"trace_id">>, <<"workflow_id">>,
+                       <<"invocation_id">>],
+            case trace_query_options(Req0, State, Allowed) of
+                {error, Message} ->
+                    error_reply(400, <<"invalid_trace_query">>, Message,
+                                #{}, Req0, State);
+                {ok, Selector, Options} ->
+                    query_developer_traces(Selector, Options, Req0, State)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_provider_payloads(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> -> query_provider_payloads(Req0, State);
+        <<"DELETE">> -> clear_provider_payloads(Req0, State);
+        _ -> method_not_allowed(<<"GET, DELETE">>, Req0, State)
+    end.
+
+query_provider_payloads(Req, State) ->
+    case maps:get(provider_payload_store, State, undefined) of
+        undefined -> provider_payloads_unavailable(Req, State);
+        Store ->
+            case payload_query_options(Req, State) of
+                {error, Message} ->
+                    error_reply(400, <<"invalid_payload_query">>, Message,
+                                #{}, Req, State);
+                {ok, Options} ->
+                    case adk_dev_payload_store:query(Store, Options) of
+                        {ok, Result} -> json_reply(200, Result, #{}, Req, State);
+                        {error, {replay_gap, Gap}} ->
+                            error_reply(
+                              409, <<"provider_payload_replay_gap">>,
+                              <<"Payload cursor is older than retained data">>,
+                              #{<<"x-adk-payload-gap">> => <<"true">>},
+                              Req, State, Gap);
+                        {error, {cursor_ahead, Gap}} ->
+                            error_reply(
+                              409, <<"provider_payload_cursor_ahead">>,
+                              <<"Payload cursor is newer than retained data">>,
+                              #{}, Req, State, Gap);
+                        {error, _} -> provider_payloads_unavailable(Req, State)
+                    end
+            end
+    end.
+
+clear_provider_payloads(Req, State) ->
+    case maps:get(provider_payload_store, State, undefined) of
+        undefined -> provider_payloads_unavailable(Req, State);
+        Store ->
+            case adk_dev_payload_store:clear(Store) of
+                ok -> json_reply(200, #{<<"cleared">> => true}, #{}, Req, State);
+                {error, _} -> provider_payloads_unavailable(Req, State)
+            end
+    end.
+
+payload_query_options(Req, State) ->
+    case checked_query(Req, [<<"after_cursor">>, <<"limit">>]) of
+        {ok, Params} ->
+            CursorResult = case maps:find(<<"after_cursor">>, Params) of
+                error -> {ok, undefined};
+                {ok, Cursor} ->
+                    nonnegative_bounded_integer(Cursor, 16#7fffffff)
+            end,
+            case {CursorResult, page_limit(Params, State)} of
+                {{ok, undefined}, {ok, Limit}} ->
+                    {ok, #{limit => Limit}};
+                {{ok, After}, {ok, Limit}} ->
+                    {ok, #{after_cursor => After, limit => Limit}};
+                _ ->
+                    {error, <<"after_cursor and limit must be bounded integers">>}
+            end;
+        {error, _} ->
+            {error, <<"Only one after_cursor and limit may be supplied">>}
+    end.
+
+provider_payloads_unavailable(Req, State) ->
+    error_reply(
+      503, <<"provider_payload_inspection_disabled">>,
+      <<"Explicit local provider payload inspection is not enabled">>,
+      #{}, Req, State).
+
+query_developer_traces(Selector, Options, Req, State) ->
+    case {maps:get(trace_store, State, undefined),
+          maps:get(trace_principal, State, undefined)} of
+        {Store, Principal} when Store =/= undefined, is_binary(Principal) ->
+            Cursor = maps:get(after_cursor, Options),
+            QueryOptions = maps:without([after_cursor], Options),
+            case adk_dev_trace_view:query(
+                   Store, Principal, Selector, Cursor, QueryOptions) of
+                {ok, Result} ->
+                    json_reply(
+                      200, Result#{<<"schema_version">> => 1,
+                                   <<"content_captured">> => false},
+                      #{}, Req, State);
+                {error, {replay_gap, Gap}} ->
+                    trace_replay_gap_reply(Gap, Req, State);
+                {error, {cursor_ahead, Gap}} ->
+                    trace_cursor_ahead_reply(Gap, Req, State);
+                {error, _} -> graph_service_unavailable(Req, State)
+            end;
+        _ -> graph_service_unavailable(Req, State)
+    end.
+
+with_graph_catalog(Req, State, Fun) ->
+    case {maps:get(graph_catalog, State, undefined),
+          maps:get(graph_owner, State, undefined)} of
+        {Catalog, Owner} when Catalog =/= undefined, is_binary(Owner) ->
+            Fun(Catalog, Owner, Req);
+        _ -> graph_service_unavailable(Req, State)
+    end.
+
+developer_graph_trace_handles(State) ->
+    case {maps:get(graph_catalog, State, undefined),
+          maps:get(graph_owner, State, undefined),
+          maps:get(trace_store, State, undefined),
+          maps:get(trace_principal, State, undefined)} of
+        {Catalog, Owner, Store, Principal}
+          when Catalog =/= undefined, Store =/= undefined,
+               is_binary(Owner), is_binary(Principal) ->
+            {ok, Catalog, Owner, Store, Principal};
+        _ -> error
+    end.
+
+graph_list_options(Req, State) ->
+    case checked_query(Req, [<<"limit">>, <<"cursor">>]) of
+        {ok, Params} ->
+            case page_limit(Params, State) of
+                {ok, Limit} ->
+                    Cursor = maps:get(<<"cursor">>, Params, <<>>),
+                    case Cursor =:= <<>> orelse valid_field(
+                                                 Cursor,
+                                                 maps:get(max_field_bytes,
+                                                          State)) of
+                        true -> {ok, #{limit => Limit, 'after' => Cursor}};
+                        false -> {error, <<"cursor is invalid">>}
+                    end;
+                {error, _} -> {error, <<"limit is invalid">>}
+            end;
+        {error, _} ->
+            {error, <<"limit and cursor may each be supplied once">>}
+    end.
+
+trace_query_options(Req, State, SelectorKeys) ->
+    Allowed = SelectorKeys ++ [<<"after_cursor">>, <<"limit">>],
+    case checked_query(Req, Allowed) of
+        {error, _} -> {error, <<"Trace query parameters are invalid">>};
+        {ok, Params} ->
+            SelectorPairs = [{trace_selector_key(Key), Value}
+                             || Key <- SelectorKeys,
+                                {ok, Value} <- [maps:find(Key, Params)]],
+            Selector = case SelectorPairs of [] -> all; _ -> maps:from_list(SelectorPairs) end,
+            CursorValue = maps:get(<<"after_cursor">>, Params, <<"0">>),
+            case {nonnegative_bounded_integer(CursorValue, 16#7fffffff),
+                  page_limit(Params, State),
+                  lists:all(fun({_Key, Value}) ->
+                                    valid_field(
+                                      Value, maps:get(max_field_bytes, State))
+                            end, SelectorPairs)} of
+                {{ok, Cursor}, {ok, Limit}, true} ->
+                    {ok, Selector,
+                     #{after_cursor => Cursor, limit => Limit,
+                       max_bytes => maps:get(sse_max_bytes, State)}};
+                _ -> {error, <<"Trace cursor, limit, or selector is invalid">>}
+            end
+    end.
+
+trace_selector_key(<<"run_id">>) -> run_id;
+trace_selector_key(<<"trace_id">>) -> trace_id;
+trace_selector_key(<<"workflow_id">>) -> workflow_id;
+trace_selector_key(<<"invocation_id">>) -> invocation_id.
+
+nonnegative_bounded_integer(Value, Maximum) when is_binary(Value) ->
+    try binary_to_integer(Value) of
+        Integer when Integer >= 0, Integer =< Maximum -> {ok, Integer};
+        _ -> {error, invalid_integer}
+    catch _:_ -> {error, invalid_integer}
+    end.
+
+trace_replay_gap_reply(Gap, Req, State) ->
+    error_reply(409, <<"trace_replay_gap">>,
+                <<"Trace cursor is older than the retained replay window">>,
+                #{<<"x-adk-trace-gap">> => <<"true">>},
+                Req, State, Gap).
+
+trace_cursor_ahead_reply(Gap, Req, State) ->
+    error_reply(409, <<"trace_cursor_ahead">>,
+                <<"Trace cursor is newer than the retained stream">>,
+                #{}, Req, State, Gap).
+
+%% Keep trace gap details bounded and already JSON-safe from adk_trace_store.
+error_reply(Status, Code, Message, Headers, Req0, State, Details) ->
+    Body = #{<<"error">> => #{<<"code">> => Code,
+                                <<"message">> => Message,
+                                <<"details">> => Details}},
+    json_reply(Status, Body, Headers, Req0, State).
+
+graph_service_unavailable(Req, State) ->
+    error_reply(503, <<"developer_graph_trace_unavailable">>,
+                <<"Developer graph/trace inspection is not configured">>,
+                #{}, Req, State).
+
 developer_component_snapshot(Name, Read) ->
     case whereis(Name) of
         undefined -> #{<<"enabled">> => false};
@@ -587,6 +903,14 @@ render_evaluation_payload(Payload, Req, State) ->
                     binary_reply(
                       200, <<"text/markdown; charset=utf-8">>,
                       Output, #{}, Req, State);
+                {ok, Output} when Format =:= <<"junit">> ->
+                    binary_reply(
+                      200, <<"application/xml; charset=utf-8">>,
+                      Output, #{}, Req, State);
+                {ok, Output} when Format =:= <<"sarif">>;
+                                  Format =:= <<"annotations">> ->
+                    binary_reply(
+                      200, ?JSON, Output, #{}, Req, State);
                 {error, {eval_dev_view, Code}} ->
                     evaluation_view_error(Code, Req, State)
             end
@@ -639,6 +963,337 @@ evaluation_view_error(eval_set_mismatch, Req, State) ->
 evaluation_view_error(_Code, Req, State) ->
     error_reply(400, <<"invalid_evaluation_report">>,
                 <<"The evaluation report or rendering options are invalid">>,
+                #{}, Req, State).
+
+handle_evaluation_jobs(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            case evaluation_page_options(Req0, State) of
+                {ok, Options} ->
+                    with_evaluation_service(
+                      Req0, State,
+                      fun(Service, Scope, Req) ->
+                          evaluation_api_reply(
+                            adk_eval_dev_api:list_jobs(
+                              Service, Scope, Options),
+                            200, Req, State)
+                      end);
+                {error, Message} ->
+                    error_reply(400, <<"invalid_evaluation_query">>,
+                                Message, #{}, Req0, State)
+            end;
+        <<"POST">> ->
+            case read_json_object(Req0, State) of
+                {ok, Payload, Req1} ->
+                    with_evaluation_service(
+                      Req1, State,
+                      fun(Service, Scope, Req) ->
+                          case adk_eval_dev_api:submit(
+                                 Service, Scope, Payload) of
+                              {ok, Job} when is_map(Job) ->
+                                  JobId = maps:get(job_id, Job, <<>>),
+                                  Location =
+                                      <<"/dev/v1/evaluation/jobs/",
+                                        JobId/binary>>,
+                                  json_reply(
+                                    202, json_safe(Job),
+                                    #{<<"location">> => Location},
+                                    Req, State);
+                              {error, Reason} ->
+                                  evaluation_api_error(
+                                    Reason, Req, State)
+                          end
+                      end);
+                {error, Req1} -> {ok, Req1, State}
+            end;
+        _ -> method_not_allowed(<<"GET, POST">>, Req0, State)
+    end.
+
+handle_evaluation_job(Req0, State) ->
+    case {cowboy_req:method(Req0),
+          evaluation_binding(job_id, Req0, State)} of
+        {<<"GET">>, {ok, JobId}} ->
+            with_evaluation_service(
+              Req0, State,
+              fun(Service, Scope, Req) ->
+                  evaluation_api_reply(
+                    adk_eval_dev_api:status(Service, Scope, JobId),
+                    200, Req, State)
+              end);
+        {<<"DELETE">>, {ok, JobId}} ->
+            with_evaluation_service(
+              Req0, State,
+              fun(Service, Scope, Req) ->
+                  case adk_eval_dev_api:cancel(Service, Scope, JobId) of
+                      ok ->
+                          json_reply(
+                            202,
+                            #{<<"job_id">> => JobId,
+                              <<"status">> => <<"cancellation_requested">>},
+                            #{}, Req, State);
+                      {error, Reason} ->
+                          evaluation_api_error(Reason, Req, State)
+                  end
+              end);
+        {_Method, {error, Req1}} -> {ok, Req1, State};
+        _ -> method_not_allowed(<<"GET, DELETE">>, Req0, State)
+    end.
+
+handle_evaluation_job_result(Req0, State) ->
+    case {cowboy_req:method(Req0),
+          evaluation_binding(job_id, Req0, State)} of
+        {<<"GET">>, {ok, JobId}} ->
+            with_evaluation_service(
+              Req0, State,
+              fun(Service, Scope, Req) ->
+                  evaluation_api_reply(
+                    adk_eval_dev_api:result(Service, Scope, JobId),
+                    200, Req, State)
+              end);
+        {_Method, {error, Req1}} -> {ok, Req1, State};
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_evaluation_job_report(Req0, State) ->
+    case {cowboy_req:method(Req0),
+          evaluation_binding(job_id, Req0, State),
+          evaluation_report_options(Req0, State)} of
+        {<<"GET">>, {ok, JobId}, {ok, Format, Options}} ->
+            with_evaluation_service(
+              Req0, State,
+              fun(Service, Scope, Req) ->
+                  case adk_eval_dev_api:report(
+                         Service, Scope, JobId, Format, Options) of
+                      {ok, Output} ->
+                          binary_reply(
+                            200, evaluation_report_content_type(Format),
+                            Output, #{}, Req, State);
+                      {error, {eval_dev_view, Code}} ->
+                          evaluation_view_error(Code, Req, State);
+                      {error, Reason} ->
+                          evaluation_api_error(Reason, Req, State)
+                  end
+              end);
+        {<<"GET">>, {error, Req1}, _} -> {ok, Req1, State};
+        {<<"GET">>, _, {error, Message}} ->
+            error_reply(400, <<"invalid_evaluation_query">>, Message,
+                        #{}, Req0, State);
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+evaluation_report_options(Req, State) ->
+    case checked_query(Req, [<<"format">>, <<"suite_name">>]) of
+        {error, _} ->
+            {error,
+             <<"format and suite_name may each be supplied once">>};
+        {ok, Params} ->
+            Format = maps:get(<<"format">>, Params, <<"json">>),
+            Suite = maps:get(<<"suite_name">>, Params,
+                             <<"erlang_adk_eval">>),
+            Maximum = maps:get(max_field_bytes, State),
+            case valid_field(Format, Maximum)
+                 andalso valid_field(Suite, Maximum) of
+                true ->
+                    {ok, Format,
+                     #{<<"suite_name">> => Suite,
+                       <<"max_output_bytes">> =>
+                           maps:get(evaluation_report_max_bytes, State)}};
+                false ->
+                    {error,
+                     <<"format and suite_name must be non-empty bounded UTF-8 strings">>}
+            end
+    end.
+
+evaluation_report_content_type(<<"markdown">>) ->
+    <<"text/markdown; charset=utf-8">>;
+evaluation_report_content_type(<<"junit">>) ->
+    <<"application/xml; charset=utf-8">>;
+evaluation_report_content_type(_Format) -> ?JSON.
+
+handle_evaluation_sets(Req0, State) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            case evaluation_page_options(Req0, State) of
+                {ok, Options} ->
+                    with_evaluation_service(
+                      Req0, State,
+                      fun(Service, Scope, Req) ->
+                          evaluation_api_reply(
+                            adk_eval_dev_api:list_sets(
+                              Service, Scope, Options),
+                            200, Req, State)
+                      end);
+                {error, Message} ->
+                    error_reply(400, <<"invalid_evaluation_query">>,
+                                Message, #{}, Req0, State)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_evaluation_set(Req0, State) ->
+    case {cowboy_req:method(Req0),
+          evaluation_binding(set_id, Req0, State),
+          evaluation_binding(version, Req0, State)} of
+        {<<"GET">>, {ok, SetId}, {ok, Version}} ->
+            with_evaluation_service(
+              Req0, State,
+              fun(Service, Scope, Req) ->
+                  evaluation_api_reply(
+                    adk_eval_dev_api:get_set(
+                      Service, Scope, SetId, Version),
+                    200, Req, State)
+              end);
+        {_Method, {error, Req1}, _} -> {ok, Req1, State};
+        {_Method, _, {error, Req1}} -> {ok, Req1, State};
+        _ -> method_not_allowed(<<"GET">>, Req0, State)
+    end.
+
+handle_evaluation_baseline(Req0, State) ->
+    case {cowboy_req:method(Req0),
+          evaluation_binding(baseline_name, Req0, State)} of
+        {<<"GET">>, {ok, Name}} ->
+            with_evaluation_service(
+              Req0, State,
+              fun(Service, Scope, Req) ->
+                  evaluation_api_reply(
+                    adk_eval_dev_api:get_baseline(Service, Scope, Name),
+                    200, Req, State)
+              end);
+        {<<"PUT">>, {ok, Name}} ->
+            case read_json_object(Req0, State) of
+                {ok, #{<<"job_id">> := JobId} = Payload, Req1}
+                  when map_size(Payload) =:= 1 ->
+                    case valid_field(
+                           JobId, maps:get(max_field_bytes, State)) of
+                        true ->
+                            with_evaluation_service(
+                              Req1, State,
+                              fun(Service, Scope, Req) ->
+                                  evaluation_api_reply(
+                                    adk_eval_dev_api:put_baseline(
+                                      Service, Scope, Name, JobId),
+                                    200, Req, State)
+                              end);
+                        false ->
+                            evaluation_authoring_error(Req1, State)
+                    end;
+                {ok, _Payload, Req1} ->
+                    evaluation_authoring_error(Req1, State);
+                {error, Req1} -> {ok, Req1, State}
+            end;
+        {_Method, {error, Req1}} -> {ok, Req1, State};
+        _ -> method_not_allowed(<<"GET, PUT">>, Req0, State)
+    end.
+
+with_evaluation_service(Req, State, Fun) ->
+    case {maps:get(evaluation_service, State, undefined),
+          maps:get(evaluation_scope, State, undefined)} of
+        {undefined, undefined} ->
+            error_reply(
+              503, <<"developer_evaluation_unavailable">>,
+              <<"Durable evaluation is not configured for the Developer API">>,
+              #{}, Req, State);
+        {Service, {app, ScopeId} = Scope}
+          when Service =/= undefined, is_binary(ScopeId) ->
+            Fun(Service, Scope, Req);
+        _ ->
+            error_reply(
+              503, <<"developer_evaluation_unavailable">>,
+              <<"Durable evaluation configuration is invalid">>,
+              #{}, Req, State)
+    end.
+
+evaluation_page_options(Req, State) ->
+    case checked_query(Req, [<<"limit">>, <<"cursor">>]) of
+        {error, _} ->
+            {error, <<"Only one limit and cursor parameter may be supplied">>};
+        {ok, Params} ->
+            case page_limit(Params, State) of
+                {error, _} ->
+                    {error, <<"limit must be a positive bounded integer">>};
+                {ok, Limit} ->
+                    case maps:get(<<"cursor">>, Params, undefined) of
+                        undefined -> {ok, #{limit => Limit}};
+                        Cursor ->
+                            case valid_field(
+                                   Cursor,
+                                   maps:get(max_field_bytes, State)) of
+                                true ->
+                                    {ok, #{limit => Limit,
+                                           cursor => Cursor}};
+                                false ->
+                                    {error, <<"cursor is invalid or too large">>}
+                            end
+                    end
+            end
+    end.
+
+evaluation_binding(Name, Req, State) ->
+    Value = cowboy_req:binding(Name, Req),
+    case valid_field(Value, maps:get(max_field_bytes, State)) of
+        true -> {ok, Value};
+        false ->
+            Req1 = error_req(
+                     400, <<"invalid_evaluation_path_parameter">>,
+                     <<"Evaluation identifiers must be non-empty UTF-8 strings within configured limits">>,
+                     #{}, Req),
+            {error, Req1}
+    end.
+
+evaluation_api_reply({ok, Value}, Status, Req, State) ->
+    json_reply(Status, json_safe(Value), #{}, Req, State);
+evaluation_api_reply({error, Reason}, _Status, Req, State) ->
+    evaluation_api_error(Reason, Req, State).
+
+evaluation_api_error(not_found, Req, State) ->
+    error_reply(404, <<"evaluation_resource_not_found">>,
+                <<"The requested evaluation resource was not found">>,
+                #{}, Req, State);
+evaluation_api_error(agent_not_found, Req, State) ->
+    error_reply(404, <<"evaluation_agent_not_found">>,
+                <<"The selected registered agent was not found">>,
+                #{}, Req, State);
+evaluation_api_error(result_not_ready, Req, State) ->
+    error_reply(409, <<"evaluation_result_not_ready">>,
+                <<"The evaluation result is not ready">>,
+                #{}, Req, State);
+evaluation_api_error({already_terminal, _}, Req, State) ->
+    evaluation_conflict(Req, State);
+evaluation_api_error({evaluation_job_terminal, _, _}, Req, State) ->
+    evaluation_conflict(Req, State);
+evaluation_api_error(job_not_completed, Req, State) ->
+    evaluation_conflict(Req, State);
+evaluation_api_error(evaluation_queue_full, Req, State) ->
+    evaluation_capacity_error(Req, State);
+evaluation_api_error(evaluation_request_validation_busy, Req, State) ->
+    evaluation_capacity_error(Req, State);
+evaluation_api_error(timeout, Req, State) ->
+    evaluation_service_error(Req, State);
+evaluation_api_error({eval_service_unavailable, _}, Req, State) ->
+    evaluation_service_error(Req, State);
+evaluation_api_error({eval_store_call_failed, _, _}, Req, State) ->
+    evaluation_service_error(Req, State);
+evaluation_api_error(_Reason, Req, State) ->
+    evaluation_authoring_error(Req, State).
+
+evaluation_authoring_error(Req, State) ->
+    error_reply(400, <<"invalid_evaluation_authoring_request">>,
+                <<"The evaluation authoring request is invalid">>,
+                #{}, Req, State).
+
+evaluation_conflict(Req, State) ->
+    error_reply(409, <<"evaluation_state_conflict">>,
+                <<"The evaluation job state does not permit this operation">>,
+                #{}, Req, State).
+
+evaluation_capacity_error(Req, State) ->
+    error_reply(429, <<"evaluation_capacity_reached">>,
+                <<"Evaluation capacity is temporarily unavailable">>,
+                #{<<"retry-after">> => <<"1">>}, Req, State).
+
+evaluation_service_error(Req, State) ->
+    error_reply(503, <<"evaluation_service_unavailable">>,
+                <<"The evaluation service is unavailable">>,
                 #{}, Req, State).
 
 handle_live_sessions(Req0, State) ->

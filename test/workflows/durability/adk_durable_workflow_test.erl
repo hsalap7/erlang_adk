@@ -2,6 +2,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(TABLE, adk_durable_invocation_test).
+-define(INCOMPATIBLE_TABLE, adk_durable_invocation_incompatible_test).
 
 durable_workflow_test_() ->
     {setup,
@@ -18,11 +19,14 @@ durable_workflow_test_() ->
           ?_test(expired_owner_cannot_write_without_takeover(Ledger)),
           ?_test(expired_live_local_owner_is_claimable(Ledger)),
           ?_test(concurrent_expiry_claim_has_single_winner(Ledger)),
+          ?_test(incompatible_existing_ledger_table_is_rejected(Ledger)),
           ?_test(ledger_restart_preserves_expiry_fence(Ledger))]
      end}.
 
 setup() ->
     {ok, _} = application:ensure_all_started(erlang_adk),
+    {ok, _} = application:ensure_all_started(mnesia),
+    ok = delete_table_if_present(?TABLE),
     {ok, Ledger} = adk_invocation_ledger_mnesia:init(#{table => ?TABLE}),
     true = mnesia:table_info(?TABLE, majority),
     {atomic, ok} = mnesia:clear_table(?TABLE),
@@ -409,6 +413,26 @@ concurrent_expiry_claim_has_single_winner(Ledger) ->
         _ = Module:delete(Ledger, InvocationId)
     end.
 
+incompatible_existing_ledger_table_is_rejected(_Ledger) ->
+    Table = ?INCOMPATIBLE_TABLE,
+    ok = delete_table_if_present(Table),
+    try
+        {atomic, ok} = mnesia:create_table(
+                         Table,
+                         [{attributes, durable_invocation_attributes()},
+                          {record_name, adk_durable_invocation},
+                          {ram_copies, [node()]},
+                          {type, set},
+                          {majority, true}]),
+        ?assertEqual(
+           {error,
+            {invocation_ledger_table_schema_mismatch, Table,
+             storage_type, disc_copies, ram_copies}},
+           adk_invocation_ledger_mnesia:init(#{table => Table}))
+    after
+        ok = delete_table_if_present(Table)
+    end.
+
 ledger_restart_preserves_expiry_fence(Ledger) ->
     Module = adk_invocation_ledger_mnesia,
     InvocationId = <<"inv-test-ledger-restart-expiry">>,
@@ -514,6 +538,17 @@ assert_second_checkpoint(Record) ->
 assert_invocation_context(InvocationId, Context) ->
     ?assertEqual(InvocationId, maps:get(invocation_id, Context)),
     ?assert(is_map(maps:get(checkpoint_cursor, Context))).
+
+durable_invocation_attributes() ->
+    [id, format, workflow_id, workflow_version, kind, checkpoint,
+     phase, outcome, owner_token, owner_pid, owner_node, lease_until,
+     revision, created_at, updated_at].
+
+delete_table_if_present(Table) ->
+    case mnesia:delete_table(Table) of
+        {atomic, ok} -> ok;
+        {aborted, {no_exists, Table}} -> ok
+    end.
 
 collect_resume_results(0, Acc) -> lists:reverse(Acc);
 collect_resume_results(Remaining, Acc) ->

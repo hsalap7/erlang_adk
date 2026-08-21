@@ -1,0 +1,26 @@
+[
+ {kernel,
+  [{logger_level, info},
+   {logger,
+    [{handler, default, logger_std_h,
+      #{config => #{type => standard_io},
+        formatter =>
+         {logger_formatter,
+          #{single_line => true,
+            legacy_header => false}}}}]}]},
+ {sasl, [{sasl_error_logger, false}]},
+ {mnesia, [{dir, "/var/lib/erlang_adk/mnesia"}]},
+ {erlang_adk,
+  [%% This profile exposes only content-minimal deployment health routes.
+   %% Agent, developer, and legacy prompt routes remain disabled.
+   {http_health_enabled, true},
+   {a2a_port, ${PORT:-8080}},
+   {a2a_ip, {0, 0, 0, 0}},
+   {a2a_enabled, false},
+   {a2a_v1_enabled, false},
+   {dev_enabled, false},
+   {runtime_service_profile, disabled},
+   {evaluation_service_enabled, false},
+   {trace_store_enabled, false},
+   {memory_outbox_enabled, false}]}
+].

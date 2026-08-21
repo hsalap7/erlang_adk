@@ -1,0 +1,9 @@
+apiVersion: v2
+name: erlang-adk
+description: Hardened deployment foundation for the Erlang ADK root OTP release
+type: application
+version: 0.10.0
+appVersion: "0.10.0"
+kubeVersion: ">=1.28.0-0"
+annotations:
+  erlang-adk.dev/support-status: foundation-static-validation

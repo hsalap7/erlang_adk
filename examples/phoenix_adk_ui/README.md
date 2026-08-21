@@ -1,4 +1,4 @@
-# Phoenix production UI companion (v0.9)
+# Phoenix production UI companion (v0.10)
 
 This is a Phoenix 1.8 companion application for Erlang ADK. It runs Phoenix,
 `erlang_adk`, the authenticated gateway, and supervised agent runs on the same
@@ -12,11 +12,12 @@ server-side cursor, cancellation, and typed human approval. The `/live`
 console adds principal-scoped discovery of server-owned ADK Live sessions,
 future-only attach/detach, realtime text input, bounded Live event credit/ack,
 an authenticated binary full-duplex voice bridge with server-negotiated
-16/24 kHz input, read-only observability
-snapshots, and pure evaluation report and baseline-comparison panels. Browser
+16/24 kHz input, read-only observability snapshots, a server-owned workflow
+graph catalog with execution overlays, a cursor-aware metadata-only trace
+timeline, and pure evaluation report and baseline-comparison panels. Browser
 input never selects an ADK user ID,
-application name, runner, provider, model, evaluator module, or filesystem
-path.
+application name, runner, provider, model, evaluator module, graph/trace service
+handle, operations owner/principal, trace selector, or filesystem path.
 
 ## Locked setup and tests
 
@@ -54,6 +55,10 @@ The v0.9.0 gate repeats those results with the refreshed security locks: 103
 ExUnit tests and 40 browser/audio tests pass, production assets and release
 assembly complete, and both trusted-proxy and verified direct-TLS health smokes
 pass.
+
+The current v0.10.0 precommit gate passes 107 ExUnit tests and all 40
+browser/audio tests, including the graph/trace scope, isolation, content
+exclusion, forged-input and cursor-recovery contracts.
 
 Phoenix LiveView is temporarily pinned to the official upstream fix commit
 `86165533e311469a1b62093fd182d9d874de8106` for CVE-2026-58228. Replace that Git
@@ -100,7 +105,7 @@ export OIDC_ISSUER='https://identity.example.com'
 export OIDC_CLIENT_ID='...'
 export OIDC_CLIENT_SECRET='...'
 export OIDC_REDIRECT_URI='http://127.0.0.1:4000/auth/callback'
-export OIDC_SCOPES='openid adk.agents.read adk.run.start adk.run.read adk.run.control adk.live.read adk.live.control adk.observability.read adk.evaluation.read'
+export OIDC_SCOPES='openid adk.agents.read adk.run.start adk.run.read adk.run.control adk.live.read adk.live.control adk.observability.read adk.evaluation.read adk.graph.read adk.trace.read'
 mix phx.server
 ```
 
@@ -186,7 +191,10 @@ exact server-side principal and applies capability-specific scopes:
 - `adk.live.control` for realtime text and microphone/control frames; voice
   frames re-check both Live scopes;
 - `adk.observability.read` for metric/export-delivery snapshots; and
-- `adk.evaluation.read` for checked reports and baseline comparisons.
+- `adk.evaluation.read` for checked reports and baseline comparisons;
+- `adk.graph.read` for the server-owned graph catalog and topology detail; and
+- `adk.trace.read` for the fixed trace timeline. Graph overlays require both
+  graph and trace scopes.
 
 The browser can attach only an identifier returned by its current discovery
 result; it can neither see nor submit the opaque attachment handle. Credit is
@@ -367,6 +375,37 @@ config :erlang_adk_ui,
 invalid or mismatched reports fail closed. Populate the map at trusted boot
 configuration time. Do not add a browser-controlled loader.
 
+### Optional graph and trace operations adapter
+
+The graph and trace panels are disabled by default. Enable them only after the
+named graph catalog and trace store are supervised by trusted application code,
+and publish compiled graphs through `:adk_dev_graph_catalog.publish/4`. All
+handles, ownership values, the trace principal, selector and bounds below are
+server configuration; none are accepted from browser parameters:
+
+```elixir
+config :erlang_adk_ui,
+  graph_trace: %{
+    graph_catalog: :phoenix_graph_catalog,
+    graph_owner: "phoenix-operations",
+    trace_store: :adk_trace_store,
+    trace_principal: "phoenix-operations",
+    trace_selector: :all,
+    graph_list_limit: 100,
+    trace_limit: 256,
+    trace_max_bytes: 1_048_576
+  }
+```
+
+The local adapter accepts only that exact configuration shape. A trace selector
+may instead be a fixed map containing one or more of `:run_id`, `:trace_id`,
+`:workflow_id`, and `:invocation_id`. The browser can choose only a graph ID
+already returned by its current catalog view. Timeline and overlay cursors are
+held in LiveView state; replay gaps and cursor-ahead responses stop progression
+and require an explicit resume at the retained boundary supplied by the trace
+store. The rendered projection is redacted and drops prompts, responses, media,
+tool arguments/results and generic payload fields before it enters assigns.
+
 Gateway authorization itself uses independent caller-monitored workers with
 bounded admission, timeout, heap, input, and normalized results. The defaults
 are 64 concurrent checks, one second, and 100,000 heap words. A custom catalog
@@ -386,7 +425,8 @@ parameters.
 ## Current deployment scope
 
 The login, web session, reconnect cursor, gateways, `adk_run`, ADK Live,
-observability snapshot, and configured evaluation catalog are node-local. A
+observability snapshot, configured evaluation catalog, and optional graph/trace
+operations handles are node-local. A
 single-node release is supported. A multi-node deployment must
 use sticky routing for the complete login/session/run lifetime or replace these
 stores and run routing with an explicitly distributed design. A node restart
@@ -394,7 +434,7 @@ invalidates web sessions and in-flight login transactions, which fails closed.
 
 Logout revokes the local UI session; it does not perform identity-provider
 single logout or token revocation. The UI intentionally does not expose the
-developer inspector. Keep Erlang ADK's developer tooling on a separate,
+full developer inspector. Keep Erlang ADK's developer tooling on a separate,
 authenticated, loopback/private interface as documented in the repository
 root.
 

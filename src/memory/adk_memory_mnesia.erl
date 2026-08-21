@@ -53,7 +53,8 @@ stop(Pid) ->
         exit:noproc -> ok
     end.
 
-table_names() -> [?ENTRY_TABLE, ?USAGE_TABLE].
+table_names() -> [?ENTRY_TABLE, ?USAGE_TABLE,
+                  adk_memory_erasure_epoch:default_table()].
 
 capabilities(Pid) -> call(Pid, capabilities).
 add_entry(Pid, Scope, Input, Opts) ->
@@ -244,7 +245,7 @@ handle_call({delete_user, Scope, Deadline}, _From, State) ->
                   adk_memory_contract:validate_scope(Scope)} of
         {true, _} -> {error, timeout};
         {false, {ok, CanonScope}} ->
-            delete_matching_tx(CanonScope, fun(_) -> true end, Deadline);
+            erase_user_tx(CanonScope, Deadline);
         {false, {error, _} = Error} -> Error
     end,
     {reply, Reply, State};
@@ -304,12 +305,16 @@ create_tables() ->
                 {disc_copies, [node()]}, {type, set}]}],
     case create_tables(Tables) of
         ok ->
-            case mnesia:wait_for_tables(table_names(), 5000) of
-                ok -> ok;
-                {timeout, Missing} ->
-                    {error, {memory_table_wait_timeout, Missing}};
-                {error, Reason} ->
-                    {error, {memory_table_wait_failed, Reason}}
+            case adk_memory_erasure_epoch:ensure_table() of
+                ok ->
+                    case mnesia:wait_for_tables(table_names(), 5000) of
+                        ok -> ok;
+                        {timeout, Missing} ->
+                            {error, {memory_table_wait_timeout, Missing}};
+                        {error, Reason} ->
+                            {error, {memory_table_wait_failed, Reason}}
+                    end;
+                {error, _} = Error -> Error
             end;
         {error, _} = Error -> Error
     end.
@@ -334,6 +339,7 @@ store_entries_tx([], _Limits, _Deadline) -> {ok, 0, 0};
 store_entries_tx(Entries, Limits, Deadline) ->
     abort_if_expired(Deadline),
     Scope = maps:get(scope, hd(Entries)),
+    assert_consistent_epoch_tx(Scope, Entries),
     Usage = case mnesia:read(?USAGE_TABLE, Scope, write) of
         [Stored] -> Stored;
         [] -> #adk_memory_mnesia_usage{scope = Scope}
@@ -442,6 +448,43 @@ delete_matching_tx(Scope, Predicate, Deadline) ->
         {error, Reason} -> {error, Reason}
     end.
 
+%% User erasure advances the durable fence in the same transaction as entry
+%% deletion. A stale outbox write therefore either commits before this delete
+%% (and is removed) or observes the new epoch and aborts.
+erase_user_tx(Scope, Deadline) ->
+    case transaction(fun() ->
+        abort_if_expired(Deadline),
+        _Epoch = adk_memory_erasure_epoch:advance_tx(
+                   adk_memory_erasure_epoch:default_table(), Scope),
+        Pattern = #adk_memory_mnesia_entry{key = {Scope, '_'}, _ = '_'},
+        Matches = mnesia:match_object(?ENTRY_TABLE, Pattern, write),
+        case Matches of
+            [] -> {error, not_found};
+            _ ->
+                abort_if_expired(Deadline),
+                lists:foreach(
+                  fun(#adk_memory_mnesia_entry{key = Key}) ->
+                          mnesia:delete({?ENTRY_TABLE, Key})
+                  end, Matches),
+                subtract_usage_tx(Scope, Matches),
+                ok
+        end
+    end) of
+        {ok, Reply} -> Reply;
+        {error, Reason} -> {error, Reason}
+    end.
+
+assert_consistent_epoch_tx(Scope, Entries) ->
+    Epochs = lists:usort([maps:get(erasure_epoch, Entry, undefined)
+                          || Entry <- Entries]),
+    case Epochs of
+        [undefined] -> ok;
+        [Expected] ->
+            adk_memory_erasure_epoch:assert_tx(
+              adk_memory_erasure_epoch:default_table(), Scope, Expected);
+        _ -> mnesia:abort(inconsistent_memory_erasure_epochs)
+    end.
+
 subtract_usage_tx(Scope, Records) ->
     RemovedCount = length(Records),
     RemovedBytes = lists:sum(
@@ -468,6 +511,8 @@ transaction(Fun) ->
         {aborted, memory_capacity_exceeded} ->
             {error, memory_capacity_exceeded};
         {aborted, timeout} -> {error, timeout};
+        {aborted, {memory_erasure_epoch_stale, _, _} = Reason} ->
+            {error, Reason};
         {aborted, Reason} -> {error, {memory_transaction_failed, Reason}}
     end.
 
@@ -476,7 +521,8 @@ same_entry(Left, Right) ->
     maps:get(metadata, Left) =:= maps:get(metadata, Right) andalso
     maps:get(provenance, Left) =:= maps:get(provenance, Right).
 
-public_entry(Entry) -> maps:without([storage_bytes], Entry).
+public_entry(Entry) ->
+    maps:without([storage_bytes, idempotency_key, erasure_epoch], Entry).
 
 compare_hits(Left, Right) ->
     {-maps:get(score, Left), maps:get(timestamp, Left), maps:get(id, Left)} =<

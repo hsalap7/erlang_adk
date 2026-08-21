@@ -11,7 +11,7 @@
 
 -define(MAPPING_VERSION, <<"otlp-json-1.10-erlang-adk-0.8">>).
 -define(SCOPE_NAME, <<"erlang_adk">>).
--define(SCOPE_VERSION, <<"0.9.0">>).
+-define(SCOPE_VERSION, <<"0.10.0">>).
 -define(MAX_VALUE_DEPTH, 8).
 -define(MAX_COLLECTION_ITEMS, 64).
 -define(MAX_STRING_BYTES, 16384).

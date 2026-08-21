@@ -76,7 +76,7 @@ compile_known(Options) ->
 
 %% @doc JSON-safe policy metadata. Names are policy configuration, not
 %% runtime argument/content values.
--spec describe(policy()) -> map().
+-spec describe(term()) -> map().
 describe(#{version := ?VERSION} = Policy) ->
     #{<<"schema_version">> => ?VERSION,
       <<"id">> => maps:get(id, Policy),

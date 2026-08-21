@@ -8,9 +8,11 @@
 
 -define(LEASE_RENEW_MARGIN_MS, 25).
 
--export([start_link/1, child_spec/1, submit/2, status/2, kick/1]).
+-export([start_link/1, child_spec/1, submit/2, status/2, stats/1,
+         semantics/1, health/1, prune_terminal/2, kick/1,
+         validate_options/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+         terminate/2, code_change/3, format_status/1]).
 
 -record(state, {
     outbox,
@@ -48,6 +50,12 @@ submit(Processor, Request) ->
 status(Processor, JobId) ->
     safe_call(Processor, {status, JobId}).
 
+stats(Processor) -> safe_call(Processor, stats).
+semantics(Processor) -> safe_call(Processor, semantics).
+health(Processor) -> safe_call(Processor, health).
+prune_terminal(Processor, Limit) ->
+    safe_call(Processor, {prune_terminal, Limit}).
+
 kick(Processor) ->
     gen_server:cast(Processor, kick).
 
@@ -68,6 +76,15 @@ handle_call({submit, Request}, _From, State) ->
     {reply, Reply, State};
 handle_call({status, JobId}, _From, State) ->
     {reply, adk_memory_outbox:status(State#state.outbox, JobId), State};
+handle_call(stats, _From, State) ->
+    {reply, adk_memory_outbox:stats(State#state.outbox), State};
+handle_call(semantics, _From, State) ->
+    {reply, adk_memory_outbox:semantics(State#state.outbox), State};
+handle_call(health, _From, State) ->
+    {reply, adk_memory_outbox:health(State#state.outbox), State};
+handle_call({prune_terminal, Limit}, _From, State) ->
+    {reply, adk_memory_outbox:prune_terminal(
+              State#state.outbox, now_ms(), Limit), State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unsupported_memory_outbox_processor_operation}, State}.
 
@@ -114,6 +131,66 @@ terminate(_Reason, State) ->
 
 code_change(_OldVersion, State, _Extra) -> {ok, State}.
 
+%% Resolver state can contain credentials or provider-owned handles, while
+%% worker metadata contains live lease-owner tokens. Neither may enter system
+%% status output or crash reports.
+format_status(Status) when is_map(Status) ->
+    maps:map(
+      fun(state,
+          #state{poll_interval_ms = Poll,
+                 lease_ms = Lease,
+                 call_timeout_ms = Timeout,
+                 max_concurrency = Max,
+                 workers = Workers}) ->
+              #{status => running,
+                poll_interval_ms => Poll,
+                lease_ms => Lease,
+                call_timeout_ms => Timeout,
+                max_concurrency => Max,
+                active_workers => map_size(Workers)};
+         (message, _Message) -> adk_secret_redactor:marker();
+         (log, _Log) -> [];
+         (reason, _Reason) -> adk_secret_redactor:marker();
+         (_Key, _Value) -> adk_secret_redactor:marker()
+      end, Status);
+format_status(_Status) -> adk_secret_redactor:marker().
+
+%% Validate the configurable processor tuning independently of runtime-owned
+%% store and resolver references, which the supervisor injects after compile.
+validate_options(Opts) when is_map(Opts) ->
+    Allowed = [name, poll_interval_ms, lease_ms,
+               call_timeout_ms, max_concurrency],
+    Unknown = lists:sort(maps:keys(maps:without(Allowed, Opts))),
+    Name = maps:get(name, Opts, undefined),
+    Poll = maps:get(poll_interval_ms, Opts, 100),
+    Lease = maps:get(lease_ms, Opts, 15000),
+    Timeout = maps:get(call_timeout_ms, Opts, 5000),
+    Concurrency = maps:get(max_concurrency, Opts, 4),
+    case {Unknown, Name =:= undefined orelse is_atom(Name),
+          integer_in(Poll, 5, 60000),
+          integer_in(Lease, 250, 3600000),
+          integer_in(Timeout, 10, 600000),
+          integer_in(Concurrency, 1, 128)} of
+        {[_ | _], _, _, _, _, _} ->
+            {error, {invalid_memory_outbox_processor_options,
+                     {unknown_keys, Unknown}}};
+        {[], false, _, _, _, _} ->
+            {error, invalid_memory_outbox_processor_name};
+        {[], true, false, _, _, _} ->
+            {error, invalid_memory_outbox_poll_interval};
+        {[], true, true, false, _, _} ->
+            {error, invalid_memory_outbox_lease};
+        {[], true, true, true, false, _} ->
+            {error, invalid_memory_outbox_call_timeout};
+        {[], true, true, true, true, false} ->
+            {error, invalid_memory_outbox_concurrency};
+        {[], true, true, true, true, true}
+          when Lease >= (2 * Timeout) + 250 -> ok;
+        _ -> {error, memory_outbox_lease_too_short_for_call_timeout}
+    end;
+validate_options(_) ->
+    {error, invalid_memory_outbox_processor_options}.
+
 compile_options(Opts) ->
     Allowed = [name, outbox, resolver, poll_interval_ms, lease_ms,
                call_timeout_ms, max_concurrency],
@@ -153,8 +230,11 @@ compile_options(Opts) ->
         _ -> {error, memory_outbox_lease_too_short_for_call_timeout}
     end.
 
-valid_outbox(#{jobs_table := Jobs, usage_table := Usage, limits := Limits}) ->
-    is_atom(Jobs) andalso is_atom(Usage) andalso is_map(Limits);
+valid_outbox(#{jobs_table := Jobs, usage_table := Usage,
+               schedule_table := Schedule,
+               epochs_table := Epochs, limits := Limits}) ->
+    is_atom(Jobs) andalso is_atom(Usage) andalso is_atom(Schedule)
+        andalso is_atom(Epochs) andalso is_map(Limits);
 valid_outbox(_) -> false.
 
 validate_resolver({Module, ResolverState}) when is_atom(Module) ->
@@ -176,12 +256,25 @@ validate_resolver(_) ->
 integer_in(Value, Min, Max) ->
     is_integer(Value) andalso Value >= Min andalso Value =< Max.
 
-fill_workers(#state{workers = Workers, max_concurrency = Max} = State)
-  when map_size(Workers) >= Max -> State;
 fill_workers(State) ->
+    case resolver_ready(State) of
+        ready ->
+            case resolver_claimable_identities(State) of
+                {ok, Claimable} -> fill_ready_workers(State, Claimable);
+                {error, _Reason} -> State
+            end;
+        not_ready -> State;
+        {error, _Reason} -> State
+    end.
+
+fill_ready_workers(
+  #state{workers = Workers, max_concurrency = Max} = State, _Claimable)
+  when map_size(Workers) >= Max -> State;
+fill_ready_workers(State, Claimable) ->
     Token = crypto:strong_rand_bytes(24),
     case adk_memory_outbox:claim_due(
-           State#state.outbox, Token, now_ms(), State#state.lease_ms) of
+           State#state.outbox, Token, now_ms(), State#state.lease_ms,
+           Claimable) of
         {ok, Work} ->
             Parent = self(),
             Resolver = {State#state.resolver_module,
@@ -199,12 +292,96 @@ fill_workers(State) ->
             Meta = #{monitor => Monitor,
                      job_id => maps:get(job_id, Work), token => Token},
             Workers = State#state.workers,
-            fill_workers(State#state{workers = Workers#{Pid => Meta}});
+            fill_ready_workers(
+              State#state{workers = Workers#{Pid => Meta}}, Claimable);
         none -> State;
         {error, Reason} ->
             logger:warning("Memory outbox claim failed: ~p",
                            [adk_memory_outbox_payload:safe_reason(Reason)]),
             State
+    end.
+
+resolver_claimable_identities(
+  #state{resolver_module = Module,
+         resolver_state = ResolverState,
+         call_timeout_ms = Timeout}) ->
+    case erlang:function_exported(Module, claimable_identities, 1) of
+        false -> {ok, all};
+        true ->
+            Work = fun() ->
+                try Module:claimable_identities(ResolverState) of
+                    Value -> Value
+                catch
+                    Class:Reason ->
+                        {error,
+                         {memory_outbox_claimable_identities_exception,
+                          Class, Reason}}
+                end
+            end,
+            case bounded_worker_call(
+                   Work, erlang:min(Timeout, 1000),
+                   claimable_identities) of
+                {ok, {ok, Claimable}} ->
+                    validate_claimable_identities(Claimable);
+                {ok, {error, _} = Error} -> Error;
+                {ok, Other} ->
+                    {error,
+                     {invalid_memory_outbox_claimable_identities_reply,
+                      Other}};
+                {error, timeout} ->
+                    {error, memory_outbox_claimable_identities_timeout};
+                {error, Reason} ->
+                    {error,
+                     {memory_outbox_claimable_identities_process_down,
+                      Reason}}
+            end
+    end.
+
+validate_claimable_identities(all) -> {ok, all};
+validate_claimable_identities(Claimable)
+  when is_map(Claimable), map_size(Claimable) =< 10000 ->
+    case maps:fold(
+           fun({Module, StableId}, true, Acc)
+                 when is_atom(Module), is_binary(StableId),
+                      byte_size(StableId) > 0,
+                      byte_size(StableId) =< 256 -> Acc;
+              (_Identity, _Value, _Acc) -> false
+           end, true, Claimable) of
+        true -> {ok, Claimable};
+        false -> {error, invalid_memory_outbox_claimable_identities}
+    end;
+validate_claimable_identities(_Claimable) ->
+    {error, invalid_memory_outbox_claimable_identities}.
+
+resolver_ready(#state{resolver_module = Module,
+                      resolver_state = ResolverState,
+                      call_timeout_ms = Timeout}) ->
+    case erlang:function_exported(Module, ready, 1) of
+        false -> ready;
+        true ->
+            Work = fun() ->
+                try Module:ready(ResolverState) of
+                    Value -> Value
+                catch
+                    Class:Reason ->
+                        {error, {memory_outbox_resolver_ready_exception,
+                                 Class, Reason}}
+                end
+            end,
+            case bounded_worker_call(
+                   Work, erlang:min(Timeout, 1000), resolver_ready) of
+                {ok, ready} -> ready;
+                {ok, not_ready} -> not_ready;
+                {ok, {error, _} = Error} -> Error;
+                {ok, Other} ->
+                    {error, {invalid_memory_outbox_resolver_ready_reply,
+                             Other}};
+                {error, timeout} ->
+                    {error, memory_outbox_resolver_ready_timeout};
+                {error, Reason} ->
+                    {error, {memory_outbox_resolver_ready_process_down,
+                             Reason}}
+            end
     end.
 
 execute_work(Work, {ResolverModule, ResolverState}, Timeout,
@@ -339,27 +516,31 @@ require_idempotent_v2(ServiceRef, Timeout) ->
 check_capabilities(ServiceRef, Capabilities) ->
     Version = maps:get(contract_version, Capabilities,
                        maps:get(version, Capabilities, 0)),
-    case Version >= 2 andalso
+    case is_integer(Version) andalso Version >= 2 andalso
          maps:get(idempotent_ingestion, Capabilities, false) =:= true andalso
-         maps:get(incremental_events, Capabilities, false) =:= true of
+         maps:get(incremental_events, Capabilities, false) =:= true andalso
+         maps:get(erasure_epoch_fencing, Capabilities, false) =:= true of
         true -> {ok, ServiceRef};
-        false -> {error, memory_outbox_requires_idempotent_v2_adapter}
+        false ->
+            {error, memory_outbox_requires_fenced_idempotent_v2_adapter}
     end.
 
 call_adapter({Module, _} = ServiceRef, Work, Timeout) ->
     Scope = maps:get(scope, Work),
     SessionId = maps:get(session_id, Work),
     Events = maps:get(events, Work),
+    Options = #{erasure_epoch => maps:get(erasure_epoch, Work)},
     Reply = case erlang:function_exported(Module, add_events, 6) of
         true ->
             adk_service_ref:call(
               ServiceRef, add_events,
-              [Scope, SessionId, Events, #{}, #{timeout_ms => Timeout}],
+              [Scope, SessionId, Events, Options,
+               #{timeout_ms => Timeout}],
               Timeout);
         false ->
             adk_service_ref:call(
               ServiceRef, add_events,
-              [Scope, SessionId, Events, #{}], Timeout)
+              [Scope, SessionId, Events, Options], Timeout)
     end,
     case Reply of
         {ok, Result} when is_map(Result) -> {ok, Result};
@@ -392,7 +573,7 @@ safe_call(Processor, Request) ->
     catch
         exit:{noproc, _} -> {error, memory_outbox_processor_unavailable};
         exit:{timeout, _} -> {error, memory_outbox_processor_timeout};
-        exit:Reason -> {error, {memory_outbox_processor_down, Reason}}
+        exit:_Reason -> {error, memory_outbox_processor_unavailable}
     end.
 
 now_ms() -> erlang:system_time(millisecond).

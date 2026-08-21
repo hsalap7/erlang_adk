@@ -13,7 +13,7 @@
          enqueue/1, enqueue/2, stats/0, stats/1,
          drain/1, drain/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+         terminate/2, code_change/3, format_status/1]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_QUEUE_EVENTS, 4096).
@@ -243,6 +243,20 @@ terminate(_Reason, State) ->
     ok.
 
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
+
+%% Exporter configurations may contain authenticated principals or opaque
+%% operator handles. Never include them, queued envelopes, or an in-flight
+%% message in supervisor diagnostics and crash reports.
+format_status(Status) when is_map(Status) ->
+    maps:map(
+      fun(state, State) when is_record(State, state) ->
+              public_stats(State);
+         (message, _Message) -> adk_secret_redactor:marker();
+         (log, _Log) -> [];
+         (reason, _Reason) -> adk_secret_redactor:marker();
+         (_Key, Value) -> Value
+      end, Status);
+format_status(Status) -> Status.
 
 compile_options(Opts) ->
     Defaults = #{exporters => [],

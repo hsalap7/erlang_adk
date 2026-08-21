@@ -37,10 +37,18 @@ adk_dev_http_test_() ->
            ?_test(sse_duration_limit_closes_without_cancelling_case(State))},
           {"paused run resumes with a linked run ID",
            ?_test(resume_run_case(State))},
+          {"run and evaluation mutations reject malformed input",
+           ?_test(malformed_mutation_case(State))},
+          {"optional developer services fail closed when unconfigured",
+           ?_test(optional_services_fail_closed_case(State))},
+          {"resource diagnostics validate scope and destructive intent",
+           ?_test(resource_diagnostic_boundary_case(State))},
           {"session inspection is scope-isolated",
            ?_test(session_isolation_case(State))},
           {"session lifecycle is scoped, idempotent, and bounded",
-           ?_test(session_lifecycle_case(State))}]
+           ?_test(session_lifecycle_case(State))},
+          {"session mutations reject unsupported and malformed requests",
+           ?_test(session_mutation_boundary_case(State))}]
      end}.
 
 setup() ->
@@ -180,6 +188,8 @@ sse_config_validation_case() ->
     ?assertEqual(128, maps:get(sse_max_events, Validated)),
     ?assertEqual(1048576, maps:get(sse_max_bytes, Validated)),
     ?assertEqual(300000, maps:get(sse_max_duration_ms, Validated)),
+    ?assertEqual(16777216,
+                 maps:get(evaluation_report_max_bytes, Validated)),
     lists:foreach(
       fun(Key) ->
           ?assertEqual(
@@ -189,10 +199,18 @@ sse_config_validation_case() ->
       [sse_max_events, sse_max_bytes, sse_max_duration_ms]),
     ?assertEqual(
        {error, invalid_dev_platform_config},
+       adk_dev_router:validate_config(
+         Base#{evaluation_report_max_bytes => 0})),
+    ?assertEqual(
+       {error, invalid_dev_platform_config},
        adk_dev_router:validate_config(Base#{sse_max_events => 10001})),
     ?assertEqual(
        {error, invalid_dev_platform_config},
        adk_dev_router:validate_config(Base#{sse_max_bytes => 16777217})),
+    ?assertEqual(
+       {error, invalid_dev_platform_config},
+       adk_dev_router:validate_config(
+         Base#{evaluation_report_max_bytes => 16777217})),
     ?assertEqual(
        {error, invalid_dev_platform_config},
        adk_dev_router:validate_config(
@@ -503,6 +521,220 @@ resume_run_case(State) ->
               <<"app">>, <<"user">>, Session)
     end.
 
+malformed_mutation_case(State) ->
+    Auth = auth_header(?TOKEN),
+    Json = [{<<"content-type">>, <<"application/json">>} | Auth],
+    MissingRun = <<"/dev/v1/runs/missing-run">>,
+    expect_api_error(State, get, <<"/dev/v1/runs">>, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, post, <<"/dev/v1/runs">>, Auth, <<"{}">>,
+                     415, <<"unsupported_media_type">>),
+    expect_api_error(State, post, <<"/dev/v1/runs">>, Json, <<"{">>,
+                     400, <<"invalid_json">>),
+    expect_api_error(State, post, <<"/dev/v1/runs">>, Json, <<"[]">>,
+                     400, <<"invalid_json">>),
+    expect_api_error(State, post, <<"/dev/v1/runs">>, Json, <<"{}">>,
+                     400, <<"invalid_request">>),
+    InvalidFields = jsx:encode(
+                      #{<<"agent_name">> => <<>>,
+                        <<"app_name">> => <<"app">>,
+                        <<"user_id">> => <<"user">>,
+                        <<"session_id">> => <<"session">>,
+                        <<"message">> => <<"message">>}),
+    expect_api_error(State, post, <<"/dev/v1/runs">>, Json, InvalidFields,
+                     400, <<"invalid_request">>),
+    UnknownAgent = jsx:encode(
+                     #{<<"agent_name">> => <<"missing-agent">>,
+                       <<"app_name">> => <<"app">>,
+                       <<"user_id">> => <<"user">>,
+                       <<"session_id">> => <<"session">>,
+                       <<"message">> => <<"message">>}),
+    expect_api_error(State, post, <<"/dev/v1/runs">>, Json, UnknownAgent,
+                     404, <<"agent_not_found">>),
+    expect_api_error(State, post, MissingRun, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, get, MissingRun, Auth, <<>>,
+                     404, <<"run_not_found">>),
+    expect_api_error(State, delete, MissingRun, Auth, <<>>,
+                     404, <<"run_not_found">>),
+    ResumePath = <<MissingRun/binary, "/resume">>,
+    expect_api_error(State, get, ResumePath, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, post, ResumePath, Auth, <<"{}">>,
+                     415, <<"unsupported_media_type">>),
+    expect_api_error(State, post, ResumePath, Json, <<"{">>,
+                     400, <<"invalid_resume_request">>),
+    expect_api_error(State, post, ResumePath, Json, <<"{}">>,
+                     400, <<"invalid_resume_request">>),
+    expect_api_error(State, post, ResumePath, Json,
+                     jsx:encode(#{<<"tool_response">> => #{}}),
+                     404, <<"run_not_found">>),
+    EventsPath = <<MissingRun/binary, "/events">>,
+    expect_api_error(State, post, EventsPath, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, get, EventsPath,
+                     [{<<"last-event-id">>, <<"-1">>} | Auth], <<>>,
+                     400, <<"invalid_last_event_id">>),
+    expect_api_error(State, get, EventsPath, Auth, <<>>,
+                     404, <<"run_not_found">>),
+
+    expect_api_error(State, get, <<"/dev/v1/evaluation/render">>, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, post, <<"/dev/v1/evaluation/render">>, Json,
+                     <<"{}">>, 400, <<"invalid_evaluation_request">>),
+    expect_api_error(State, post, <<"/dev/v1/evaluation/compare">>, Json,
+                     <<"{}">>, 400, <<"invalid_evaluation_request">>),
+    expect_api_error(State, put,
+                     <<"/dev/v1/evaluation/baselines/release">>, Json,
+                     <<"{}">>, 400,
+                     <<"invalid_evaluation_authoring_request">>).
+
+optional_services_fail_closed_case(State) ->
+    Auth = auth_header(?TOKEN),
+    Json = [{<<"content-type">>, <<"application/json">>} | Auth],
+    lists:foreach(
+      fun(Path) ->
+          expect_api_error(State, get, Path, Auth, <<>>,
+                           503, <<"developer_graph_trace_unavailable">>)
+      end,
+      [<<"/dev/v1/graphs">>,
+       <<"/dev/v1/graphs/graph-a">>,
+       <<"/dev/v1/graphs/graph-a/overlay">>,
+       <<"/dev/v1/traces">>]),
+    lists:foreach(
+      fun(Method) ->
+          expect_api_error(State, Method, <<"/dev/v1/provider-payloads">>,
+                           Auth, <<>>, 503,
+                           <<"provider_payload_inspection_disabled">>)
+      end,
+      [get, delete]),
+    lists:foreach(
+      fun({Method, Path, Headers, Body}) ->
+          expect_api_error(State, Method, Path, Headers, Body, 503,
+                           <<"developer_evaluation_unavailable">>)
+      end,
+      [{get, <<"/dev/v1/evaluation/jobs">>, Auth, <<>>},
+       {post, <<"/dev/v1/evaluation/jobs">>, Json, <<"{}">>},
+       {get, <<"/dev/v1/evaluation/jobs/job-a">>, Auth, <<>>},
+       {delete, <<"/dev/v1/evaluation/jobs/job-a">>, Auth, <<>>},
+       {get, <<"/dev/v1/evaluation/jobs/job-a/result">>, Auth, <<>>},
+       {get, <<"/dev/v1/evaluation/sets">>, Auth, <<>>},
+       {get, <<"/dev/v1/evaluation/sets/set-a/v1">>, Auth, <<>>},
+       {get, <<"/dev/v1/evaluation/baselines/release">>, Auth, <<>>}]),
+    expect_api_error(State, get, <<"/dev/v1/evaluation/jobs?limit=0">>,
+                     Auth, <<>>, 400, <<"invalid_evaluation_query">>),
+    expect_api_error(State, get, <<"/dev/v1/live/sessions">>, Auth, <<>>,
+                     503, <<"live_developer_access_unconfigured">>),
+    expect_api_error(State, post, <<"/dev/v1/live/sessions/live-a/text">>,
+                     Json, jsx:encode(#{<<"text">> => <<"hello">>}),
+                     503, <<"live_developer_access_unconfigured">>),
+    expect_api_error(State, get, <<"/dev/v1/live/sessions/live-a/events">>,
+                     Auth, <<>>, 503,
+                     <<"live_developer_access_unconfigured">>),
+    expect_api_error(State, get, <<"/dev/v1/live/sessions/live-a/events">>,
+                     [{<<"last-event-id">>, <<"1">>} | Auth], <<>>, 409,
+                     <<"live_event_replay_unsupported">>).
+
+resource_diagnostic_boundary_case(State) ->
+    Auth = auth_header(?TOKEN),
+    Json = [{<<"content-type">>, <<"application/json">>} | Auth],
+    ArtifactPath = <<"/dev/v1/artifacts/app/user/session">>,
+    VersionsPath = <<ArtifactPath/binary, "/versions?name=report.txt">>,
+    DeletePath = <<ArtifactPath/binary, "/delete">>,
+    MemoryPath = <<"/dev/v1/memory/app/user">>,
+    expect_api_error(State, post, <<"/dev/v1/diagnostics">>, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    {200, _, DiagnosticsBody} = request(
+                                  State, get, <<"/dev/v1/diagnostics">>,
+                                  Auth, <<>>),
+    Diagnostics = jsx:decode(DiagnosticsBody, [return_maps]),
+    Resources = maps:get(<<"resources">>, Diagnostics),
+    ?assertEqual(<<"unavailable">>, maps:get(<<"artifact">>, Resources)),
+    ?assertEqual(<<"unavailable">>, maps:get(<<"memory">>, Resources)),
+    expect_api_error(State, get, ArtifactPath, Auth, <<>>,
+                     503, <<"diagnostic_service_unavailable">>),
+    expect_api_error(State, get, <<ArtifactPath/binary, "?limit=0">>,
+                     Auth, <<>>, 400, <<"invalid_artifact_query">>),
+    expect_api_error(State, get, VersionsPath, Auth, <<>>,
+                     503, <<"diagnostic_service_unavailable">>),
+    expect_api_error(State, post, DeletePath, Json, <<"{}">>,
+                     400, <<"invalid_artifact_delete">>),
+    Selector = <<"latest">>,
+    DeletePayload =
+        #{<<"name">> => <<"report.txt">>,
+          <<"selector">> => Selector,
+          <<"confirm">> =>
+              #{<<"app_name">> => <<"app">>,
+                <<"user_id">> => <<"user">>,
+                <<"session_id">> => <<"session">>,
+                <<"name">> => <<"report.txt">>,
+                <<"selector">> => Selector}},
+    expect_api_error(State, post, DeletePath, Json,
+                     jsx:encode(DeletePayload), 503,
+                     <<"diagnostic_service_unavailable">>),
+    expect_api_error(State, get, MemoryPath, Auth, <<>>,
+                     503, <<"diagnostic_service_unavailable">>),
+    expect_api_error(State, post, <<MemoryPath/binary, "/search">>, Json,
+                     <<"{}">>, 400, <<"invalid_memory_search">>),
+    expect_api_error(State, post, <<MemoryPath/binary, "/search">>, Json,
+                     jsx:encode(#{<<"query">> => <<"release notes">>}),
+                     503, <<"diagnostic_service_unavailable">>),
+    expect_api_error(State, post, <<MemoryPath/binary, "/erase">>, Json,
+                     <<"{}">>, 400, <<"invalid_memory_erase">>),
+    ErasePayload =
+        #{<<"target">> => <<"user">>,
+          <<"confirm">> =>
+              #{<<"app_name">> => <<"app">>,
+                <<"user_id">> => <<"user">>,
+                <<"target">> => <<"user">>,
+                <<"identifier">> => <<"user">>}},
+    expect_api_error(State, post, <<MemoryPath/binary, "/erase">>, Json,
+                     jsx:encode(ErasePayload), 503,
+                     <<"diagnostic_service_unavailable">>),
+
+    ContextPath = <<"/dev/v1/context/app/user/missing-session">>,
+    expect_api_error(State, get, ContextPath, Auth, <<>>,
+                     404, <<"session_not_found">>),
+    expect_api_error(State, get, <<ContextPath/binary, "/lifecycle">>,
+                     Auth, <<>>, 404, <<"session_not_found">>),
+    InvalidatePath = <<ContextPath/binary, "/cache/invalidate">>,
+    expect_api_error(State, post, InvalidatePath, Json, <<"{}">>,
+                     400, <<"invalid_context_cache_invalidation">>),
+    expect_api_error(
+      State, post, InvalidatePath, Json,
+      jsx:encode(#{<<"model">> => <<"model-a">>, <<"confirm">> => #{}}),
+      503, <<"context_cache_unavailable">>).
+
+session_mutation_boundary_case(State) ->
+    Auth = auth_header(?TOKEN),
+    Json = [{<<"content-type">>, <<"application/json">>} | Auth],
+    Collection = <<"/dev/v1/sessions/app/user">>,
+    Session = <<Collection/binary, "/missing-session">>,
+    StatePath = <<Session/binary, "/state">>,
+    expect_api_error(State, put, Collection, Json, <<"{}">>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, post, Collection, Auth, <<"{}">>,
+                     415, <<"unsupported_media_type">>),
+    expect_api_error(State, post, Collection, Json, <<"{">>,
+                     400, <<"invalid_json">>),
+    expect_api_error(State, post, Collection, Json, <<"{}">>,
+                     400, <<"invalid_session_request">>),
+    expect_api_error(State, post, Collection, Json,
+                     jsx:encode(#{<<"session_id">> => <<>>}),
+                     400, <<"invalid_session_id">>),
+    expect_api_error(State, post, Session, Json, <<"{}">>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, get, StatePath, Auth, <<>>,
+                     405, <<"method_not_allowed">>),
+    expect_api_error(State, post, StatePath, Auth, <<"{}">>,
+                     415, <<"unsupported_media_type">>),
+    expect_api_error(State, post, StatePath, Json, <<"{}">>,
+                     400, <<"invalid_state_request">>),
+    expect_api_error(State, post, StatePath, Json,
+                     jsx:encode(#{<<"state_delta">> =>
+                                      #{<<"draft">> => <<"ready">>}}),
+                     404, <<"session_not_found">>).
+
 session_isolation_case(State) ->
     App = unique(<<"scope-app">>),
     Session = <<"shared-session-id">>,
@@ -699,6 +931,7 @@ request(#{port := Port}, Method, Path, Headers, Body) ->
     Ref = case Method of
         get -> gun:get(Conn, Path, Headers);
         post -> gun:post(Conn, Path, Headers, Body);
+        put -> gun:put(Conn, Path, Headers, Body);
         delete -> gun:delete(Conn, Path, Headers)
     end,
     try
@@ -712,6 +945,13 @@ request(#{port := Port}, Method, Path, Headers, Body) ->
     after
         gun:close(Conn)
     end.
+
+expect_api_error(State, Method, Path, Headers, Body,
+                 ExpectedStatus, ExpectedCode) ->
+    {Status, _ResponseHeaders, ResponseBody} =
+        request(State, Method, Path, Headers, Body),
+    ?assertEqual({ExpectedStatus, ExpectedCode},
+                 {Status, error_code(ResponseBody)}).
 
 await_http_state(_State, _RunId, _Expected, 0) ->
     {error, timeout};

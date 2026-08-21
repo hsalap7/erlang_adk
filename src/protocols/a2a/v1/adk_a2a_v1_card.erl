@@ -20,8 +20,10 @@ new(Config) when is_map(Config) ->
       <<"version">> => maps:get(version, Config, application_version()),
       <<"capabilities">> => #{
         <<"streaming">> => maps:get(streaming, Config, true),
-        <<"pushNotifications">> => false,
-        <<"extendedAgentCard">> => false,
+        <<"pushNotifications">> => maps:get(push_notifications, Config,
+                                               false),
+        <<"extendedAgentCard">> => maps:get(extended_agent_card, Config,
+                                               false),
         <<"extensions">> => maps:get(extensions, Config, [])
       },
       <<"defaultInputModes">> => maps:get(

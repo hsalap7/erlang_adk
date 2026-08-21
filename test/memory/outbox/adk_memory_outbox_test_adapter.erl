@@ -3,16 +3,20 @@
 -behaviour(adk_memory_service).
 
 -export([start_link/1, stop/1, release/1, stats/1,
-         capabilities/1, add_entry/4, add_events/5, add_events/6,
-         add_session_to_memory/5, search/4, delete_entry/3,
-         delete_session/3, delete_user/2]).
+         capabilities/1, add_entry/4, add_entry/5,
+         add_events/5, add_events/6,
+         add_session_to_memory/5, search/4, search/5,
+         delete_entry/3, delete_entry/4,
+         delete_session/3, delete_session/4,
+         delete_user/2, delete_user/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -record(state, {test_pid,
                 seen = #{},
                 calls = 0,
-                block_first = false}).
+                block_first = false,
+                contract_version = 2}).
 
 start_link(Opts) -> gen_server:start_link(?MODULE, Opts, []).
 stop(Pid) -> gen_server:stop(Pid).
@@ -21,6 +25,8 @@ stats(Pid) -> gen_server:call(Pid, stats, 5000).
 
 capabilities(Pid) -> gen_server:call(Pid, capabilities, 5000).
 add_entry(_Pid, _Scope, _Input, _Opts) -> {error, unsupported_test_operation}.
+add_entry(Pid, Scope, Input, Opts, _CallOptions) ->
+    add_entry(Pid, Scope, Input, Opts).
 add_events(Pid, Scope, SessionId, Events, Opts) ->
     add_events(Pid, Scope, SessionId, Events, Opts, #{}).
 add_events(Pid, Scope, SessionId, Events, Opts, _CallOptions) ->
@@ -28,22 +34,47 @@ add_events(Pid, Scope, SessionId, Events, Opts, _CallOptions) ->
 add_session_to_memory(Pid, Scope, SessionId, Events, Opts) ->
     add_events(Pid, Scope, SessionId, Events, Opts).
 search(_Pid, _Scope, _Query, _Opts) -> {ok, []}.
+search(Pid, Scope, Query, Opts, _CallOptions) ->
+    search(Pid, Scope, Query, Opts).
 delete_entry(_Pid, _Scope, _Id) -> ok.
+delete_entry(Pid, Scope, Id, _CallOptions) ->
+    delete_entry(Pid, Scope, Id).
 delete_session(_Pid, _Scope, _SessionId) -> ok.
+delete_session(Pid, Scope, SessionId, _CallOptions) ->
+    delete_session(Pid, Scope, SessionId).
 delete_user(_Pid, _Scope) -> ok.
+delete_user(Pid, Scope, _CallOptions) -> delete_user(Pid, Scope).
 
 init(Opts) ->
     {ok, #state{test_pid = maps:get(test_pid, Opts, undefined),
-                block_first = maps:get(block_first, Opts, false)}}.
+                block_first = maps:get(block_first, Opts, false),
+                contract_version = maps:get(contract_version, Opts, 2)}}.
 
-handle_call(capabilities, _From, State) ->
-    {reply, #{contract_version => 2,
+handle_call(capabilities, _From,
+            #state{contract_version = Version} = State) ->
+    {reply, #{contract_version => Version,
               idempotent_ingestion => true,
-              incremental_events => true}, State};
+              incremental_events => true,
+              erasure_epoch_fencing => true}, State};
 handle_call(stats, _From, State) ->
     {reply, #{calls => State#state.calls,
               unique_events => map_size(State#state.seen)}, State};
+handle_call({add_events, Scope, SessionId, Events,
+             #{erasure_epoch := Expected}}, _From, State0) ->
+    case adk_memory_erasure_epoch:current(Scope) of
+        {ok, Expected} ->
+            handle_fenced_events(Scope, SessionId, Events, State0);
+        {ok, Actual} ->
+            {reply, {error, {memory_erasure_epoch_stale,
+                             Expected, Actual}}, State0};
+        {error, _} = Error -> {reply, Error, State0}
+    end;
 handle_call({add_events, Scope, SessionId, Events, #{}}, _From, State0) ->
+    handle_fenced_events(Scope, SessionId, Events, State0);
+handle_call(_Request, _From, State) ->
+    {reply, {error, unsupported_test_operation}, State}.
+
+handle_fenced_events(Scope, SessionId, Events, State0) ->
     EventIds = [maps:get(<<"id">>, Event) || Event <- Events],
     {Seen, Added, Duplicates} = classify(EventIds, State0#state.seen, 0, 0),
     Call = State0#state.calls + 1,
@@ -53,9 +84,7 @@ handle_call({add_events, Scope, SessionId, Events, #{}}, _From, State0) ->
     maybe_block(State0#state.block_first, Call),
     State = State0#state{seen = Seen, calls = Call},
     {reply, {ok, #{added => Added, duplicates => Duplicates, skipped => 0}},
-     State};
-handle_call(_Request, _From, State) ->
-    {reply, {error, unsupported_test_operation}, State}.
+     State}.
 
 handle_cast(_Message, State) -> {noreply, State}.
 handle_info(_Message, State) -> {noreply, State}.

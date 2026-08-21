@@ -1,0 +1,9 @@
+{application, erlang_adk_postgres, [
+    {description, "Postgres prepared-statement connector tools for Erlang ADK."},
+    {vsn, "0.10.0"},
+    {applications, [kernel, stdlib, erlang_adk]},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/hsalap7/erlang_adk"}]},
+    {files, ["src", "test", "README.md", "LICENSE.md", "rebar.config"]}
+]}.

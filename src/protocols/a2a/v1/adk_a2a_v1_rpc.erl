@@ -4,23 +4,26 @@
 -export([dispatch/5, method_type/1, rpc_error/2, task_state/1]).
 
 -spec method_type(binary()) ->
-    unary | stream | unsupported_push | unsupported | unknown.
+    unary | stream | unknown.
 method_type(<<"SendMessage">>) -> unary;
 method_type(<<"SendStreamingMessage">>) -> stream;
 method_type(<<"GetTask">>) -> unary;
 method_type(<<"ListTasks">>) -> unary;
 method_type(<<"CancelTask">>) -> unary;
 method_type(<<"SubscribeToTask">>) -> stream;
-method_type(<<"CreateTaskPushNotificationConfig">>) -> unsupported_push;
-method_type(<<"GetTaskPushNotificationConfig">>) -> unsupported_push;
-method_type(<<"ListTaskPushNotificationConfigs">>) -> unsupported_push;
-method_type(<<"DeleteTaskPushNotificationConfig">>) -> unsupported_push;
-method_type(<<"GetExtendedAgentCard">>) -> unsupported;
+method_type(<<"CreateTaskPushNotificationConfig">>) -> unary;
+method_type(<<"GetTaskPushNotificationConfig">>) -> unary;
+method_type(<<"ListTaskPushNotificationConfigs">>) -> unary;
+method_type(<<"DeleteTaskPushNotificationConfig">>) -> unary;
+method_type(<<"GetExtendedAgentCard">>) -> unary;
 method_type(_) -> unknown.
 
 -spec dispatch(gen_server:server_ref(), map(), term(), binary(), map()) ->
     {ok, map()} | {error, map()}.
 dispatch(Server, Auth, Id, <<"SendMessage">>, Params) ->
+    HistoryLength = maps:get(
+                      <<"historyLength">>,
+                      maps:get(<<"configuration">>, Params, #{}), undefined),
     ReturnImmediately = maps:get(
                           <<"returnImmediately">>,
                           maps:get(<<"configuration">>, Params, #{}), false),
@@ -29,7 +32,8 @@ dispatch(Server, Auth, Id, <<"SendMessage">>, Params) ->
         {ok, #{task := Task}} when ReturnImmediately ->
             {ok, adk_a2a_v1_codec:result(Id, #{<<"task">> => Task})};
         {ok, #{task_id := TaskId, task := Task}} ->
-            wait_send(Server, maps:get(scope, Auth), TaskId, Task, Id);
+            wait_send(Server, maps:get(scope, Auth), TaskId, Task, Id,
+                      HistoryLength);
         {error, {execution_start_failed, _Reason,
                  #{task := FailedTask}}} ->
             {ok, adk_a2a_v1_codec:result(
@@ -51,19 +55,46 @@ dispatch(Server, Auth, Id, <<"CancelTask">>, Params) ->
         {ok, Task} -> {ok, adk_a2a_v1_codec:result(Id, Task)};
         {error, Reason} -> {error, rpc_error(Id, Reason)}
     end;
+dispatch(Server, Auth, Id, <<"CreateTaskPushNotificationConfig">>, Params) ->
+    case adk_a2a_v1_server:create_push_config(
+           Server, maps:get(scope, Auth), Params) of
+        {ok, Config} -> {ok, adk_a2a_v1_codec:result(Id, Config)};
+        {error, Reason} -> {error, rpc_error(Id, Reason)}
+    end;
+dispatch(Server, Auth, Id, <<"GetTaskPushNotificationConfig">>, Params) ->
+    case adk_a2a_v1_server:get_push_config(
+           Server, maps:get(scope, Auth), Params) of
+        {ok, Config} -> {ok, adk_a2a_v1_codec:result(Id, Config)};
+        {error, Reason} -> {error, rpc_error(Id, Reason)}
+    end;
+dispatch(Server, Auth, Id, <<"ListTaskPushNotificationConfigs">>, Params) ->
+    case adk_a2a_v1_server:list_push_configs(
+           Server, maps:get(scope, Auth), Params) of
+        {ok, Configs} -> {ok, adk_a2a_v1_codec:result(Id, Configs)};
+        {error, Reason} -> {error, rpc_error(Id, Reason)}
+    end;
+dispatch(Server, Auth, Id, <<"DeleteTaskPushNotificationConfig">>, Params) ->
+    case adk_a2a_v1_server:delete_push_config(
+           Server, maps:get(scope, Auth), Params) of
+        {ok, Empty} -> {ok, adk_a2a_v1_codec:result(Id, Empty)};
+        {error, Reason} -> {error, rpc_error(Id, Reason)}
+    end;
+dispatch(Server, Auth, Id, <<"GetExtendedAgentCard">>, _Params) ->
+    case adk_a2a_v1_server:extended_card(
+           Server, maps:get(scope, Auth)) of
+        {ok, Card} -> {ok, adk_a2a_v1_codec:result(Id, Card)};
+        {error, Reason} -> {error, rpc_error(Id, Reason)}
+    end;
 dispatch(_Server, _Auth, Id, Method, _Params) ->
     case method_type(Method) of
         stream -> {error, rpc_error(Id, stream_method_requires_sse)};
-        unsupported_push ->
-            {error, rpc_error(Id, push_notification_not_supported)};
-        unsupported -> {error, rpc_error(Id, unsupported_operation)};
         unknown ->
             {error, adk_a2a_v1_codec:error_response(
                       Id, -32601, <<"Method not found">>)};
         _ -> {error, rpc_error(Id, invalid_params)}
     end.
 
-wait_send(Server, Scope, TaskId, InitialTask, Id) ->
+wait_send(Server, Scope, TaskId, InitialTask, Id, HistoryLength) ->
     case returnable_state(task_state(InitialTask)) of
         true ->
             _ = adk_a2a_v1_server:unsubscribe(Server, TaskId, self()),
@@ -71,20 +102,27 @@ wait_send(Server, Scope, TaskId, InitialTask, Id) ->
                    Id, #{<<"task">> => InitialTask})};
         false ->
             receive
-                {adk_a2a_v1_event, TaskId, _Seq, Payload, _Terminal} ->
-                    case payload_state(Payload) of
-                        State when is_binary(State) ->
+                {adk_a2a_v1_event, TaskId, _Seq, Payload, Terminal} ->
+                    case {payload_state(Payload), Terminal} of
+                        {State, _} when is_binary(State) ->
                             case returnable_state(State) of
                                 true ->
                                     _ = adk_a2a_v1_server:unsubscribe(
                                           Server, TaskId, self()),
-                                    final_task(Server, Scope, TaskId, Id);
+                                    final_task(Server, Scope, TaskId, Id,
+                                               HistoryLength);
                                 false ->
                                     wait_send(Server, Scope, TaskId,
-                                              InitialTask, Id)
+                                              InitialTask, Id, HistoryLength)
                             end;
-                        undefined ->
-                            wait_send(Server, Scope, TaskId, InitialTask, Id)
+                        {undefined, true} ->
+                            _ = adk_a2a_v1_server:unsubscribe(
+                                  Server, TaskId, self()),
+                            final_task(Server, Scope, TaskId, Id,
+                                       HistoryLength);
+                        {undefined, false} ->
+                            wait_send(Server, Scope, TaskId, InitialTask, Id,
+                                      HistoryLength)
                     end
             after 65000 ->
                 _ = adk_a2a_v1_server:unsubscribe(Server, TaskId, self()),
@@ -92,11 +130,13 @@ wait_send(Server, Scope, TaskId, InitialTask, Id) ->
             end
     end.
 
-final_task(Server, Scope, TaskId, Id) ->
-    case adk_a2a_v1_server:get_task(
-           Server, Scope, #{<<"id">> => TaskId}) of
-        {ok, Task} ->
+final_task(Server, Scope, TaskId, Id, HistoryLength) ->
+    case adk_a2a_v1_server:send_result(
+           Server, Scope, TaskId, HistoryLength) of
+        {ok, {task, Task}} ->
             {ok, adk_a2a_v1_codec:result(Id, #{<<"task">> => Task})};
+        {ok, {message, Message}} ->
+            {ok, adk_a2a_v1_codec:result(Id, #{<<"message">> => Message})};
         {error, Reason} -> {error, rpc_error(Id, Reason)}
     end.
 
@@ -109,6 +149,9 @@ rpc_error(Id, task_not_cancelable) ->
 rpc_error(Id, push_notification_not_supported) ->
     a2a_error(Id, -32003, <<"Push notification is not supported">>,
               <<"PUSH_NOTIFICATION_NOT_SUPPORTED">>);
+rpc_error(Id, extended_agent_card_not_configured) ->
+    a2a_error(Id, -32007, <<"Extended Agent Card is not configured">>,
+              <<"EXTENDED_AGENT_CARD_NOT_CONFIGURED">>);
 rpc_error(Id, unsupported_operation) ->
     a2a_error(Id, -32004, <<"Unsupported operation">>,
               <<"UNSUPPORTED_OPERATION">>);
@@ -133,6 +176,9 @@ rpc_error(Id, replay_window_exceeded) ->
               <<"UNSUPPORTED_OPERATION">>);
 rpc_error(Id, subscriber_capacity) ->
     a2a_error(Id, -32004, <<"Subscriber capacity reached">>,
+              <<"UNSUPPORTED_OPERATION">>);
+rpc_error(Id, push_notification_capacity_reached) ->
+    a2a_error(Id, -32004, <<"Push notification capacity reached">>,
               <<"UNSUPPORTED_OPERATION">>);
 rpc_error(Id, stream_method_requires_sse) ->
     a2a_error(Id, -32004, <<"Streaming operation required">>,

@@ -7,6 +7,7 @@
 -define(OTHER_USER, <<"runner-durable-memory-other-user">>).
 -define(JOBS, adk_runner_durable_memory_test_job).
 -define(USAGE, adk_runner_durable_memory_test_usage).
+-define(SCHEDULE, adk_runner_durable_memory_test_schedule).
 
 runner_durable_memory_test_() ->
     {foreach,
@@ -160,7 +161,8 @@ durable_runner(Agent, Memory, AdapterId) ->
 
 runtime_options(OutboxOverrides, PollInterval) ->
     Outbox = maps:merge(
-               #{jobs_table => ?JOBS, usage_table => ?USAGE},
+               #{jobs_table => ?JOBS, usage_table => ?USAGE,
+                 schedule_table => ?SCHEDULE},
                OutboxOverrides),
     #{outbox => Outbox,
       processor => #{poll_interval_ms => PollInterval,
@@ -288,7 +290,7 @@ cleanup_sessions() ->
     ok.
 
 delete_test_tables() ->
-    lists:foreach(fun delete_table/1, [?JOBS, ?USAGE]),
+    lists:foreach(fun delete_table/1, [?JOBS, ?USAGE, ?SCHEDULE]),
     ok.
 
 delete_table(Table) ->

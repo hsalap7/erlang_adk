@@ -13,7 +13,8 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(state, {owner, mode, barrier = false}).
+-record(state, {owner, mode, barrier = false,
+                persistence = volatile, durable = false}).
 
 start_link(Config) -> gen_server:start_link(?MODULE, Config, []).
 stop(Pid) -> gen_server:stop(Pid).
@@ -66,21 +67,26 @@ init(Config) ->
     Owner = maps:get(test_owner, Config),
     Mode = maps:get(mode, Config),
     Barrier = maps:get(barrier, Config, false),
+    Persistence = maps:get(persistence, Config, volatile),
+    Durable = maps:get(durable, Config, false),
     Owner ! {probe_started, self(), Mode},
-    {ok, #state{owner = Owner, mode = Mode, barrier = Barrier}}.
+    {ok, #state{owner = Owner, mode = Mode, barrier = Barrier,
+                persistence = Persistence, durable = Durable}}.
 
-handle_call(capabilities, _From, #state{mode = artifact} = State) ->
+handle_call(capabilities, _From,
+            #state{mode = artifact, persistence = Persistence} = State) ->
     {reply, {ok, #{api_version => 1,
                    immutable_versions => true,
                    scopes => [app, user, session],
                    pagination => #{max_page_limit => 10},
                    deadlines => true,
-                   persistence => volatile,
+                   persistence => Persistence,
                    quotas => #{max_total_bytes => 1024}}}, State};
-handle_call(capabilities, _From, #state{mode = memory} = State) ->
+handle_call(capabilities, _From,
+            #state{mode = memory, durable = Durable} = State) ->
     {reply, #{contract_version => 2,
               scope => app_user,
-              durable => false,
+              durable => Durable,
               search => lexical_overlap,
               idempotent_ingestion => true,
               incremental_events => true,

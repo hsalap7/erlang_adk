@@ -1,19 +1,25 @@
-%% @doc Bounded MCP 2025-11-25 Streamable HTTP server.
+%% @doc Bounded dual-era MCP Streamable HTTP server.
 %%
-%% The server deliberately implements JSON responses to POST and returns 405
-%% for the optional GET/SSE channel. Tool/resource/prompt work runs in monitored
-%% lightweight processes behind a global concurrency and deadline bound.
+%% Modern requests are stateless. Legacy requests retain the bounded session
+%% lifecycle, with an explicitly opt-in deprecated GET/SSE adapter. Registered
+%% work runs in monitored lightweight processes behind global concurrency and
+%% deadline bounds.
 -module(adk_mcp_server).
 -behaviour(gen_server).
 
 -export([start/2, start_link/1, stop/1, endpoint/1,
          register_tool/2, register_resource/2, register_prompt/2,
+         replace_catalog/2, catalog_info/1,
          handle_http/5, handle_http/6,
+         handle_modern_http/5,
+         open_modern_subscription/6, acknowledge_modern_subscription/4,
+         close_modern_subscription/3,
          delete_session/3, delete_session/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3, format_status/1]).
 
 -define(LATEST_PROTOCOL_VERSION, <<"2025-11-25">>).
+-define(MODERN_PROTOCOL_VERSION, <<"2026-07-28">>).
 -define(SUPPORTED_PROTOCOL_VERSIONS,
         [?LATEST_PROTOCOL_VERSION, <<"2025-06-18">>]).
 -define(DEFAULT_MAX_BODY_BYTES, 1048576).
@@ -22,6 +28,7 @@
 -define(DEFAULT_MAX_CONCURRENCY, 32).
 -define(DEFAULT_MAX_SESSIONS, 1024).
 -define(DEFAULT_MAX_SESSION_REQUESTS, 10000).
+-define(DEFAULT_MAX_SUBSCRIPTIONS, 256).
 -define(DEFAULT_SESSION_TTL_MS, 3600000).
 -define(DEFAULT_CALLBACK_TIMEOUT, 5000).
 -define(MAX_CALLBACK_TIMEOUT, 30000).
@@ -83,6 +90,16 @@ register_resource(Server, Resource) ->
 register_prompt(Server, Prompt) ->
     gen_server:call(Server, {register, prompt, Prompt}).
 
+%% @doc Atomically validate and replace all executable registries and the
+%% immutable public catalog generation used by list operations.
+-spec replace_catalog(pid(), map()) -> {ok, map()} | {error, term()}.
+replace_catalog(Server, Definitions) when is_map(Definitions) ->
+    gen_server:call(Server, {replace_catalog, Definitions});
+replace_catalog(_Server, _Definitions) -> {error, invalid_mcp_registry}.
+
+-spec catalog_info(pid()) -> {ok, map()} | {error, term()}.
+catalog_info(Server) -> gen_server:call(Server, catalog_info).
+
 %% Internal transport boundary called by adk_mcp_http_handler.
 -spec handle_http(pid(), undefined | binary(), undefined | binary(),
                   map(), timeout()) -> term().
@@ -97,6 +114,35 @@ handle_http(Server, Session, Version, Message, Timeout) ->
 handle_http(Server, Session, Version, Message, AuthContext, Timeout) ->
     gen_server:call(Server,
                     {http, Session, Version, Message, AuthContext}, Timeout).
+
+%% Modern requests are self-describing and stateless.  Context is produced by
+%% adk_mcp_protocol_modern after body/header agreement has been validated.
+-spec handle_modern_http(pid(), map(), map(), legacy | map(), timeout()) ->
+    term().
+handle_modern_http(Server, Message, Context, AuthContext, Timeout) ->
+    gen_server:call(Server,
+                    {modern_http, Message, Context, AuthContext}, Timeout).
+
+%% Native 2026-07-28 subscriptions are owned by the Cowboy request process.
+%% Catalog changes are coalesced per kind until that process acknowledges the
+%% preceding SSE frame, keeping producer memory bounded for slow consumers.
+-spec open_modern_subscription(pid(), binary() | integer(), map(), pid(),
+                               legacy | map(), timeout()) ->
+    {ok, map()} | {error, term()}.
+open_modern_subscription(Server, Id, Filter, Owner, AuthContext, Timeout) ->
+    gen_server:call(Server,
+                    {open_modern_subscription, Id, Filter, Owner,
+                     AuthContext}, Timeout).
+
+-spec acknowledge_modern_subscription(pid(), pid(), binary() | integer(),
+                                       tools | resources | prompts) -> ok.
+acknowledge_modern_subscription(Server, Owner, Id, Kind) ->
+    gen_server:cast(Server,
+                    {acknowledge_modern_subscription, Owner, Id, Kind}).
+
+-spec close_modern_subscription(pid(), pid(), binary() | integer()) -> ok.
+close_modern_subscription(Server, Owner, Id) ->
+    gen_server:cast(Server, {close_modern_subscription, Owner, Id}).
 
 -spec delete_session(pid(), undefined | binary(), undefined | binary()) ->
     ok | {error, term()}.
@@ -120,6 +166,13 @@ init(Config0) ->
     end.
 
 init_listener(Config, Registries) ->
+    case adk_mcp_catalog:new(catalog_definitions(Registries)) of
+        {error, Reason} -> {stop, {invalid_mcp_catalog, Reason}};
+        {ok, Catalog} -> init_listener_with_catalog(Config, Registries,
+                                                     Catalog)
+    end.
+
+init_listener_with_catalog(Config, Registries, Catalog) ->
     Listener = {?MODULE, make_ref()},
     RouteState = route_config(Config, self()),
     Dispatch = cowboy_router:compile([{'_', routes(Config, RouteState)}]),
@@ -138,11 +191,13 @@ init_listener(Config, Registries) ->
             Port = apply(ranch, get_port, [Listener]),
             Cleanup = schedule_cleanup(Config),
             {ok, Registries#{config => Config,
+                             catalog => Catalog,
                              listener => Listener,
                              listener_pid => ListenerPid,
                              listener_monitor => Monitor,
                              port => Port,
                              sessions => #{},
+                             subscriptions => #{},
                              pending => #{},
                              active => 0,
                              cleanup_timer => Cleanup}};
@@ -166,8 +221,66 @@ handle_call({register, Kind, Value}, _From, State) ->
         {ok, Key, Item} ->
             Field = registry_field(Kind),
             Registry = maps:get(Field, State),
-            {reply, ok, State#{Field => Registry#{Key => Item}}};
+            Candidate = State#{Field => Registry#{Key => Item}},
+            case replace_public_catalog(Candidate) of
+                {ok, Updated, _Change} -> {reply, ok, Updated};
+                {error, Reason} -> {reply, {error, Reason}, State}
+            end;
         {error, Reason} -> {reply, {error, Reason}, State}
+    end;
+handle_call(catalog_info, _From, State) ->
+    {reply, adk_mcp_catalog:describe(maps:get(catalog, State)), State};
+handle_call({open_modern_subscription, Id, Filter0, Owner, AuthContext},
+            _From, State) ->
+    Config = maps:get(config, State),
+    Subscriptions = maps:get(subscriptions, State),
+    Key = {Owner, Id},
+    case {maps:get(modern_subscriptions, Config, false),
+          auth_scope(AuthContext), is_pid(Owner), maps:is_key(Key,
+                                                              Subscriptions),
+          map_size(Subscriptions) < maps:get(max_subscriptions, Config)} of
+        {true, {ok, Scope}, true, false, true} ->
+            case adk_mcp_protocol_modern:subscription_acknowledged(
+                   Id, Filter0, Filter0) of
+                {ok, Ack} ->
+                    #{<<"params">> :=
+                          #{<<"notifications">> := Filter}} = Ack,
+                    Monitor = erlang:monitor(process, Owner),
+                    Subscription = #{owner => Owner, id => Id,
+                                     monitor => Monitor, scope => Scope,
+                                     filter => Filter, inflight => #{},
+                                     dirty => #{}},
+                    {reply, {ok, Ack},
+                     State#{subscriptions =>
+                                Subscriptions#{Key => Subscription}}};
+                {error, Reason} -> {reply, {error, Reason}, State}
+            end;
+        {false, _, _, _, _} ->
+            {reply, {error, mcp_modern_subscriptions_disabled}, State};
+        {_, error, _, _, _} ->
+            {reply, {error, unauthenticated}, State};
+        {_, _, false, _, _} ->
+            {reply, {error, invalid_mcp_subscription_owner}, State};
+        {_, _, _, true, _} ->
+            {reply, {error, duplicate_mcp_subscription}, State};
+        {_, _, _, _, false} ->
+            {reply, {error, mcp_subscription_capacity_reached}, State}
+    end;
+handle_call({replace_catalog, Definitions}, _From, State) ->
+    case valid_catalog_definition_keys(Definitions) of
+        false -> {reply, {error, unknown_mcp_catalog_keys}, State};
+        true -> case normalize_registries(Definitions, maps:get(config, State)) of
+        {ok, _Config, Registries} ->
+            Candidate = State#{tools => maps:get(tools, Registries),
+                               resources => maps:get(resources, Registries),
+                               prompts => maps:get(prompts, Registries)},
+            case replace_public_catalog(Candidate) of
+                {ok, Updated, Change} ->
+                    {reply, {ok, Change}, Updated};
+                {error, Reason} -> {reply, {error, Reason}, State}
+            end;
+        {error, Reason} -> {reply, {error, Reason}, State}
+        end
     end;
 handle_call({delete_session, undefined, _Version, _Auth}, _From, State) ->
     {reply, {error, missing_session}, State};
@@ -214,9 +327,24 @@ handle_call({http, Session, Version, Message, AuthContext}, From, State0) ->
         error ->
             {reply, {http_error, 401, []}, State}
     end;
+handle_call({modern_http, Message, Context, AuthContext}, From, State) ->
+    case {auth_scope(AuthContext), classify_message(Message),
+          valid_modern_context(Message, Context)} of
+        {{ok, _Scope}, {request, Id, Method, Params}, true} ->
+            handle_modern_operation(Id, Method, Params, Context, From, State);
+        {error, _, _} -> {reply, {http_error, 401, []}, State};
+        {_, _, _} ->
+            Error = error_response(null, -32600, <<"Invalid Request">>),
+            {reply, {json, 400, [], Error}, State}
+    end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unsupported_call}, State}.
 
+handle_cast({acknowledge_modern_subscription, Owner, Id, Kind}, State)
+  when Kind =:= tools; Kind =:= resources; Kind =:= prompts ->
+    {noreply, acknowledge_subscription_event({Owner, Id}, Kind, State)};
+handle_cast({close_modern_subscription, Owner, Id}, State) ->
+    {noreply, remove_subscription({Owner, Id}, State)};
 handle_cast(_Message, State) -> {noreply, State}.
 
 handle_info({mcp_worker_result, Ref, CompletedAt, Response0}, State) ->
@@ -247,9 +375,16 @@ handle_info({'DOWN', Monitor, process, _Pid, Reason}, State) ->
             {noreply, State#{pending => Rest,
                              active => maps:get(active, State) - 1}};
         error ->
-            case Monitor =:= maps:get(listener_monitor, State) of
-                true -> {stop, {mcp_listener_terminated, Reason}, State};
-                false -> {noreply, State}
+            case subscription_by_monitor(
+                   Monitor, maps:get(subscriptions, State)) of
+                {ok, Key} ->
+                    {noreply, remove_subscription(Key, State)};
+                error ->
+                    case Monitor =:= maps:get(listener_monitor, State) of
+                        true ->
+                            {stop, {mcp_listener_terminated, Reason}, State};
+                        false -> {noreply, State}
+                    end
             end
     end;
 handle_info(cleanup_sessions, State0) ->
@@ -296,12 +431,18 @@ format_status(Status) ->
                   {hook, _} -> hook_configured;
                   none -> none
               end,
+              Handlers = maps:keys(maps:get(method_handlers, Config0, #{})),
               Config = Config0#{auth => Auth,
-                                authorization => Authorization},
+                                authorization => Authorization,
+                                method_handlers => Handlers},
               Sessions = maps:get(sessions, State, #{}),
+              Subscriptions = maps:get(subscriptions, State, #{}),
               SafeState = State#{config => Config,
                                  sessions =>
-                                     #{active_count => map_size(Sessions)}},
+                                     #{active_count => map_size(Sessions)},
+                                 subscriptions =>
+                                     #{active_count =>
+                                           map_size(Subscriptions)}},
               maps:without([pending], SafeState);
          (message, Message) -> adk_secret_redactor:redact(Message);
          (log, _Log) -> [];
@@ -409,7 +550,20 @@ handle_operation(Session, Version, AuthScope, Id, Method, Params, From,
             end
     end.
 
+handle_modern_operation(Id, Method, Params, Context, From, State) ->
+    Config = maps:get(config, State),
+    case maps:get(active, State) >= maps:get(max_concurrency, Config) of
+        true ->
+            Error = error_response(Id, -32000, <<"Server busy">>),
+            {reply, {json, 200, [], Error}, State};
+        false ->
+            start_operation(Id, Method, Params, From, modern, Context, State)
+    end.
+
 start_operation(Id, Method, Params, From, State) ->
+    start_operation(Id, Method, Params, From, legacy, #{}, State).
+
+start_operation(Id, Method, Params, From, Era, Context, State) ->
     Ref = make_ref(),
     Owner = self(),
     ReplyAlias = erlang:alias([explicit_unalias]),
@@ -419,8 +573,9 @@ start_operation(Id, Method, Params, From, State) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     Work = fun() ->
         start_operation_owner_watchdog(Owner, self()),
-        Outcome = execute_method(Method, Params, State),
-        Response = bounded_operation_response(Id, Outcome, MaxResponseBytes),
+        Outcome = execute_protocol_method(Era, Method, Params, Context, State),
+        Response = bounded_operation_response(Id, Method, Outcome,
+                                              MaxResponseBytes, Era, State),
         CompletedAt = erlang:monotonic_time(millisecond),
         _ = erlang:send(ReplyAlias,
                         {mcp_worker_result, Ref, CompletedAt, Response},
@@ -499,30 +654,125 @@ operation_owner_watchdog(Owner, Worker) ->
             ok
     end.
 
-execute_method(<<"tools/list">>, _Params, State) ->
+execute_protocol_method(modern, <<"server/discover">>, _Params,
+                        _Context, State) ->
+    ServerInfo = mcp_server_info(),
+    Capabilities = modern_capabilities(State),
+    case adk_mcp_protocol:discover_result(
+           ServerInfo, Capabilities,
+           #{supported_versions => [?MODERN_PROTOCOL_VERSION],
+             ttl_ms => 0, cache_scope => private}) of
+        {ok, Result} -> {modern_discovery, Result};
+        {error, _} -> {protocol_error, -32603, <<"Discovery failed">>}
+    end;
+execute_protocol_method(modern, <<"tools/list">>, Params, _Context, State) ->
+    modern_catalog_list(tools, Params, State);
+execute_protocol_method(modern, <<"resources/list">>, Params, _Context,
+                        State) ->
+    modern_catalog_list(resources, Params, State);
+execute_protocol_method(modern, <<"prompts/list">>, Params, _Context,
+                        State) ->
+    modern_catalog_list(prompts, Params, State);
+execute_protocol_method(modern, <<"resources/read">>, Params, _Context,
+                        State) ->
+    case execute_resource(Params, State) of
+        {ok, Result} ->
+            case adk_mcp_protocol_modern:cacheable_result(
+                   Result, #{ttl_ms => 0, cache_scope => private}) of
+                {ok, Cacheable} -> {ok, Cacheable};
+                {error, _} ->
+                    {protocol_error, -32603,
+                     <<"Resource result encoding failed">>}
+            end;
+        Other -> Other
+    end;
+execute_protocol_method(modern, Method, _Params, _Context, _State)
+  when Method =:= <<"roots/list">>;
+       Method =:= <<"sampling/createMessage">>;
+       Method =:= <<"logging/setLevel">> ->
+    {protocol_error, -32601, <<"Method is not available in this protocol era">>};
+execute_protocol_method(Era, Method, Params, Context, State) ->
+    execute_method(Method, Params, #{era => Era, client => Context}, State).
+
+modern_catalog_list(Kind, Params, State) ->
+    Cursor = maps:get(<<"cursor">>, Params, undefined),
+    Limit = maps:get(<<"pageSize">>, Params, 100),
+    case adk_mcp_catalog:list(maps:get(catalog, State), Kind, Cursor, Limit) of
+        {ok, Page} ->
+            Options0 = #{ttl_ms => 0, cache_scope => private},
+            Options = case maps:find(next_cursor, Page) of
+                {ok, Next} -> Options0#{next_cursor => Next};
+                error -> Options0
+            end,
+            case adk_mcp_protocol_modern:list_result(
+                   Kind, maps:get(items, Page), Options) of
+                {ok, Result} -> {ok, Result};
+                {error, _} ->
+                    {protocol_error, -32603, <<"Catalog encoding failed">>}
+            end;
+        {error, invalid_mcp_catalog_page} ->
+            {protocol_error, -32602, <<"Invalid page size">>};
+        {error, stale_mcp_catalog_cursor} ->
+            {protocol_error, -32602, <<"Stale catalog cursor">>};
+        {error, _} ->
+            {protocol_error, -32602, <<"Invalid catalog cursor">>}
+    end.
+
+execute_method(<<"tools/list">>, _Params, _Context, State) ->
     Tools = [maps:get(public, Item)
              || {_Name, Item} <- lists:sort(maps:to_list(maps:get(tools,
                                                                  State)))],
     {ok, #{<<"tools">> => Tools}};
-execute_method(<<"tools/call">>, Params, State) ->
+execute_method(<<"tools/call">>, Params, _Context, State) ->
     execute_tool(Params, State);
-execute_method(<<"resources/list">>, _Params, State) ->
+execute_method(<<"resources/list">>, _Params, _Context, State) ->
     Resources = [maps:get(public, Item)
                  || {_Uri, Item} <- lists:sort(
                                       maps:to_list(maps:get(resources,
                                                             State)))],
     {ok, #{<<"resources">> => Resources}};
-execute_method(<<"resources/read">>, Params, State) ->
+execute_method(<<"resources/read">>, Params, _Context, State) ->
     execute_resource(Params, State);
-execute_method(<<"prompts/list">>, _Params, State) ->
+execute_method(<<"prompts/list">>, _Params, _Context, State) ->
     Prompts = [maps:get(public, Item)
                || {_Name, Item} <- lists:sort(
                                     maps:to_list(maps:get(prompts, State)))],
     {ok, #{<<"prompts">> => Prompts}};
-execute_method(<<"prompts/get">>, Params, State) ->
+execute_method(<<"prompts/get">>, Params, _Context, State) ->
     execute_prompt(Params, State);
-execute_method(_Method, _Params, _State) ->
-    {protocol_error, -32601, <<"Method not found">>}.
+execute_method(Method, Params, Context, State) ->
+    execute_extension(Method, Params, Context, State).
+
+execute_extension(Method, Params, Context, State) ->
+    Handlers = maps:get(method_handlers, maps:get(config, State), #{}),
+    case maps:find(Method, Handlers) of
+        {ok, Fun} ->
+            try Fun(Params, Context) of
+                {ok, _} = Result -> Result;
+                {input_required, Requests, RequestState} ->
+                    normalize_input_required(Requests, RequestState,
+                                             Context);
+                {error, Reason} ->
+                    {protocol_error, -32603, safe_error_text(Reason)};
+                _ -> {protocol_error, -32603, <<"Invalid handler result">>}
+            catch _:_ ->
+                {protocol_error, -32603, <<"Method handler failed">>}
+            end;
+        error -> {protocol_error, -32601, <<"Method not found">>}
+    end.
+
+normalize_input_required(Requests, RequestState,
+                         #{era := modern,
+                           client := #{client_capabilities := Capabilities}}) ->
+    case adk_mcp_protocol_modern:input_required(
+           Requests, RequestState, Capabilities) of
+        {ok, Result} -> {ok, Result};
+        {error, _} ->
+            {protocol_error, -32602, <<"Invalid elicitation request">>}
+    end;
+normalize_input_required(_Requests, _RequestState, _Context) ->
+    {protocol_error, -32602,
+     <<"Input-required results need the modern elicitation capability">>}.
 
 execute_tool(Params, State) ->
     Name = maps:get(<<"name">>, Params, undefined),
@@ -641,11 +891,25 @@ outcome_response(Id, {ok, Result}) -> result_response(Id, Result);
 outcome_response(Id, {protocol_error, Code, Message}) ->
     error_response(Id, Code, Message).
 
+outcome_response(_Method, Id, {modern_discovery, Result}, modern, _State) ->
+    result_response(Id, Result);
+outcome_response(_Method, Id, {ok, Result}, modern, _State) ->
+    case adk_mcp_protocol:result_response(
+           modern, Id, Result, mcp_server_info()) of
+        {ok, Response} -> Response;
+        {error, _} -> error_response(Id, -32603, <<"Invalid result">>)
+    end;
+outcome_response(_Method, Id, {protocol_error, Code, Message}, modern,
+                 _State) ->
+    error_response(Id, Code, Message);
+outcome_response(_Method, Id, Outcome, legacy, _State) ->
+    outcome_response(Id, Outcome).
+
 %% Normalize and encode inside the short-lived callback worker.  Only a
 %% protocol response whose encoded representation fits the configured limit is
 %% copied into the long-lived server process.
-bounded_operation_response(Id, Outcome, MaxBytes) ->
-    Response = outcome_response(Id, Outcome),
+bounded_operation_response(Id, Method, Outcome, MaxBytes, Era, State) ->
+    Response = outcome_response(Method, Id, Outcome, Era, State),
     try jsx:encode(Response) of
         Encoded when byte_size(Encoded) =< MaxBytes -> Response;
         _ -> error_response(null, -32603, <<"Response exceeds limit">>)
@@ -717,10 +981,180 @@ initialize_result(State, Version) ->
         0 -> Cap2;
         _ -> Cap2#{<<"prompts">> => #{<<"listChanged">> => false}}
     end,
+    Cap4 = case handler_configured(<<"completion/complete">>, State) of
+        true -> Cap3#{<<"completions">> => #{}};
+        false -> Cap3
+    end,
+    Cap5 = case handler_configured(<<"logging/setLevel">>, State) of
+        true -> Cap4#{<<"logging">> => #{}};
+        false -> Cap4
+    end,
     #{<<"protocolVersion">> => Version,
-      <<"capabilities">> => Cap3,
-      <<"serverInfo">> => #{<<"name">> => <<"erlang_adk">>,
-                             <<"version">> => application_version()}}.
+      <<"capabilities">> => Cap5,
+      <<"serverInfo">> => mcp_server_info()}.
+
+mcp_server_info() ->
+    #{<<"name">> => <<"erlang_adk">>,
+      <<"version">> => application_version()}.
+
+modern_capabilities(State) ->
+    Config = maps:get(config, State),
+    ListChanged = maps:get(modern_subscriptions, Config, false),
+    ResourceSubscribe =
+        handler_configured(<<"resources/subscribe">>, State) andalso
+        handler_configured(<<"resources/unsubscribe">>, State),
+    Base0 = #{},
+    Base1 = case map_size(maps:get(tools, State)) of
+        0 -> Base0;
+        _ -> Base0#{<<"tools">> => #{<<"listChanged">> => ListChanged}}
+    end,
+    Base2 = case map_size(maps:get(resources, State)) of
+        0 -> Base1;
+        _ -> Base1#{<<"resources">> => #{<<"listChanged">> => ListChanged,
+                                             <<"subscribe">> =>
+                                                 ResourceSubscribe}}
+    end,
+    Base3 = case map_size(maps:get(prompts, State)) of
+        0 -> Base2;
+        _ -> Base2#{<<"prompts">> => #{<<"listChanged">> => ListChanged}}
+    end,
+    Base4 = case handler_configured(<<"completion/complete">>, State) of
+        true -> Base3#{<<"completions">> => #{}};
+        false -> Base3
+    end,
+    case ListChanged of
+        true -> Base4#{<<"extensions">> =>
+                           #{<<"subscriptions">> => #{<<"streamable">> => true}}};
+        false -> Base4
+    end.
+
+handler_configured(Method, State) ->
+    maps:is_key(Method,
+                maps:get(method_handlers, maps:get(config, State), #{})).
+
+valid_modern_context(
+  #{<<"id">> := Id, <<"method">> := Method, <<"params">> := Params},
+  #{id := Id, method := Method, params := Params,
+    client_capabilities := Capabilities}) ->
+    is_map(Capabilities);
+valid_modern_context(_, _) -> false.
+
+catalog_definitions(Registries) ->
+    #{tools => public_entries(maps:get(tools, Registries, #{})),
+      resources => public_entries(maps:get(resources, Registries, #{})),
+      prompts => public_entries(maps:get(prompts, Registries, #{}))}.
+
+public_entries(Registry) ->
+    [maps:get(public, Item)
+     || {_Id, Item} <- lists:sort(maps:to_list(Registry))].
+
+replace_public_catalog(State) ->
+    Catalog0 = maps:get(catalog, State),
+    case adk_mcp_catalog:replace(Catalog0, catalog_definitions(State)) of
+        {ok, Catalog} ->
+            case adk_mcp_catalog:list_changed(Catalog0, Catalog) of
+                {ok, Change} ->
+                    Updated = enqueue_catalog_change(
+                                State#{catalog => Catalog}, Change),
+                    {ok, Updated, Change};
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} -> {error, Reason}
+    end.
+
+enqueue_catalog_change(State, #{changed := Changed}) ->
+    Kinds = [Kind || Kind <- [tools, resources, prompts],
+                     maps:get(Kind, Changed, false)],
+    Subscriptions0 = maps:get(subscriptions, State, #{}),
+    Subscriptions = lists:foldl(
+                      fun(Kind, Current) ->
+                          maps:map(
+                            fun(_Key, Subscription) ->
+                                enqueue_subscription_kind(
+                                  Kind, Subscription)
+                            end, Current)
+                      end, Subscriptions0, Kinds),
+    State#{subscriptions => Subscriptions}.
+
+enqueue_subscription_kind(Kind, Subscription) ->
+    Filter = maps:get(filter, Subscription),
+    case maps:get(subscription_filter_key(Kind), Filter, false) of
+        false -> Subscription;
+        true ->
+            Inflight = maps:get(inflight, Subscription),
+            case maps:get(Kind, Inflight, false) of
+                true ->
+                    Dirty = maps:get(dirty, Subscription),
+                    Subscription#{dirty => Dirty#{Kind => true}};
+                false -> send_subscription_kind(Kind, Subscription)
+            end
+    end.
+
+send_subscription_kind(Kind, Subscription) ->
+    Id = maps:get(id, Subscription),
+    Method = subscription_notification_method(Kind),
+    case adk_mcp_protocol_modern:subscription_event(Id, Method, #{}) of
+        {ok, Notification} ->
+            Owner = maps:get(owner, Subscription),
+            case erlang:send(
+                   Owner,
+                   {adk_mcp_subscription_event, Id, Kind, Notification},
+                   [nosuspend, noconnect]) of
+                ok ->
+                    Inflight = maps:get(inflight, Subscription),
+                    Subscription#{inflight => Inflight#{Kind => true}};
+                _ -> Subscription
+            end;
+        {error, _} -> Subscription
+    end.
+
+acknowledge_subscription_event(Key, Kind, State) ->
+    Subscriptions0 = maps:get(subscriptions, State),
+    case maps:find(Key, Subscriptions0) of
+        error -> State;
+        {ok, Subscription0} ->
+            Inflight = maps:remove(
+                         Kind, maps:get(inflight, Subscription0)),
+            Dirty0 = maps:get(dirty, Subscription0),
+            Dirty = maps:remove(Kind, Dirty0),
+            Subscription1 = Subscription0#{inflight => Inflight,
+                                           dirty => Dirty},
+            Subscription = case maps:get(Kind, Dirty0, false) of
+                true -> enqueue_subscription_kind(Kind, Subscription1);
+                false -> Subscription1
+            end,
+            State#{subscriptions => Subscriptions0#{Key => Subscription}}
+    end.
+
+remove_subscription(Key, State) ->
+    Subscriptions0 = maps:get(subscriptions, State, #{}),
+    case maps:take(Key, Subscriptions0) of
+        {Subscription, Subscriptions} ->
+            _ = erlang:demonitor(maps:get(monitor, Subscription), [flush]),
+            State#{subscriptions => Subscriptions};
+        error -> State
+    end.
+
+subscription_by_monitor(Monitor, Subscriptions) ->
+    case [Key || {Key, Subscription} <- maps:to_list(Subscriptions),
+                 maps:get(monitor, Subscription) =:= Monitor] of
+        [Key] -> {ok, Key};
+        [] -> error
+    end.
+
+subscription_filter_key(tools) -> <<"toolsListChanged">>;
+subscription_filter_key(resources) -> <<"resourcesListChanged">>;
+subscription_filter_key(prompts) -> <<"promptsListChanged">>.
+
+subscription_notification_method(tools) ->
+    <<"notifications/tools/list_changed">>;
+subscription_notification_method(resources) ->
+    <<"notifications/resources/list_changed">>;
+subscription_notification_method(prompts) ->
+    <<"notifications/prompts/list_changed">>.
+
+valid_catalog_definition_keys(Definitions) ->
+    maps:keys(maps:without([tools, resources, prompts], Definitions)) =:= [].
 
 application_version() ->
     _ = application:load(erlang_adk),
@@ -747,6 +1181,8 @@ normalize_config(Config0) when is_map(Config0) ->
                                           ?DEFAULT_MAX_SESSIONS),
                 max_session_requests => maps:get(max_session_requests, Config0,
                                                   ?DEFAULT_MAX_SESSION_REQUESTS),
+                max_subscriptions => maps:get(max_subscriptions, Config0,
+                                              ?DEFAULT_MAX_SUBSCRIPTIONS),
                 session_ttl_ms => maps:get(session_ttl_ms, Config0,
                                            ?DEFAULT_SESSION_TTL_MS),
                 num_acceptors => maps:get(num_acceptors, Config0, 10),
@@ -760,6 +1196,13 @@ normalize_config(Config0) when is_map(Config0) ->
                     maps:get(callback_max_heap_words, Config0,
                              ?DEFAULT_CALLBACK_MAX_HEAP_WORDS),
                 max_keepalive => maps:get(max_keepalive, Config0, 100),
+                legacy_sse_compat => maps:get(legacy_sse_compat, Config0,
+                                              false),
+                modern_enabled => maps:get(modern_enabled, Config0, true),
+                modern_subscriptions => maps:get(modern_subscriptions,
+                                                 Config0, false),
+                method_handlers => normalize_method_handlers(
+                                     maps:get(method_handlers, Config0, #{})),
                 allow_non_loopback => maps:get(allow_non_loopback,
                                                Config0, false),
                 trusted_tls_proxy => maps:get(trusted_tls_proxy,
@@ -913,6 +1356,10 @@ valid_config(Config) ->
     valid_ip(maps:get(ip, Config)) andalso
     is_boolean(maps:get(allow_non_loopback, Config)) andalso
     is_boolean(maps:get(trusted_tls_proxy, Config)) andalso
+    is_boolean(maps:get(legacy_sse_compat, Config)) andalso
+    is_boolean(maps:get(modern_enabled, Config)) andalso
+    is_boolean(maps:get(modern_subscriptions, Config)) andalso
+    maps:get(method_handlers, Config) =/= invalid andalso
     valid_tls_options(maps:get(tls_options, Config)) andalso
     secure_bind(maps:get(ip, Config), maps:get(auth, Config),
                 maps:get(allow_non_loopback, Config),
@@ -936,6 +1383,7 @@ valid_config(Config) ->
                maps:get(max_concurrency, Config),
                maps:get(max_sessions, Config),
                maps:get(max_session_requests, Config),
+               maps:get(max_subscriptions, Config),
                maps:get(session_ttl_ms, Config),
                maps:get(num_acceptors, Config),
                maps:get(max_connections, Config),
@@ -948,6 +1396,22 @@ valid_config(Config) ->
                   ?MAX_CALLBACK_MAX_HEAP_WORDS) andalso
     is_integer(maps:get(max_keepalive, Config)) andalso
     maps:get(max_keepalive, Config) >= 0.
+
+normalize_method_handlers(Handlers) when is_map(Handlers),
+                                         map_size(Handlers) =< 32 ->
+    Allowed = [<<"completion/complete">>, <<"logging/setLevel">>,
+               <<"roots/list">>, <<"sampling/createMessage">>,
+               <<"elicitation/create">>, <<"subscriptions/listen">>,
+               <<"resources/subscribe">>, <<"resources/unsubscribe">>],
+    case lists:all(
+           fun({Method, Fun}) ->
+                   is_binary(Method) andalso lists:member(Method, Allowed)
+                       andalso is_function(Fun, 2)
+           end, maps:to_list(Handlers)) of
+        true -> Handlers;
+        false -> invalid
+    end;
+normalize_method_handlers(_) -> invalid.
 
 valid_oauth_protected_resource(none, _McpPath) -> true;
 valid_oauth_protected_resource(
@@ -1078,7 +1542,9 @@ route_config(Config, Server) ->
     RouteConfig = maps:with(
                     [path, max_body_bytes, callback_timeout,
                      callback_max_heap_words, allowed_origins, auth,
-                     authorization, oauth_protected_resource], Config),
+                     authorization, oauth_protected_resource,
+                     legacy_sse_compat, modern_enabled,
+                     modern_subscriptions], Config),
     %% The operation worker is killed at the configured request_timeout.  Give
     %% that worker's small JSON-RPC timeout reply a bounded delivery margin so
     %% Cowboy does not race it and replace the protocol error with HTTP 504.

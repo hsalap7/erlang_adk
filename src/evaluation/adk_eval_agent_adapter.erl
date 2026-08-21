@@ -161,39 +161,97 @@ start_resources(Target, Context, Config, Owner, OwnerMonitor) ->
         {error, _} = Error -> Error;
         {ok, BaseName, AgentConfig, Tools, RunnerOptions0} ->
             Name = unique_name(BaseName),
-            case erlang_adk:spawn_agent(Name, AgentConfig, Tools) of
-                {ok, AgentPid} ->
+            case spawn_eval_target(
+                   Target, Name, AgentConfig, Tools, RunnerOptions0) of
+                {ok, AgentPid, RunnerOptions, AgentOwner} ->
                     RunTimeout = positive_option(
                                    Config, run_timeout_ms,
                                    ?DEFAULT_RUN_TIMEOUT_MS),
-                    RunnerOptions = RunnerOptions0#{
-                        run_timeout => RunTimeout
-                    },
                     App = <<"adk-eval">>,
                     User = <<"local-evaluator">>,
                     Session = unique_session(Context),
-                    Runner = adk_runner:new(
-                               AgentPid, App, erlang_adk_session,
-                               RunnerOptions),
-                    Resources = #{owner => Owner,
-                                  owner_monitor => OwnerMonitor,
-                                  agent_pid => AgentPid,
-                                  agent_name => Name,
-                                  runner => Runner,
-                                  app => App, user => User,
-                                  session => Session,
-                                  run_timeout_ms => RunTimeout},
-                    case owner_is_down(OwnerMonitor) of
-                        true ->
-                            cleanup_resources(Resources),
-                            {error, eval_worker_down};
-                        false -> {ok, Resources}
+                    case build_runtime_runner(
+                           AgentPid, App, RunnerOptions, RunTimeout) of
+                        {ok, Runner, SessionService} ->
+                            Resources = #{owner => Owner,
+                                          owner_monitor => OwnerMonitor,
+                                          agent_pid => AgentPid,
+                                          agent_name => Name,
+                                          agent_owner => AgentOwner,
+                                          runner => Runner,
+                                          session_service => SessionService,
+                                          app => App, user => User,
+                                          session => Session,
+                                          run_timeout_ms => RunTimeout},
+                            case owner_is_down(OwnerMonitor) of
+                                true ->
+                                    cleanup_resources(Resources),
+                                    {error, eval_worker_down};
+                                false -> {ok, Resources}
+                            end;
+                        {error, _} = Error ->
+                            stop_eval_target(AgentOwner, AgentPid, Name),
+                            Error
                     end;
                 {error, _Reason} ->
                     {error, agent_start_failed}
             end
     end.
 
+spawn_eval_target(#{schema_version := Version} = Target, _Name,
+                  _AgentConfig, _Tools, _RunnerOptions)
+  when Version =:= 1; Version =:= 2 ->
+    case adk_agent_composition:spawn_scoped(Target, unique_scope()) of
+        {ok, Composition} ->
+            case {adk_agent_composition:root(Composition),
+                  adk_agent_composition:runner_options(Composition)} of
+                {{ok, AgentPid}, {ok, RunnerOptions}} ->
+                    {ok, AgentPid, RunnerOptions,
+                     {composition, Composition}};
+                _ ->
+                    _ = adk_agent_composition:stop(Composition),
+                    {error, agent_start_failed}
+            end;
+        {error, _} -> {error, agent_start_failed}
+    end;
+spawn_eval_target(#{agent_name := BorrowedName}, _Name, borrowed,
+                  _Tools, RunnerOptions) ->
+    case adk_agent_registry:lookup(BorrowedName) of
+        {ok, AgentPid} when is_pid(AgentPid) ->
+            {ok, AgentPid, RunnerOptions, {borrowed, BorrowedName}};
+        _ -> {error, agent_start_failed}
+    end;
+spawn_eval_target(_Target, Name, AgentConfig, Tools, RunnerOptions) ->
+    case erlang_adk:spawn_agent(Name, AgentConfig, Tools) of
+        {ok, AgentPid} ->
+            {ok, AgentPid, RunnerOptions, legacy};
+        {error, _} -> {error, agent_start_failed}
+    end.
+
+build_runtime_runner(AgentPid, App, AgentOptions, RunTimeout) ->
+    case erlang_adk:runtime_runner_spec() of
+        {ok, #{session_service := SessionService,
+               runner_options := ServiceOptions}}
+          when is_atom(SessionService), is_map(ServiceOptions) ->
+            Options0 = maps:merge(AgentOptions, ServiceOptions),
+            Options = Options0#{run_timeout => RunTimeout},
+            try adk_runner:new(AgentPid, App, SessionService, Options) of
+                Runner -> {ok, Runner, SessionService}
+            catch
+                _:_ -> {error, invalid_agent_runner_options}
+            end;
+        {error, _} = Error -> Error;
+        _ -> {error, invalid_runtime_runner_spec}
+    end.
+
+target_fields(#{agent_name := Name} = Target) when is_binary(Name) ->
+    RunnerOptions = maps:get(runner_options, Target, #{}),
+    case {maps:keys(maps:without([agent_name, runner_options], Target)),
+          byte_size(Name) > 0, is_map(RunnerOptions)} of
+        {[], true, true} -> {ok, Name, borrowed, [], RunnerOptions};
+        {[], _, false} -> {error, invalid_agent_runner_options};
+        _ -> {error, invalid_agent_eval_target}
+    end;
 target_fields(#{name := Name, config := AgentConfig,
                 tools := Tools} = Target)
   when is_binary(Name), byte_size(Name) > 0,
@@ -320,13 +378,22 @@ cleanup_resources(Resources) ->
         _ -> ok
     end,
     erase('$adk_eval_agent_stream'),
-    safe_stop_agent(maps:get(agent_pid, Resources),
-                    maps:get(agent_name, Resources)),
-    _ = catch erlang_adk_session:delete_session(
-                maps:get(app, Resources), maps:get(user, Resources),
-                maps:get(session, Resources)),
+    stop_eval_target(maps:get(agent_owner, Resources, legacy),
+                     maps:get(agent_pid, Resources),
+                     maps:get(agent_name, Resources)),
+    SessionService = maps:get(session_service, Resources),
+    _ = catch apply(SessionService, delete_session,
+                    [maps:get(app, Resources), maps:get(user, Resources),
+                     maps:get(session, Resources)]),
     erlang:demonitor(maps:get(owner_monitor, Resources), [flush]),
     ok.
+
+stop_eval_target({composition, Composition}, _AgentPid, _Name) ->
+    _ = catch adk_agent_composition:stop(Composition),
+    ok;
+stop_eval_target({borrowed, _Name}, _AgentPid, _RuntimeName) -> ok;
+stop_eval_target(_Owner, AgentPid, Name) ->
+    safe_stop_agent(AgentPid, Name).
 
 safe_stop_agent(AgentPid, Name) ->
     _ = catch erlang_adk:stop_agent(AgentPid),
@@ -345,6 +412,11 @@ unique_name(BaseName) ->
     Suffix = integer_to_binary(
                erlang:unique_integer([positive, monotonic])),
     <<BaseName/binary, "_eval_", Suffix/binary>>.
+
+unique_scope() ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    <<"eval_", Suffix/binary>>.
 
 unique_session(Context) ->
     SampleId = maps:get(<<"sample_id">>, Context, <<"sample">>),

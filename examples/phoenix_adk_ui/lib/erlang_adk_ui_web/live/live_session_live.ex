@@ -5,6 +5,28 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
   alias ErlangAdkUi.LiveGateway
   alias ErlangAdkUiWeb.{BoundedEvents, BoundedText, LiveProjection, PublicData}
 
+  @content_keys MapSet.new([
+                  "arguments",
+                  "audio",
+                  "body",
+                  "completion",
+                  "content",
+                  "data",
+                  "inline_data",
+                  "input",
+                  "media",
+                  "output",
+                  "payload",
+                  "prompt",
+                  "request",
+                  "response",
+                  "result",
+                  "thought_signature",
+                  "tool_arguments",
+                  "tool_result",
+                  "video"
+                ])
+
   @impl true
   def mount(_params, _session, socket) do
     limits = Application.fetch_env!(:erlang_adk_ui, :ui_limits)
@@ -29,6 +51,19 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
         evaluations: [],
         evaluation_report: nil,
         evaluation_error: nil,
+        graphs: [],
+        graph_catalog_truncated: false,
+        graph_detail: nil,
+        graph_overlay: nil,
+        selected_graph_id: nil,
+        graph_overlay_cursor: 0,
+        graph_overlay_recovery_cursor: nil,
+        graph_error: nil,
+        trace_timeline: nil,
+        trace_cursor: 0,
+        trace_recovery_cursor: nil,
+        trace_truncated: false,
+        trace_error: nil,
         dashboard_loaded: false
       )
 
@@ -258,6 +293,101 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
           <pre :if={@observability} class="outcome" id="observability-snapshot" role="status"><%= @observability %></pre>
         </section>
 
+        <section class="panel stack dashboard-wide" id="graph-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Workflow topology</p>
+              <h2>Graph catalog and execution overlay</h2>
+              <p class="muted">
+                Graphs come from a server-owned catalog. The browser can select only a returned ID;
+                service handles, owners, trace principals, modules and paths stay in release configuration.
+              </p>
+            </div>
+            <span class="panel-icon" aria-hidden="true">⌘</span>
+          </div>
+
+          <button type="button" class="secondary" phx-click="refresh-graphs">
+            Refresh graph catalog
+          </button>
+
+          <p :if={@graphs == [] && !@graph_error} class="empty-state" id="no-graphs" role="status">
+            <strong>No graphs available</strong>
+            <span>Publish compiled graphs through the trusted server-side catalog.</span>
+          </p>
+
+          <p :if={@graph_catalog_truncated} class="muted" id="graphs-truncated">
+            The bounded catalog view omits additional server-owned graphs.
+          </p>
+
+          <form :if={@graphs != []} id="graph-form" phx-submit="show-graph" class="stack">
+            <label>
+              Server-owned graph
+              <select name="graph_id" required>
+                <option :for={graph <- @graphs} value={graph.id}>{graph.id}</option>
+              </select>
+            </label>
+            <button type="submit" phx-disable-with="Loading…">Inspect graph</button>
+          </form>
+
+          <div :if={@selected_graph_id} class="actions">
+            <button type="button" class="secondary" phx-click="refresh-graph-overlay">
+              Continue overlay from cursor {@graph_overlay_cursor}
+            </button>
+            <button
+              :if={is_integer(@graph_overlay_recovery_cursor)}
+              type="button"
+              class="secondary"
+              id="resume-graph-overlay"
+              phx-click="resume-graph-overlay"
+            >
+              Resume overlay at retained boundary
+            </button>
+          </div>
+
+          <p :if={@graph_error} class="notice error" id="graph-error" role="alert">
+            {@graph_error}
+          </p>
+          <pre :if={@graph_detail} class="outcome" id="graph-detail" role="status"><%= @graph_detail %></pre>
+          <pre :if={@graph_overlay} class="outcome" id="graph-overlay" role="status"><%= @graph_overlay %></pre>
+        </section>
+
+        <section class="panel stack dashboard-wide" id="trace-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker">Execution metadata</p>
+              <h2>Trace timeline</h2>
+              <p class="muted">
+                The trace store and selector are fixed server-side. Only redacted lifecycle and
+                observability metadata is rendered; prompts, responses, media and tool payloads are excluded.
+              </p>
+            </div>
+            <span class="panel-icon" aria-hidden="true">⋮</span>
+          </div>
+
+          <div class="actions">
+            <button type="button" class="secondary" phx-click="refresh-traces">
+              Continue from cursor {@trace_cursor}
+            </button>
+            <button
+              :if={is_integer(@trace_recovery_cursor)}
+              type="button"
+              class="secondary"
+              id="resume-traces"
+              phx-click="resume-traces"
+            >
+              Resume at retained boundary
+            </button>
+          </div>
+
+          <p :if={@trace_truncated} class="muted" id="trace-truncated">
+            More retained metadata is available after cursor {@trace_cursor}.
+          </p>
+          <p :if={@trace_error} class="notice error" id="trace-error" role="alert">
+            {@trace_error}
+          </p>
+          <pre :if={@trace_timeline} class="outcome" id="trace-timeline" role="status"><%= @trace_timeline %></pre>
+        </section>
+
         <section class="panel stack" id="evaluation-panel">
           <div class="panel-heading">
             <div>
@@ -436,6 +566,115 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
     end
   end
 
+  def handle_event("refresh-graphs", _params, socket) do
+    with {:ok, identity} <- current_identity(socket),
+         {:ok, updated} <- load_graphs(socket, identity) do
+      {:noreply, updated}
+    else
+      {:error, :unauthenticated} -> reauthenticate(socket)
+      _error -> {:noreply, assign(socket, graph_error: "The graph catalog is unavailable.")}
+    end
+  end
+
+  def handle_event("show-graph", %{"graph_id" => graph_id}, socket)
+      when is_binary(graph_id) do
+    with true <- visible_graph?(socket.assigns.graphs, graph_id),
+         {:ok, identity} <- current_identity(socket),
+         {:ok, detail} <- LiveGateway.graph_detail(identity, graph_id),
+         {:ok, detail_json} <-
+           validate_graph_detail(
+             detail,
+             graph_id,
+             socket.assigns.limits[:max_graph_bytes]
+           ) do
+      prepared =
+        assign(socket,
+          selected_graph_id: graph_id,
+          graph_detail: detail_json,
+          graph_overlay: nil,
+          graph_overlay_cursor: 0,
+          graph_overlay_recovery_cursor: nil,
+          graph_error: nil
+        )
+
+      case load_graph_overlay(prepared, identity, graph_id, 0) do
+        {:ok, updated} ->
+          {:noreply, updated}
+
+        {:error, {:replay_gap, recovery}} ->
+          {:noreply,
+           assign(prepared,
+             graph_overlay_recovery_cursor: recovery,
+             graph_error: replay_gap_message("Graph overlay")
+           )}
+
+        {:error, {:cursor_ahead, recovery}} ->
+          {:noreply,
+           assign(prepared,
+             graph_overlay_recovery_cursor: recovery,
+             graph_error: cursor_ahead_message("Graph overlay")
+           )}
+
+        _error ->
+          {:noreply, assign(prepared, graph_error: "The execution overlay is unavailable.")}
+      end
+    else
+      {:error, :unauthenticated} ->
+        reauthenticate(socket)
+
+      _error ->
+        {:noreply, assign(socket, graph_error: "The graph could not be inspected safely.")}
+    end
+  end
+
+  def handle_event("show-graph", _params, socket),
+    do: {:noreply, assign(socket, graph_error: "Invalid graph selection.")}
+
+  def handle_event(
+        "refresh-graph-overlay",
+        _params,
+        %{assigns: %{selected_graph_id: graph_id, graph_overlay_cursor: cursor}} = socket
+      )
+      when is_binary(graph_id) and is_integer(cursor) and cursor >= 0 do
+    continue_graph_overlay(socket, graph_id, cursor)
+  end
+
+  def handle_event(
+        "resume-graph-overlay",
+        _params,
+        %{
+          assigns: %{
+            selected_graph_id: graph_id,
+            graph_overlay_recovery_cursor: cursor
+          }
+        } = socket
+      )
+      when is_binary(graph_id) and is_integer(cursor) and cursor >= 0 do
+    continue_graph_overlay(socket, graph_id, cursor)
+  end
+
+  def handle_event("refresh-graph-overlay", _params, socket),
+    do: {:noreply, assign(socket, graph_error: "Select a visible graph first.")}
+
+  def handle_event("resume-graph-overlay", _params, socket),
+    do: {:noreply, assign(socket, graph_error: "No graph replay gap can be resumed.")}
+
+  def handle_event("refresh-traces", _params, socket) do
+    continue_traces(socket, socket.assigns.trace_cursor)
+  end
+
+  def handle_event(
+        "resume-traces",
+        _params,
+        %{assigns: %{trace_recovery_cursor: cursor}} = socket
+      )
+      when is_integer(cursor) and cursor >= 0 do
+    continue_traces(socket, cursor)
+  end
+
+  def handle_event("resume-traces", _params, socket),
+    do: {:noreply, assign(socket, trace_error: "No trace replay gap can be resumed.")}
+
   def handle_event("show-evaluation", %{"report_id" => report_id}, socket)
       when is_binary(report_id) do
     with true <- visible_evaluation?(socket.assigns.evaluations, report_id),
@@ -555,13 +794,43 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
           evaluation_error: nil
         )
 
-      case load_observability(socket, identity) do
-        {:ok, updated} ->
-          {:ok, updated}
+      socket =
+        case load_observability(socket, identity) do
+          {:ok, updated} ->
+            updated
 
-        {:error, _reason} ->
-          {:ok, assign(socket, observability_error: "Observability is unavailable.")}
-      end
+          {:error, _reason} ->
+            assign(socket, observability_error: "Observability is unavailable.")
+        end
+
+      socket =
+        case load_graphs(socket, identity) do
+          {:ok, updated} -> updated
+          {:error, _reason} -> assign(socket, graph_error: "The graph catalog is unavailable.")
+        end
+
+      socket =
+        case load_trace(socket, identity, 0) do
+          {:ok, updated} ->
+            updated
+
+          {:error, {:replay_gap, recovery}} ->
+            assign(socket,
+              trace_recovery_cursor: recovery,
+              trace_error: replay_gap_message("Trace timeline")
+            )
+
+          {:error, {:cursor_ahead, recovery}} ->
+            assign(socket,
+              trace_recovery_cursor: recovery,
+              trace_error: cursor_ahead_message("Trace timeline")
+            )
+
+          {:error, _reason} ->
+            assign(socket, trace_error: "The trace timeline is unavailable.")
+        end
+
+      {:ok, socket}
     else
       {:error, :unauthenticated} ->
         {:ok, redirect(socket, to: "/auth/login")}
@@ -588,6 +857,390 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
       {:ok, assign(socket, observability: bounded, observability_error: nil)}
     end
   end
+
+  defp load_graphs(socket, identity) do
+    with {:ok, page} <- LiveGateway.list_graphs(identity),
+         {:ok, graphs, truncated} <-
+           validate_graph_catalog(page, socket.assigns.limits[:max_graphs]) do
+      {:ok,
+       assign(socket,
+         graphs: graphs,
+         graph_catalog_truncated: truncated,
+         graph_detail: nil,
+         graph_overlay: nil,
+         selected_graph_id: nil,
+         graph_overlay_cursor: 0,
+         graph_overlay_recovery_cursor: nil,
+         graph_error: nil
+       )}
+    end
+  end
+
+  defp load_graph_overlay(socket, identity, graph_id, cursor) do
+    case LiveGateway.graph_overlay(identity, graph_id, cursor) do
+      {:ok, overlay} ->
+        with {:ok, json, next_cursor} <-
+               validate_graph_overlay(
+                 overlay,
+                 graph_id,
+                 cursor,
+                 socket.assigns.limits
+               ) do
+          {:ok,
+           assign(socket,
+             graph_overlay: json,
+             graph_overlay_cursor: next_cursor,
+             graph_overlay_recovery_cursor: nil,
+             graph_error: nil
+           )}
+        end
+
+      {:error, {:replay_gap, gap}} ->
+        with {:ok, recovery} <- recovery_cursor(gap, :replay_gap) do
+          {:error, {:replay_gap, recovery}}
+        end
+
+      {:error, {:cursor_ahead, gap}} ->
+        with {:ok, recovery} <- recovery_cursor(gap, :cursor_ahead) do
+          {:error, {:cursor_ahead, recovery}}
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp load_trace(socket, identity, cursor) do
+    case LiveGateway.trace_timeline(identity, cursor) do
+      {:ok, timeline} ->
+        with {:ok, json, next_cursor, truncated} <-
+               validate_trace_page(timeline, cursor, socket.assigns.limits) do
+          {:ok,
+           assign(socket,
+             trace_timeline: json,
+             trace_cursor: next_cursor,
+             trace_recovery_cursor: nil,
+             trace_truncated: truncated,
+             trace_error: nil
+           )}
+        end
+
+      {:error, {:replay_gap, gap}} ->
+        with {:ok, recovery} <- recovery_cursor(gap, :replay_gap) do
+          {:error, {:replay_gap, recovery}}
+        end
+
+      {:error, {:cursor_ahead, gap}} ->
+        with {:ok, recovery} <- recovery_cursor(gap, :cursor_ahead) do
+          {:error, {:cursor_ahead, recovery}}
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp continue_graph_overlay(socket, graph_id, cursor) do
+    with {:ok, identity} <- current_identity(socket),
+         {:ok, updated} <- load_graph_overlay(socket, identity, graph_id, cursor) do
+      {:noreply, updated}
+    else
+      {:error, :unauthenticated} ->
+        reauthenticate(socket)
+
+      {:error, {:replay_gap, recovery}} ->
+        {:noreply,
+         assign(socket,
+           graph_overlay_recovery_cursor: recovery,
+           graph_error: replay_gap_message("Graph overlay")
+         )}
+
+      {:error, {:cursor_ahead, recovery}} ->
+        {:noreply,
+         assign(socket,
+           graph_overlay_recovery_cursor: recovery,
+           graph_error: cursor_ahead_message("Graph overlay")
+         )}
+
+      _error ->
+        {:noreply, assign(socket, graph_error: "The execution overlay is unavailable.")}
+    end
+  end
+
+  defp continue_traces(socket, cursor) do
+    with {:ok, identity} <- current_identity(socket),
+         {:ok, updated} <- load_trace(socket, identity, cursor) do
+      {:noreply, updated}
+    else
+      {:error, :unauthenticated} ->
+        reauthenticate(socket)
+
+      {:error, {:replay_gap, recovery}} ->
+        {:noreply,
+         assign(socket,
+           trace_recovery_cursor: recovery,
+           trace_error: replay_gap_message("Trace timeline")
+         )}
+
+      {:error, {:cursor_ahead, recovery}} ->
+        {:noreply,
+         assign(socket,
+           trace_recovery_cursor: recovery,
+           trace_error: cursor_ahead_message("Trace timeline")
+         )}
+
+      _error ->
+        {:noreply, assign(socket, trace_error: "The trace timeline is unavailable.")}
+    end
+  end
+
+  defp validate_graph_catalog(page, maximum) when is_integer(maximum) and maximum > 0 do
+    case metadata_projection(page) do
+      %{"graphs" => graphs, "truncated" => truncated, "next_cursor" => next_cursor}
+      when is_list(graphs) and is_boolean(truncated) ->
+        with true <- length(graphs) <= maximum,
+             true <- is_nil(next_cursor) or valid_id?(next_cursor),
+             {:ok, checked} <- validate_graph_summaries(graphs) do
+          {:ok, checked, truncated}
+        else
+          _other -> {:error, :invalid_gateway_result}
+        end
+
+      _other ->
+        {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp validate_graph_catalog(_page, _maximum), do: {:error, :invalid_gateway_result}
+
+  defp validate_graph_summaries(graphs) do
+    Enum.reduce_while(graphs, {:ok, []}, fn graph, {:ok, acc} ->
+      case graph_summary(graph) do
+        {:ok, checked} -> {:cont, {:ok, [checked | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, checked} -> {:ok, Enum.reverse(checked)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp graph_summary(%{
+         "id" => id,
+         "fingerprint" => fingerprint,
+         "generation" => generation,
+         "updated_at" => updated_at,
+         "encoded_bytes" => encoded_bytes
+       })
+       when is_binary(fingerprint) and byte_size(fingerprint) > 0 and
+              byte_size(fingerprint) <= 128 and is_integer(generation) and generation >= 0 and
+              is_integer(updated_at) and updated_at >= 0 and is_integer(encoded_bytes) and
+              encoded_bytes >= 0 do
+    if valid_id?(id) and String.valid?(fingerprint) do
+      {:ok,
+       %{
+         id: id,
+         fingerprint: fingerprint,
+         generation: generation,
+         updated_at: updated_at,
+         encoded_bytes: encoded_bytes
+       }}
+    else
+      {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp graph_summary(_graph), do: {:error, :invalid_gateway_result}
+
+  defp validate_graph_detail(detail, graph_id, maximum) do
+    projected = metadata_projection(detail)
+
+    with %{"id" => ^graph_id, "graph" => graph} when is_map(graph) <- projected,
+         {:ok, _summary} <- graph_summary(projected),
+         {:ok, json} <- encode_bounded(projected, maximum) do
+      {:ok, json}
+    else
+      _other -> {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp validate_graph_overlay(overlay, graph_id, cursor, limits) do
+    projected = metadata_projection(overlay)
+
+    with %{
+           "content_captured" => false,
+           "graph" => %{"id" => ^graph_id, "graph" => graph},
+           "overlay" => execution_overlay,
+           "trace" => trace
+         }
+         when is_map(graph) and is_map(execution_overlay) <- projected,
+         {:ok, next_cursor, _truncated} <-
+           validate_trace_shape(trace, cursor, limits[:max_trace_events]),
+         {:ok, json} <- encode_bounded(projected, limits[:max_graph_bytes]) do
+      {:ok, json, next_cursor}
+    else
+      _other -> {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp validate_trace_page(page, cursor, limits) do
+    projected = metadata_projection(page)
+
+    with {:ok, next_cursor, truncated} <-
+           validate_trace_shape(projected, cursor, limits[:max_trace_events]),
+         {:ok, json} <- encode_bounded(projected, limits[:max_trace_bytes]) do
+      {:ok, json, next_cursor, truncated}
+    end
+  end
+
+  defp validate_trace_shape(
+         %{
+           "events" => events,
+           "next_cursor" => next_cursor,
+           "oldest_available_cursor" => oldest,
+           "latest_cursor" => latest,
+           "encoded_bytes" => encoded_bytes,
+           "truncated" => truncated
+         },
+         cursor,
+         maximum
+       )
+       when is_list(events) and is_integer(next_cursor) and next_cursor >= cursor and
+              (is_nil(oldest) or (is_integer(oldest) and oldest >= 0)) and is_integer(latest) and
+              latest >= 0 and is_integer(encoded_bytes) and encoded_bytes >= 0 and
+              is_boolean(truncated) and is_integer(maximum) and maximum > 0 do
+    with true <- length(events) <= maximum,
+         true <- valid_trace_events?(events, cursor, next_cursor) do
+      {:ok, next_cursor, truncated}
+    else
+      _other -> {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp validate_trace_shape(_page, _cursor, _maximum),
+    do: {:error, :invalid_gateway_result}
+
+  defp valid_trace_events?(events, after_cursor, next_cursor) do
+    Enum.reduce_while(events, after_cursor, fn event, previous ->
+      case event do
+        %{
+          "cursor" => cursor,
+          "kind" => kind,
+          "timestamp_ms" => timestamp,
+          "identity" => identity,
+          "event" => metadata
+        }
+        when is_integer(cursor) and cursor > previous and cursor <= next_cursor and
+               kind in ["observability", "workflow_lifecycle"] and is_integer(timestamp) and
+               timestamp >= 0 and is_map(identity) and is_map(metadata) ->
+          {:cont, cursor}
+
+        _other ->
+          {:halt, :error}
+      end
+    end) != :error
+  end
+
+  defp recovery_cursor(gap, mode) do
+    case metadata_projection(gap) do
+      %{
+        "oldest_available_cursor" => oldest,
+        "latest_cursor" => latest,
+        "evicted_through" => evicted
+      }
+      when (is_nil(oldest) or (is_integer(oldest) and oldest >= 0)) and is_integer(latest) and
+             latest >= 0 and is_integer(evicted) and evicted >= 0 ->
+        cursor = if mode == :cursor_ahead, do: latest, else: evicted
+        {:ok, cursor}
+
+      _other ->
+        {:error, :invalid_gateway_result}
+    end
+  end
+
+  defp metadata_projection(value) do
+    value
+    |> :adk_secret_redactor.redact()
+    |> normalize_operations(0)
+  catch
+    _kind, _reason -> :invalid
+  end
+
+  defp normalize_operations(_value, depth) when depth >= 16, do: "[omitted]"
+  defp normalize_operations(value, _depth) when is_boolean(value) or is_nil(value), do: value
+  defp normalize_operations(value, _depth) when value in [:null, :undefined], do: nil
+
+  defp normalize_operations(value, _depth) when is_integer(value) or is_float(value), do: value
+
+  defp normalize_operations(value, _depth) when is_binary(value) do
+    if String.valid?(value), do: value, else: "[omitted]"
+  end
+
+  defp normalize_operations(value, _depth) when is_atom(value), do: Atom.to_string(value)
+
+  defp normalize_operations(value, depth) when is_list(value) do
+    Enum.map(value, &normalize_operations(&1, depth + 1))
+  end
+
+  defp normalize_operations(value, depth) when is_map(value) do
+    Enum.reduce(value, %{}, fn {key, item}, acc ->
+      case operations_key(key) do
+        {:ok, public_key} ->
+          if content_key?(public_key) do
+            acc
+          else
+            Map.put(acc, public_key, normalize_operations(item, depth + 1))
+          end
+
+        :error ->
+          acc
+      end
+    end)
+  end
+
+  defp normalize_operations(_value, _depth), do: "[omitted]"
+
+  defp operations_key(key) when is_binary(key) do
+    if String.valid?(key) and byte_size(key) > 0 and byte_size(key) <= 512,
+      do: {:ok, key},
+      else: :error
+  end
+
+  defp operations_key(key) when is_atom(key), do: operations_key(Atom.to_string(key))
+  defp operations_key(_key), do: :error
+
+  defp content_key?(key) when is_binary(key) do
+    normalized = key |> String.downcase() |> String.replace("-", "_")
+    MapSet.member?(@content_keys, normalized)
+  end
+
+  defp content_key?(_key), do: true
+
+  defp encode_bounded(value, maximum)
+       when is_integer(maximum) and maximum > 0 do
+    encoded = Jason.encode!(value, pretty: true)
+
+    if byte_size(encoded) <= maximum,
+      do: {:ok, encoded},
+      else: {:error, :invalid_gateway_result}
+  rescue
+    _error -> {:error, :invalid_gateway_result}
+  end
+
+  defp encode_bounded(_value, _maximum), do: {:error, :invalid_gateway_result}
+
+  defp replay_gap_message(surface),
+    do: "#{surface} has a replay gap. Resume explicitly at the retained boundary."
+
+  defp cursor_ahead_message(surface),
+    do: "#{surface} cursor is ahead of retained data. Resume explicitly at the retained boundary."
 
   defp current_identity(socket) do
     with {:ok, context} <- SessionStore.fetch_context(socket.assigns.auth_session_id) do
@@ -779,6 +1432,7 @@ defmodule ErlangAdkUiWeb.LiveSessionLive do
   end
 
   defp visible_evaluation?(reports, id), do: Enum.any?(reports, &(&1.id == id))
+  defp visible_graph?(graphs, id), do: Enum.any?(graphs, &(&1.id == id))
 
   defp valid_id?(value) when is_binary(value),
     do: byte_size(value) > 0 and byte_size(value) <= 128 and String.valid?(value)

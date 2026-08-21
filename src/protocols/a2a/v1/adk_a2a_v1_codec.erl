@@ -13,6 +13,7 @@
          validate_task/1,
          validate_stream_response/1,
          validate_jsonrpc_request/1,
+         normalize_method_params/2,
          result/2,
          error_response/3,
          error_response/4,
@@ -97,7 +98,9 @@ validate_artifact_fields(Artifact) ->
                 {{ok, _}, {ok, Parts}} when length(Parts) =< ?MAX_PARTS ->
                     case validate_list(Parts, fun validate_part/1, []) of
                         {ok, SafeParts} ->
-                            {ok, Artifact#{<<"parts">> => SafeParts}};
+                            {ok, project_proto(
+                                   artifact,
+                                   Artifact#{<<"parts">> => SafeParts})};
                         {error, Reason} ->
                             {error, {invalid_artifact, <<"parts">>, Reason}}
                     end;
@@ -172,6 +175,16 @@ validate_jsonrpc_request(Request) when is_map(Request) ->
 validate_jsonrpc_request(_) ->
     {error, null, -32600, <<"Request payload validation error">>}.
 
+%% @doc Normalize the original protobuf field names accepted by ProtoJSON
+%% parsers into the canonical lowerCamel JSON names used internally.  Known
+%% request messages are also projected onto their schema fields so ignored
+%% forward-compatible fields cannot leak into retained state or executors.
+-spec normalize_method_params(binary(), map()) ->
+    {ok, map()} | {error, invalid_params}.
+normalize_method_params(Method, Params) when is_map(Params) ->
+    normalize_params(Method, Params);
+normalize_method_params(_, _) -> {error, invalid_params}.
+
 -spec result(term(), term()) -> map().
 result(Id, Value) ->
     #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,
@@ -208,6 +221,136 @@ json_safe(Value) ->
     adk_json:normalize(Value).
 
 %% internal
+
+normalize_params(Method, Params)
+  when Method =:= <<"SendMessage">>;
+       Method =:= <<"SendStreamingMessage">> ->
+    case canonical_object(
+           Params,
+           [{<<"tenant">>, undefined}, {<<"message">>, undefined},
+            {<<"configuration">>, undefined}, {<<"metadata">>, undefined}]) of
+        {ok, Request0} -> normalize_send_configuration(Request0);
+        Error -> Error
+    end;
+normalize_params(<<"GetTask">>, Params) ->
+    canonical_object(
+      Params,
+      [{<<"tenant">>, undefined}, {<<"id">>, undefined},
+       {<<"historyLength">>, <<"history_length">>}]);
+normalize_params(<<"ListTasks">>, Params) ->
+    canonical_object(
+      Params,
+      [{<<"tenant">>, undefined},
+       {<<"contextId">>, <<"context_id">>},
+       {<<"status">>, undefined},
+       {<<"pageSize">>, <<"page_size">>},
+       {<<"pageToken">>, <<"page_token">>},
+       {<<"historyLength">>, <<"history_length">>},
+       {<<"statusTimestampAfter">>, <<"status_timestamp_after">>},
+       {<<"includeArtifacts">>, <<"include_artifacts">>}]);
+normalize_params(<<"CancelTask">>, Params) ->
+    canonical_object(
+      Params,
+      [{<<"tenant">>, undefined}, {<<"id">>, undefined},
+       {<<"metadata">>, undefined}]);
+normalize_params(<<"SubscribeToTask">>, Params) ->
+    canonical_object(
+      Params, [{<<"tenant">>, undefined}, {<<"id">>, undefined}]);
+normalize_params(<<"CreateTaskPushNotificationConfig">>, Params) ->
+    normalize_push_config(Params);
+normalize_params(Method, Params)
+  when Method =:= <<"GetTaskPushNotificationConfig">>;
+       Method =:= <<"DeleteTaskPushNotificationConfig">> ->
+    canonical_object(
+      Params,
+      [{<<"tenant">>, undefined}, {<<"taskId">>, <<"task_id">>},
+       {<<"id">>, undefined}]);
+normalize_params(<<"ListTaskPushNotificationConfigs">>, Params) ->
+    canonical_object(
+      Params,
+      [{<<"tenant">>, undefined}, {<<"taskId">>, <<"task_id">>},
+       {<<"pageSize">>, <<"page_size">>},
+       {<<"pageToken">>, <<"page_token">>}]);
+normalize_params(<<"GetExtendedAgentCard">>, Params) ->
+    canonical_object(Params, [{<<"tenant">>, undefined}]);
+normalize_params(_, Params) -> {ok, Params}.
+
+normalize_send_configuration(Request) ->
+    case maps:find(<<"configuration">>, Request) of
+        error -> {ok, Request};
+        {ok, Configuration} when is_map(Configuration) ->
+            case canonical_object(
+                   Configuration,
+                   [{<<"acceptedOutputModes">>,
+                     <<"accepted_output_modes">>},
+                    {<<"taskPushNotificationConfig">>,
+                     <<"task_push_notification_config">>},
+                    {<<"historyLength">>, <<"history_length">>},
+                    {<<"returnImmediately">>, <<"return_immediately">>}]) of
+                {ok, Configuration0} ->
+                    case maps:find(<<"taskPushNotificationConfig">>,
+                                   Configuration0) of
+                        error ->
+                            {ok, Request#{<<"configuration">> =>
+                                              Configuration0}};
+                        {ok, Push} when is_map(Push) ->
+                            case normalize_push_config(Push) of
+                                {ok, SafePush} ->
+                                    {ok, Request#{
+                                      <<"configuration">> =>
+                                        Configuration0#{
+                                          <<"taskPushNotificationConfig">> =>
+                                            SafePush}}};
+                                Error -> Error
+                            end;
+                        {ok, _} -> {error, invalid_params}
+                    end;
+                Error -> Error
+            end;
+        {ok, _} -> {error, invalid_params}
+    end.
+
+normalize_push_config(Config) ->
+    case canonical_object(
+           Config,
+           [{<<"tenant">>, undefined}, {<<"id">>, undefined},
+            {<<"taskId">>, <<"task_id">>}, {<<"url">>, undefined},
+            {<<"token">>, undefined},
+            {<<"authentication">>, undefined}]) of
+        {ok, Config0} ->
+            case maps:find(<<"authentication">>, Config0) of
+                error -> {ok, Config0};
+                {ok, Authentication} when is_map(Authentication) ->
+                    {ok, Config0#{<<"authentication">> =>
+                                      maps:with([<<"scheme">>,
+                                                 <<"credentials">>],
+                                                Authentication)}};
+                {ok, _} -> {error, invalid_params}
+            end;
+        Error -> Error
+    end.
+
+canonical_object(Map, Fields) ->
+    case canonicalize_aliases(Map, Fields) of
+        {ok, Canonical} ->
+            {ok, maps:with([Key || {Key, _Alias} <- Fields], Canonical)};
+        error -> {error, invalid_params}
+    end.
+
+canonicalize_aliases(Map, []) -> {ok, Map};
+canonicalize_aliases(Map, [{_Canonical, undefined} | Rest]) ->
+    canonicalize_aliases(Map, Rest);
+canonicalize_aliases(Map, [{Canonical, Alias} | Rest]) ->
+    case {maps:find(Canonical, Map), maps:find(Alias, Map)} of
+        {error, error} -> canonicalize_aliases(Map, Rest);
+        {{ok, _Value}, error} -> canonicalize_aliases(Map, Rest);
+        {error, {ok, Value}} ->
+            canonicalize_aliases(
+              (maps:remove(Alias, Map))#{Canonical => Value}, Rest);
+        {{ok, Value}, {ok, Value}} ->
+            canonicalize_aliases(maps:remove(Alias, Map), Rest);
+        {{ok, _}, {ok, _}} -> error
+    end.
 
 validate_card_fields(Card) ->
     Required = [{<<"name">>, binary},
@@ -581,7 +724,7 @@ validate_message_identifiers(Message) ->
                    {ok, Value} -> valid_identifier(Value)
                end
            end, Keys) of
-        true -> {ok, Message};
+        true -> {ok, project_proto(message, Message)};
         false -> {error, {invalid_message, invalid_identifier}}
     end.
 
@@ -627,24 +770,32 @@ validate_part_fields(Part) ->
 
 validate_stream_member(<<"task">>, Response) ->
     case validate_task(maps:get(<<"task">>, Response)) of
-        {ok, Task} -> {ok, Response#{<<"task">> => Task}};
+        {ok, Task} ->
+            {ok, project_proto(stream_response,
+                               Response#{<<"task">> => Task})};
         Error -> Error
     end;
 validate_stream_member(<<"message">>, Response) ->
     case validate_message(maps:get(<<"message">>, Response)) of
-        {ok, Message} -> {ok, Response#{<<"message">> => Message}};
+        {ok, Message} ->
+            {ok, project_proto(stream_response,
+                               Response#{<<"message">> => Message})};
         Error -> Error
     end;
 validate_stream_member(<<"statusUpdate">>, Response) ->
     Update = maps:get(<<"statusUpdate">>, Response),
     case validate_status_update(Update) of
-        {ok, Safe} -> {ok, Response#{<<"statusUpdate">> => Safe}};
+        {ok, Safe} ->
+            {ok, project_proto(stream_response,
+                               Response#{<<"statusUpdate">> => Safe})};
         Error -> Error
     end;
 validate_stream_member(<<"artifactUpdate">>, Response) ->
     Update = maps:get(<<"artifactUpdate">>, Response),
     case validate_artifact_update(Update) of
-        {ok, Safe} -> {ok, Response#{<<"artifactUpdate">> => Safe}};
+        {ok, Safe} ->
+            {ok, project_proto(stream_response,
+                               Response#{<<"artifactUpdate">> => Safe})};
         Error -> Error
     end.
 
@@ -653,8 +804,9 @@ validate_task_fields(Task) ->
           maps:get(<<"status">>, Task, undefined)} of
         {{ok, _}, Status} when is_map(Status) ->
             case validate_status(Status) of
-                ok ->
-                    case validate_optional_task_lists(Task) of
+                {ok, SafeStatus} ->
+                    case validate_optional_task_lists(
+                           Task#{<<"status">> => SafeStatus}) of
                         {ok, SafeTask} -> validate_optional_context(SafeTask);
                         Error -> Error
                     end;
@@ -689,10 +841,10 @@ validate_optional_list(Key, Map, Fun, Max) ->
 
 validate_optional_context(Task) ->
     case maps:find(<<"contextId">>, Task) of
-        error -> {ok, Task};
+        error -> {ok, project_proto(task, Task)};
         {ok, Value} when is_binary(Value), byte_size(Value) > 0,
                          byte_size(Value) =< ?MAX_IDENTIFIER_BYTES ->
-            {ok, Task};
+            {ok, project_proto(task, Task)};
         _ -> {error, {invalid_task, <<"contextId">>,
                       expected_nonempty_binary}}
     end.
@@ -705,10 +857,13 @@ validate_status(Status) ->
         false -> {error, invalid_status};
         true ->
             case Message of
-                undefined -> ok;
+                undefined -> {ok, project_proto(status, Status)};
                 _ ->
                     case validate_message(Message) of
-                        {ok, _} -> ok;
+                        {ok, SafeMessage} ->
+                            {ok, project_proto(
+                                   status,
+                                   Status#{<<"message">> => SafeMessage})};
                         {error, Reason} -> {error, Reason}
                     end
             end
@@ -720,7 +875,10 @@ validate_status_update(Update) when is_map(Update) ->
           maps:get(<<"status">>, Update, undefined)} of
         {{ok, _}, {ok, _}, Status} when is_map(Status) ->
             case validate_status(Status) of
-                ok -> {ok, Update};
+                {ok, SafeStatus} ->
+                    {ok, project_proto(
+                           status_update,
+                           Update#{<<"status">> => SafeStatus})};
                 {error, Reason} ->
                     {error, {invalid_status_update, Reason}}
             end;
@@ -738,7 +896,9 @@ validate_artifact_update(Update) when is_map(Update) ->
                   valid_optional_boolean(<<"append">>, Update),
                   valid_optional_boolean(<<"lastChunk">>, Update)} of
                 {{ok, Artifact}, true, true} ->
-                    {ok, Update#{<<"artifact">> => Artifact}};
+                    {ok, project_proto(
+                           artifact_update,
+                           Update#{<<"artifact">> => Artifact})};
                 _ -> {error, {invalid_artifact_update, invalid_field}}
             end;
         _ -> {error, {invalid_artifact_update, missing_required_field}}
@@ -789,7 +949,7 @@ validate_optional_part_fields(Part) ->
                                   andalso byte_size(Value) =< ?MAX_FIELD_BYTES
                end
            end, Keys) of
-        true -> {ok, Part};
+        true -> {ok, project_proto(part, Part)};
         false -> {error, {invalid_part, invalid_optional_field}}
     end.
 
@@ -847,6 +1007,31 @@ required_nonempty_list(Key, Map) ->
 
 present_members(Keys, Map) ->
     [Key || Key <- Keys, maps:is_key(Key, Map)].
+
+project_proto(message, Map) ->
+    maps:with([<<"messageId">>, <<"contextId">>, <<"taskId">>,
+               <<"role">>, <<"parts">>, <<"metadata">>, <<"extensions">>,
+               <<"referenceTaskIds">>], Map);
+project_proto(part, Map) ->
+    maps:with([<<"text">>, <<"raw">>, <<"url">>, <<"data">>,
+               <<"metadata">>, <<"filename">>, <<"mediaType">>], Map);
+project_proto(artifact, Map) ->
+    maps:with([<<"artifactId">>, <<"name">>, <<"description">>,
+               <<"parts">>, <<"metadata">>, <<"extensions">>], Map);
+project_proto(task, Map) ->
+    maps:with([<<"id">>, <<"contextId">>, <<"status">>,
+               <<"artifacts">>, <<"history">>, <<"metadata">>], Map);
+project_proto(status, Map) ->
+    maps:with([<<"state">>, <<"message">>, <<"timestamp">>], Map);
+project_proto(status_update, Map) ->
+    maps:with([<<"taskId">>, <<"contextId">>, <<"status">>,
+               <<"metadata">>], Map);
+project_proto(artifact_update, Map) ->
+    maps:with([<<"taskId">>, <<"contextId">>, <<"artifact">>,
+               <<"append">>, <<"lastChunk">>, <<"metadata">>], Map);
+project_proto(stream_response, Map) ->
+    maps:with([<<"task">>, <<"message">>, <<"statusUpdate">>,
+               <<"artifactUpdate">>], Map).
 
 within_json_bytes(Value, Max) ->
     try jsx:encode(Value) of

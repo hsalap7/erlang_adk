@@ -17,6 +17,7 @@
     session_svc  :: module(),
     memory_svc   :: adk_service_ref:service_ref() | undefined,
     artifact_svc :: adk_service_ref:service_ref() | undefined,
+    artifact_effect_journal :: map() | undefined,
     credential_store :: undefined | {module(), term()},
     memory_retrieval :: disabled | map(),
     memory_ingestion :: disabled | on_success | map(),
@@ -83,6 +84,9 @@ new(Agent, AppName, SessionSvc, Opts) ->
     ArtifactSvc = validate_service_option(
                     artifact_svc, artifact,
                     maps:get(artifact_svc, Opts, undefined)),
+    ArtifactEffectJournal = validate_artifact_effect_journal(
+                              maps:get(artifact_effect_journal, Opts,
+                                       undefined)),
     CredentialStore = validate_credential_store(
                         maps:get(credential_store, Opts, undefined)),
     MemoryRetrieval = validate_memory_retrieval(
@@ -117,7 +121,7 @@ new(Agent, AppName, SessionSvc, Opts) ->
     ok = validate_service_timeout(ServiceTimeout),
     ok = validate_memory_service_policy(
            MemorySvc, MemoryRetrieval, MemoryIngestion),
-    ok = validate_memory_ingestion_runtime(MemoryIngestion),
+    ok = validate_memory_ingestion_runtime(MemorySvc, MemoryIngestion),
     ok = validate_context_compaction_service(
            SessionSvc, ContextCompaction),
     #runner{
@@ -126,6 +130,7 @@ new(Agent, AppName, SessionSvc, Opts) ->
         session_svc = SessionSvc,
         memory_svc = MemorySvc,
         artifact_svc = ArtifactSvc,
+        artifact_effect_journal = ArtifactEffectJournal,
         credential_store = CredentialStore,
         memory_retrieval = MemoryRetrieval,
         memory_ingestion = MemoryIngestion,
@@ -792,8 +797,11 @@ initialize_context_capability(Runner, UserId, SessionId, InvId, Runtime) ->
               timeout => Runner#runner.service_timeout},
     Spec1 = maybe_put_service(
               memory_service, Runner#runner.memory_svc, Spec0),
+    Spec2 = maybe_put_service(
+              artifact_service, Runner#runner.artifact_svc, Spec1),
     Spec = maybe_put_service(
-             artifact_service, Runner#runner.artifact_svc, Spec1),
+             artifact_effect_journal,
+             Runner#runner.artifact_effect_journal, Spec2),
     Started = case whereis(adk_context_capability_sup) of
         undefined ->
             case adk_context_capability:start(self(), Spec) of
@@ -1671,13 +1679,15 @@ enqueue_transient_memory_ingestion(Runner, UserId, SessionId, Events) ->
 enqueue_durable_memory_ingestion(Runner, UserId, SessionId, Events, Policy) ->
     {Module, _Handle} = Service = Runner#runner.memory_svc,
     Identity = {Module, maps:get(adapter_id, Policy)},
+    Outbox = maps:get(outbox, Policy),
     Request = #{scope => {user, Runner#runner.app_name, UserId},
                 session_id => SessionId,
                 adapter => Identity,
                 events => Events,
                 max_attempts => maps:get(max_attempts, Policy)},
-    Reply = case adk_memory_outbox_sup:register_adapter(Identity, Service) of
-        ok -> adk_memory_outbox_sup:submit(Request);
+    Reply = case adk_memory_outbox_sup:register_adapter(
+                   Outbox, Identity, Service) of
+        ok -> adk_memory_outbox_sup:submit(Outbox, Request);
         {error, _} = RegisterError -> RegisterError
     end,
     case Reply of
@@ -3245,7 +3255,9 @@ encode_context_effect(#{kind := artifact_delta} = Effect) ->
         <<"version">> => maps:get(version, Effect, undefined),
         <<"digest">> => maps:get(digest, Effect, undefined),
         <<"size">> => maps:get(size, Effect, undefined),
-        <<"mime_type">> => maps:get(mime_type, Effect, undefined)});
+        <<"mime_type">> => maps:get(mime_type, Effect, undefined),
+        <<"journal_id">> => maps:get(artifact_journal_id, Effect,
+                                      undefined)});
 encode_context_effect(#{kind := artifact_attachment} = Effect) ->
     compact_effect_map(
       #{<<"kind">> => <<"artifact_attachment">>,
@@ -3654,6 +3666,13 @@ validate_service_option(Option, Kind, Value) ->
             erlang:error({invalid_runner_service, Option, Reason})
     end.
 
+validate_artifact_effect_journal(undefined) -> undefined;
+validate_artifact_effect_journal(Handle) ->
+    case adk_artifact_effect_journal:is_handle(Handle) of
+        true -> Handle;
+        false -> erlang:error(invalid_runner_artifact_effect_journal)
+    end.
+
 validate_credential_store(undefined) ->
     undefined;
 validate_credential_store({Module, Handle}) when is_atom(Module) ->
@@ -3703,30 +3722,39 @@ validate_memory_ingestion(disabled) -> disabled;
 validate_memory_ingestion(on_success) -> on_success;
 validate_memory_ingestion(Policy) when is_map(Policy) ->
     Unknown = maps:keys(
-                maps:without([mode, adapter_id, max_attempts], Policy)),
+                maps:without([mode, adapter_id, max_attempts, outbox], Policy)),
     Mode = maps:get(mode, Policy, undefined),
     AdapterId = maps:get(adapter_id, Policy, undefined),
     MaxAttempts = maps:get(max_attempts, Policy, 5),
+    Outbox = maps:get(outbox, Policy, adk_memory_outbox_sup),
     case {Unknown, Mode,
           is_binary(AdapterId) andalso byte_size(AdapterId) > 0 andalso
               byte_size(AdapterId) =< 256,
           is_integer(MaxAttempts) andalso MaxAttempts > 0 andalso
-              MaxAttempts =< 10} of
-        {[], durable, true, true} ->
+              MaxAttempts =< 10,
+          valid_memory_outbox_ref(Outbox)} of
+        {[], durable, true, true, true} ->
             #{mode => durable, adapter_id => AdapterId,
-              max_attempts => MaxAttempts};
-        {[_ | _], _, _, _} ->
+              max_attempts => MaxAttempts, outbox => Outbox};
+        {[_ | _], _, _, _, _} ->
             erlang:error({invalid_memory_ingestion,
                           {unknown_keys, lists:sort(Unknown)}});
-        {_, InvalidMode, _, _} when InvalidMode =/= durable ->
+        {_, InvalidMode, _, _, _} when InvalidMode =/= durable ->
             erlang:error({invalid_memory_ingestion, mode});
-        {_, _, false, _} ->
+        {_, _, false, _, _} ->
             erlang:error({invalid_memory_ingestion, adapter_id});
-        {_, _, _, false} ->
-            erlang:error({invalid_memory_ingestion, max_attempts})
+        {_, _, _, false, _} ->
+            erlang:error({invalid_memory_ingestion, max_attempts});
+        {_, _, _, _, false} ->
+            erlang:error({invalid_memory_ingestion, outbox})
     end;
 validate_memory_ingestion(Policy) ->
     erlang:error({invalid_memory_ingestion, Policy}).
+
+valid_memory_outbox_ref(Outbox) when is_pid(Outbox) -> true;
+valid_memory_outbox_ref(Outbox) when is_atom(Outbox), Outbox =/= undefined ->
+    true;
+valid_memory_outbox_ref(_) -> false.
 
 validate_context_policy(disabled) ->
     disabled;
@@ -3812,15 +3840,25 @@ validate_memory_service_policy(undefined, _Retrieval, _Ingestion) ->
 validate_memory_service_policy(_MemoryService, _Retrieval, _Ingestion) ->
     ok.
 
-validate_memory_ingestion_runtime(disabled) -> ok;
-validate_memory_ingestion_runtime(on_success) -> ok;
-validate_memory_ingestion_runtime(#{mode := durable}) ->
-    case {whereis(adk_memory_outbox_sup),
-          whereis(adk_memory_outbox_registry),
-          whereis(adk_memory_outbox_processor)} of
-        {Sup, Registry, Processor}
-          when is_pid(Sup), is_pid(Registry), is_pid(Processor) -> ok;
-        _ -> erlang:error(memory_outbox_runtime_required)
+validate_memory_ingestion_runtime(_MemoryService, disabled) -> ok;
+validate_memory_ingestion_runtime(_MemoryService, on_success) -> ok;
+validate_memory_ingestion_runtime(
+  {Module, _Handle} = MemoryService,
+  #{mode := durable, outbox := Outbox, adapter_id := AdapterId}) ->
+    Identity = {Module, AdapterId},
+    case adk_memory_outbox_sup:register_adapter(
+           Outbox, Identity, MemoryService) of
+        ok ->
+            case adk_memory_outbox_sup:health(Outbox) of
+                {ok, #{status := ready}} -> ok;
+                {error, Reason} ->
+                    erlang:error(
+                      {memory_outbox_runtime_required, Reason})
+            end;
+        {error, Reason} ->
+            erlang:error(
+              {memory_outbox_runtime_required,
+               {adapter_registration_failed, Reason}})
     end.
 
 validate_service_timeout(Timeout)
@@ -3903,6 +3941,13 @@ valid_admission_timeout(infinity) -> true;
 valid_admission_timeout(Value) -> is_integer(Value) andalso Value >= 0.
 
 validate_runtime_policy(disabled) -> disabled;
+validate_runtime_policy(#{version := 1} = Policy) ->
+    case adk_runtime_policy:describe(Policy) of
+        #{<<"schema_version">> := 1, <<"status">> := <<"invalid">>} ->
+            erlang:error(invalid_runner_runtime_policy);
+        #{<<"schema_version">> := 1} -> Policy;
+        _ -> erlang:error(invalid_runner_runtime_policy)
+    end;
 validate_runtime_policy(Config) when is_map(Config) ->
     case adk_runtime_policy:compile(Config) of
         {ok, Policy} -> Policy;

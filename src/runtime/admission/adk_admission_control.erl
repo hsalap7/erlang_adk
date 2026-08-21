@@ -15,6 +15,7 @@
          await/2,
          cancel/1, cancel/2,
          release/1, release/2,
+         begin_drain/0, begin_drain/1,
          status/0, status/1,
          deadline_after/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -113,6 +114,15 @@ release(Server, Permit) when is_binary(Permit) ->
     safe_call(Server, {release, Permit});
 release(_Server, _Permit) -> {error, invalid_permit}.
 
+%% @doc Atomically reject new work and fail every queued request. Existing
+%% permit owners are allowed to finish and remain visible through status/1.
+-spec begin_drain() -> {ok, map()} | {error, term()}.
+begin_drain() -> begin_drain(?SERVER).
+
+-spec begin_drain(gen_server:server_ref()) ->
+    {ok, map()} | {error, term()}.
+begin_drain(Server) -> safe_call(Server, begin_drain).
+
 -spec status() -> {ok, map()} | {error, term()}.
 status() -> status(?SERVER).
 
@@ -132,6 +142,8 @@ init(Options) ->
     case normalize_config(Options) of
         {ok, Config} ->
             {ok, #{config => Config,
+                   draining => false,
+                   drain_started_at => undefined,
                    active => #{},
                    request_to_permit => #{},
                    active_by_agent => #{},
@@ -141,6 +153,9 @@ init(Options) ->
         {error, Reason} -> {stop, Reason}
     end.
 
+handle_call({submit, _AgentId, _Options}, _From,
+            #{draining := true} = State) ->
+    {reply, {error, deployment_draining}, State};
 handle_call({submit, AgentId, Options}, From, State0) ->
     Requester = element(1, From),
     case normalize_request(AgentId, Options, Requester,
@@ -183,6 +198,9 @@ handle_call({release, Permit}, _From, State0) ->
             {reply, ok, dispatch(State1)};
         false -> {reply, {error, not_found}, State0}
     end;
+handle_call(begin_drain, _From, State0) ->
+    State1 = enter_drain(State0),
+    {reply, {ok, status_map(State1)}, State1};
 handle_call(status, _From, State0) ->
     State1 = purge_expired(State0),
     {reply, status_map(State1), State1};
@@ -536,7 +554,9 @@ status_map(State) ->
                                         maps:get(agent_id, Request) =:= AgentId]),
                      limit => agent_limit(AgentId, State)}}
                   || AgentId <- AgentIds]),
-    #{global_limit => maps:get(global_limit, Config),
+    #{draining => maps:get(draining, State, false),
+      drain_started_at => maps:get(drain_started_at, State, undefined),
+      global_limit => maps:get(global_limit, Config),
       active => active_count(State),
       available => erlang:max(0, maps:get(global_limit, Config) -
                                   active_count(State)),
@@ -544,6 +564,23 @@ status_map(State) ->
       max_queue => maps:get(max_queue, Config),
       overflow => maps:get(overflow, Config),
       per_agent => PerAgent}.
+
+enter_drain(#{draining := true} = State) -> State;
+enter_drain(State0) ->
+    StartedAt = erlang:system_time(millisecond),
+    State1 = State0#{draining => true, drain_started_at => StartedAt},
+    lists:foldl(
+      fun(RequestRef, StateAcc) ->
+          case maps:find(RequestRef, maps:get(queued, StateAcc)) of
+              {ok, Request} ->
+                  StateNext = remove_queued(RequestRef, StateAcc),
+                  notify(Request, {error, deployment_draining}),
+                  emit(deployment_draining, Request,
+                       elapsed(Request), StateNext),
+                  StateNext;
+              error -> StateAcc
+          end
+      end, State1, maps:get(queue, State1)).
 
 notify(Request, Result) ->
     maps:get(requester, Request) !

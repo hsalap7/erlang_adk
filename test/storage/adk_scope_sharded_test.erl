@@ -85,6 +85,73 @@ memory_mnesia_conformance_and_restart_test() ->
         clear_memory_tables()
     end.
 
+shared_volatile_adapter_preserves_scopes_and_enforces_global_quota_test() ->
+    Config = #{scope_strategy => shared, max_active_scopes => 1},
+    {ok, Artifact} = adk_artifact_sharded:start_link(Config),
+    try
+        {ok, _} = adk_artifact_sharded:put(
+                    Artifact, ?A_SCOPE_A, <<"a">>, <<"one">>, #{}),
+        {ok, _} = adk_artifact_sharded:put(
+                    Artifact, ?A_SCOPE_B, <<"b">>, <<"two">>, #{}),
+        {ok, #{data := <<"one">>}} =
+            adk_artifact_sharded:get(Artifact, ?A_SCOPE_A, <<"a">>, latest),
+        {ok, Capabilities} = adk_artifact_sharded:capabilities(Artifact),
+        ?assertEqual(shared,
+                     maps:get(strategy, maps:get(sharding, Capabilities))),
+        ?assertEqual(true,
+                     maps:get(global_quota, maps:get(quotas,
+                                                      Capabilities))),
+        {ok, #{active_scopes := 1, routing := shared,
+               global_quota := true}} =
+            adk_artifact_sharded:status(Artifact)
+    after
+        ok = adk_artifact_sharded:stop(Artifact)
+    end,
+    {ok, Memory} = adk_memory_sharded:start_link(Config),
+    try
+        {ok, _} = add_memory_entry(
+                    Memory, ?M_SCOPE_A, <<"shared-a">>, <<"one marker">>),
+        {ok, _} = add_memory_entry(
+                    Memory, ?M_SCOPE_B, <<"shared-b">>, <<"two marker">>),
+        {ok, [_]} = adk_memory_sharded:search(
+                      Memory, ?M_SCOPE_A, <<"one marker">>, #{limit => 5}),
+        MemoryCapabilities = adk_memory_sharded:capabilities(Memory),
+        ?assertEqual(shared_adapter,
+                     maps:get(quota_scope, MemoryCapabilities)),
+        ?assertEqual(true, maps:get(global_quota, MemoryCapabilities))
+    after
+        ok = adk_memory_sharded:stop(Memory)
+    end.
+
+durable_exact_scope_reclaims_idle_capacity_without_data_loss_test() ->
+    Root = temp_root("artifact-idle-reclaim"),
+    Config = #{adapter => adk_artifact_fs,
+               adapter_config => #{root => Root},
+               max_active_scopes => 1,
+               idle_scope_timeout_ms => 10},
+    try
+        {ok, Artifact} = adk_artifact_sharded:start_link(Config),
+        try
+            {ok, _} = adk_artifact_sharded:put(
+                        Artifact, ?A_SCOPE_A, <<"a">>, <<"one">>, #{}),
+            receive after 30 -> ok end,
+            {ok, _} = adk_artifact_sharded:put(
+                        Artifact, ?A_SCOPE_B, <<"b">>, <<"two">>, #{}),
+            receive after 30 -> ok end,
+            {ok, #{data := <<"one">>}} =
+                adk_artifact_sharded:get(
+                  Artifact, ?A_SCOPE_A, <<"a">>, latest),
+            {ok, #{active_scopes := 1, idle_reclamation := true,
+                   idle_evictions := Evictions}} =
+                adk_artifact_sharded:status(Artifact),
+            ?assert(Evictions >= 2)
+        after
+            ok = adk_artifact_sharded:stop(Artifact)
+        end
+    after
+        _ = file:del_dir_r(Root)
+    end.
+
 same_scope_reuses_one_worker_test() ->
     Config = probe_artifact_config(false, 10, 32),
     {ok, Handle = {adk_scope_shard, Router, _RoutingTable,
@@ -221,6 +288,131 @@ killed_cold_route_caller_releases_admission_test() ->
         ?assertEqual(0, maps:get(cold_routes_in_flight, Status))
     after
         _ = catch sys:resume(Router),
+        _ = adk_artifact_sharded:stop(Handle)
+    end.
+
+timed_out_queued_route_cannot_create_stale_shard_test() ->
+    {ok, Handle = {adk_scope_shard, Router, _RoutingTable,
+                   RouteAdmission, 1}} =
+        adk_artifact_sharded:start_link(
+          #{max_active_scopes => 1, max_router_queue => 1}),
+    ok = sys:suspend(Router),
+    Parent = self(),
+    Caller = spawn(fun() ->
+        Result = adk_artifact_sharded:put(
+                   Handle, ?A_SCOPE_A, <<"timed-out">>, <<"one">>, #{},
+                   #{timeout_ms => 20}),
+        Parent ! {timed_out_route_result, self(), Result},
+        receive stop -> ok end
+    end),
+    try
+        ok = await_atomic_value(RouteAdmission, 1, 100),
+        receive
+            {timed_out_route_result, Caller, {error, timeout}} -> ok
+        after 1000 -> ?assert(false)
+        end,
+        ?assert(is_process_alive(Caller)),
+        ok = await_atomic_value(RouteAdmission, 0, 100),
+        ok = sys:resume(Router),
+        {ok, #{active_scopes := 0}} =
+            adk_artifact_sharded:status(Handle),
+        {ok, _} = adk_artifact_sharded:put(
+                    Handle, ?A_SCOPE_B, <<"survivor">>, <<"two">>, #{}),
+        {ok, #{active_scopes := 1}} =
+            adk_artifact_sharded:status(Handle)
+    after
+        Caller ! stop,
+        _ = catch sys:resume(Router),
+        _ = adk_artifact_sharded:stop(Handle)
+    end.
+
+dropped_cold_reply_releases_lease_and_recovers_capacity_test() ->
+    Config = durable_probe_artifact_config(false, 1, 1, 10),
+    {ok, Handle = {adk_scope_shard, Router, RoutingTable,
+                   RouteAdmission, 1}} =
+        adk_artifact_sharded:start_link(Config),
+    flush_probe_messages(),
+    ok = sys:suspend(Router),
+    Caller = spawn(fun() ->
+        _ = adk_artifact_sharded:put(
+              Handle, ?A_SCOPE_A, <<"abandoned">>, <<>>, #{},
+              #{timeout_ms => 1000}),
+        receive stop -> ok end
+    end),
+    try
+        ok = await_atomic_value(RouteAdmission, 1, 100),
+        true = erlang:suspend_process(Caller),
+        ok = sys:resume(Router),
+        {probe_started, WorkerA, artifact} = receive_probe_started(),
+        {ok, {?A_SCOPE_A, adk_scope_shard_delay_probe,
+              WorkerA, WorkerLease}} =
+            await_route_entry(RoutingTable, ?A_SCOPE_A, 100),
+        ok = await_atomic_index(WorkerLease, 2, 1, 100),
+        CallerMonitor = erlang:monitor(process, Caller),
+        exit(Caller, kill),
+        receive
+            {'DOWN', CallerMonitor, process, Caller, killed} -> ok
+        after 1000 -> ?assert(false)
+        end,
+        ok = await_atomic_index(WorkerLease, 2, 0, 100),
+        ok = await_atomic_value(RouteAdmission, 0, 100),
+        receive after 30 -> ok end,
+        {ok, _} = adk_artifact_sharded:put(
+                    Handle, ?A_SCOPE_B, <<"replacement">>, <<>>, #{}),
+        {ok, #{active_scopes := 1, idle_evictions := Evictions}} =
+            adk_artifact_sharded:status(Handle),
+        ?assert(Evictions >= 1)
+    after
+        _ = catch erlang:resume_process(Caller),
+        exit(Caller, kill),
+        _ = catch sys:resume(Router),
+        _ = adk_artifact_sharded:stop(Handle)
+    end.
+
+killed_adapter_borrower_releases_lease_and_recovers_capacity_test() ->
+    Config = durable_probe_artifact_config(true, 1, 2, 10),
+    {ok, Handle = {adk_scope_shard, _Router, RoutingTable,
+                   _RouteAdmission, _MaxQueue}} =
+        adk_artifact_sharded:start_link(Config),
+    flush_probe_messages(),
+    Parent = self(),
+    CallerA = spawn(fun() ->
+        Result = adk_artifact_sharded:put(
+                   Handle, ?A_SCOPE_A, <<"in-flight">>, <<>>, #{},
+                   #{timeout_ms => 5000}),
+        Parent ! {borrower_a_result, self(), Result}
+    end),
+    try
+        {WorkerA, _OptionsA} = receive_probe_scope(?A_SCOPE_A),
+        [{?A_SCOPE_A, adk_scope_shard_delay_probe, WorkerA, WorkerLease}] =
+            ets:lookup(RoutingTable, ?A_SCOPE_A),
+        ok = await_atomic_index(WorkerLease, 2, 1, 100),
+        CallerMonitor = erlang:monitor(process, CallerA),
+        exit(CallerA, kill),
+        receive
+            {'DOWN', CallerMonitor, process, CallerA, killed} -> ok
+        after 1000 -> ?assert(false)
+        end,
+        ok = await_atomic_index(WorkerLease, 2, 0, 100),
+        receive after 30 -> ok end,
+        CallerB = spawn(fun() ->
+            Result = adk_artifact_sharded:put(
+                       Handle, ?A_SCOPE_B, <<"replacement">>, <<>>, #{},
+                       #{timeout_ms => 1000}),
+            Parent ! {borrower_b_result, self(), Result}
+        end),
+        {WorkerB, _OptionsB} = receive_probe_scope(?A_SCOPE_B),
+        ?assertNotEqual(WorkerA, WorkerB),
+        WorkerB ! {probe_release, ?A_SCOPE_B},
+        receive
+            {borrower_b_result, CallerB, {ok, _}} -> ok
+        after 1500 -> ?assert(false)
+        end,
+        {ok, #{active_scopes := 1, idle_evictions := Evictions}} =
+            adk_artifact_sharded:status(Handle),
+        ?assert(Evictions >= 1)
+    after
+        exit(CallerA, kill),
         _ = adk_artifact_sharded:stop(Handle)
     end.
 
@@ -397,6 +589,12 @@ probe_artifact_config(Barrier, MaxScopes, MaxQueue) ->
       max_active_scopes => MaxScopes,
       max_router_queue => MaxQueue}.
 
+durable_probe_artifact_config(Barrier, MaxScopes, MaxQueue, IdleTimeout) ->
+    Config = probe_artifact_config(Barrier, MaxScopes, MaxQueue),
+    AdapterConfig = maps:get(adapter_config, Config),
+    Config#{adapter_config => AdapterConfig#{persistence => filesystem},
+            idle_scope_timeout_ms => IdleTimeout}.
+
 receive_probe_started() ->
     receive
         Message = {probe_started, _Pid, _Mode} -> Message
@@ -442,11 +640,26 @@ await_router_queue(Router, Minimum, Attempts) ->
 await_atomic_value(_Admission, _Expected, 0) ->
     {error, timeout};
 await_atomic_value(Admission, Expected, Attempts) ->
-    case atomics:get(Admission, 1) of
+    await_atomic_index(Admission, 1, Expected, Attempts).
+
+await_atomic_index(_Atomics, _Index, _Expected, 0) ->
+    {error, timeout};
+await_atomic_index(Atomics, Index, Expected, Attempts) ->
+    case atomics:get(Atomics, Index) of
         Expected -> ok;
         _ ->
             receive after 5 -> ok end,
-            await_atomic_value(Admission, Expected, Attempts - 1)
+            await_atomic_index(Atomics, Index, Expected, Attempts - 1)
+    end.
+
+await_route_entry(_RoutingTable, _Scope, 0) ->
+    {error, timeout};
+await_route_entry(RoutingTable, Scope, Attempts) ->
+    case ets:lookup(RoutingTable, Scope) of
+        [Entry] -> {ok, Entry};
+        [] ->
+            receive after 5 -> ok end,
+            await_route_entry(RoutingTable, Scope, Attempts - 1)
     end.
 
 await_ready_callers(0) -> ok;

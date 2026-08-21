@@ -67,6 +67,35 @@ stream_response_requires_one_member_test() ->
                               #{<<"task">> => #{},
                                 <<"message">> => #{}})).
 
+protojson_unknown_fields_are_ignored_not_retained_test() ->
+    Input = #{<<"messageId">> => <<"forward-compatible">>,
+              <<"role">> => <<"ROLE_USER">>,
+              <<"parts">> => [#{<<"text">> => <<"hello">>,
+                                 <<"futurePartField">> => 1}],
+              <<"tckUnknownField">> => <<"must-not-leak">>},
+    {ok, Safe} = adk_a2a_v1_codec:validate_message(Input),
+    ?assertEqual(false, maps:is_key(<<"tckUnknownField">>, Safe)),
+    [Part] = maps:get(<<"parts">>, Safe),
+    ?assertEqual(false, maps:is_key(<<"futurePartField">>, Part)).
+
+protojson_request_aliases_are_canonical_and_conflicts_fail_test() ->
+    {ok, List} = adk_a2a_v1_codec:normalize_method_params(
+                   <<"ListTasks">>,
+                   #{<<"context_id">> => <<"ctx">>,
+                     <<"page_size">> => 2,
+                     <<"include_artifacts">> => false,
+                     <<"unknown">> => true}),
+    ?assertEqual(<<"ctx">>, maps:get(<<"contextId">>, List)),
+    ?assertEqual(2, maps:get(<<"pageSize">>, List)),
+    ?assertEqual(false, maps:get(<<"includeArtifacts">>, List)),
+    ?assertEqual(false, maps:is_key(<<"context_id">>, List)),
+    ?assertEqual(false, maps:is_key(<<"unknown">>, List)),
+    ?assertEqual(
+       {error, invalid_params},
+       adk_a2a_v1_codec:normalize_method_params(
+         <<"ListTasks">>,
+         #{<<"contextId">> => <<"one">>, <<"context_id">> => <<"two">>})).
+
 non_json_terms_are_rejected_test() ->
     ?assertMatch({error, _}, adk_a2a_v1_codec:validate_message(
                               #{<<"messageId">> => <<"m">>,

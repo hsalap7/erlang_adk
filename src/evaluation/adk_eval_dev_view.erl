@@ -7,10 +7,10 @@
 -module(adk_eval_dev_view).
 -compile({no_auto_import, [error/1]}).
 
+-include("adk_eval_report.hrl").
+
 -export([classify/1, render/3, compare/3]).
 
--define(DEFAULT_MAX_OUTPUT_BYTES, 1048576).
--define(MAX_OUTPUT_BYTES, 16777216).
 -define(MAX_TOLERANCES, 1000).
 
 -type kind() :: eval_result | baseline_comparison.
@@ -31,13 +31,17 @@ classify(_) ->
 render(Value, FormatInput, Options) ->
     case classify(Value) of
         {error, _} = Error -> Error;
-        {ok, _Kind, Canonical} ->
+        {ok, Kind, Canonical} ->
             case {render_format(FormatInput), render_options(Options)} of
-                {{ok, Format}, {ok, MaxBytes}} ->
-                    case adk_eval_set:report(Canonical, Format) of
+                {{ok, Format}, {ok, RenderOptions}} ->
+                    MaxBytes = maps:get(max_output_bytes, RenderOptions),
+                    case render_checked(Kind, Canonical, Format,
+                                        RenderOptions) of
                         {ok, Output} when byte_size(Output) =< MaxBytes ->
                             {ok, Output};
                         {ok, _Output} -> error(output_limit_exceeded);
+                        {error, eval_export_byte_limit_exceeded} ->
+                            error(output_limit_exceeded);
                         {error, _} -> error(render_failed)
                     end;
                 {{error, _} = Error, _} -> Error;
@@ -108,16 +112,45 @@ classify_comparison(_) ->
 
 render_format(<<"json">>) -> {ok, json};
 render_format(<<"markdown">>) -> {ok, markdown};
+render_format(<<"junit">>) -> {ok, junit};
+render_format(<<"sarif">>) -> {ok, sarif};
+render_format(<<"annotations">>) -> {ok, annotations};
 render_format(_) -> error(invalid_format).
 
 render_options(Options) ->
     case bounded_json(Options) of
         ok when is_map(Options) ->
-            case only_allowed_keys(Options, [<<"max_output_bytes">>]) of
-                true -> max_output_bytes(Options);
+            case only_allowed_keys(
+                   Options, [<<"max_output_bytes">>, <<"suite_name">>]) of
+                true -> normalize_render_options(Options);
                 false -> error(invalid_options)
             end;
         _ -> error(invalid_options)
+    end.
+
+normalize_render_options(Options) ->
+    Suite = maps:get(<<"suite_name">>, Options, <<"erlang_adk_eval">>),
+    case max_output_bytes(Options) of
+        {error, _} = Error -> Error;
+        {ok, MaxBytes} when is_binary(Suite) ->
+            case valid_text(Suite) of
+                true ->
+                    {ok, #{max_output_bytes => MaxBytes,
+                           suite_name => Suite}};
+                false -> error(invalid_options)
+            end;
+        {ok, _MaxBytes} -> error(invalid_options)
+    end.
+
+render_checked(Kind, Canonical, Format, Options) ->
+    case (Kind =:= eval_result)
+         orelse (Format =:= json) orelse (Format =:= markdown) of
+        true ->
+            adk_eval_export:render(
+              Canonical, Format,
+              #{suite_name => maps:get(suite_name, Options),
+                max_bytes => maps:get(max_output_bytes, Options)});
+        false -> error(render_failed)
     end.
 
 comparison_options(Options) ->
@@ -146,9 +179,9 @@ normalize_comparison_options(Options) ->
 
 max_output_bytes(Options) ->
     Value = maps:get(<<"max_output_bytes">>, Options,
-                     ?DEFAULT_MAX_OUTPUT_BYTES),
+                     ?ADK_EVAL_REPORT_MAX_BYTES),
     case is_integer(Value) andalso Value > 0
-         andalso Value =< ?MAX_OUTPUT_BYTES of
+         andalso Value =< ?ADK_EVAL_REPORT_MAX_BYTES of
         true -> {ok, Value};
         false -> error(invalid_output_limit)
     end.
@@ -211,5 +244,10 @@ valid_fraction(Value) when is_integer(Value) ->
 valid_fraction(Value) when is_float(Value) ->
     Value =:= Value andalso Value >= 0.0 andalso Value =< 1.0;
 valid_fraction(_) -> false.
+
+valid_text(Value) when is_binary(Value), byte_size(Value) > 0,
+                       byte_size(Value) =< 256 ->
+    valid_utf8(Value);
+valid_text(_) -> false.
 
 error(Code) -> {error, {eval_dev_view, Code}}.

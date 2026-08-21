@@ -157,7 +157,7 @@ handle_call({operation, Token, Operation, Request}, _From,
 handle_call({take_effects, RootToken, CallId}, {From, _},
             #state{owner = From, root_token = RootToken,
                    effects = Effects, tokens = Tokens,
-                   prepared_effects = Prepared} = State) ->
+                   prepared_effects = Prepared, spec = Spec} = State) ->
     case lists:member(CallId, maps:values(Prepared)) of
         true ->
             {reply, {error, context_effects_already_prepared}, State};
@@ -166,15 +166,21 @@ handle_call({take_effects, RootToken, CallId}, {From, _},
                                       fun(#{call_id := Seen}) ->
                                               Seen =:= CallId
                                       end, Effects),
-            Public = [maps:remove(call_id, Effect)
+            Public = [public_effect(Effect)
                       || Effect <- lists:reverse(Selected)],
-            %% Compatibility drain remains atomic. Runner uses the staged
-            %% prepare/commit protocol so persistence happens between them.
-            RemainingTokens = revoke_call_tokens(
-                                Tokens, RootToken, CallId),
-            {reply, {ok, Public},
-             State#state{effects = Remaining,
-                         tokens = RemainingTokens}}
+            %% The compatibility drain has commit semantics. When journaling
+            %% is enabled, never discard a staged effect until its durable row
+            %% has reached committed.
+            case commit_journal_effects(Selected, Spec) of
+                ok ->
+                    RemainingTokens = revoke_call_tokens(
+                                        Tokens, RootToken, CallId),
+                    {reply, {ok, Public},
+                     State#state{effects = Remaining,
+                                 tokens = RemainingTokens}};
+                {error, Reason} ->
+                    {reply, {error, Reason}, State}
+            end
     end;
 handle_call({take_effects, _RootToken, _CallId}, _From, State) ->
     {reply, {error, context_capability_owner_required}, State};
@@ -190,7 +196,7 @@ handle_call({prepare_effects, RootToken, CallId}, {From, _},
         false ->
             Selected = [Effect || Effect = #{call_id := Seen} <- Effects,
                                   Seen =:= CallId],
-            Public = [maps:remove(call_id, Effect)
+            Public = [public_effect(Effect)
                       || Effect <- lists:reverse(Selected)],
             RemainingTokens = revoke_call_tokens(
                                 Tokens, RootToken, CallId),
@@ -211,15 +217,25 @@ handle_call({prepare_effects, _RootToken, _CallId}, _From, State) ->
 handle_call({commit_effects, RootToken, Receipt}, {From, _},
             #state{owner = From, root_token = RootToken,
                    effects = Effects,
-                   prepared_effects = Prepared} = State) ->
-    case maps:take(Receipt, Prepared) of
-        {CallId, RemainingPrepared} ->
-            RemainingEffects = [Effect || Effect = #{call_id := Seen}
-                                             <- Effects,
-                                          Seen =/= CallId],
-            {reply, ok,
-             State#state{effects = RemainingEffects,
-                         prepared_effects = RemainingPrepared}};
+                   prepared_effects = Prepared, spec = Spec} = State) ->
+    case maps:find(Receipt, Prepared) of
+        {ok, CallId} ->
+            Selected = [Effect || Effect = #{call_id := Seen} <- Effects,
+                                  Seen =:= CallId],
+            case commit_journal_effects(Selected, Spec) of
+                ok ->
+                    RemainingEffects =
+                        [Effect || Effect = #{call_id := Seen} <- Effects,
+                                   Seen =/= CallId],
+                    {reply, ok,
+                     State#state{
+                       effects = RemainingEffects,
+                       prepared_effects = maps:remove(Receipt, Prepared)}};
+                {error, Reason} ->
+                    %% Keep both the receipt and effects retryable. Journal
+                    %% commits are idempotent, including partial batches.
+                    {reply, {error, Reason}, State}
+            end;
         error ->
             {reply, {error, invalid_context_effect_receipt}, State}
     end;
@@ -270,16 +286,19 @@ code_change(_OldVersion, State, _Extra) -> {ok, State}.
 
 normalize_spec(Spec) ->
     Allowed = [identity, session_service, artifact_service, artifact_scope,
+               artifact_effect_journal,
                memory_service, memory_scope, timeout],
     Unknown = maps:keys(maps:without(Allowed, Spec)),
     Timeout = maps:get(timeout, Spec, 5000),
     case {Unknown, is_integer(Timeout) andalso Timeout > 0,
           valid_identity(maps:get(identity, Spec, #{})),
           valid_optional_service(maps:get(artifact_service, Spec, undefined)),
+          valid_optional_artifact_journal(
+            maps:get(artifact_effect_journal, Spec, undefined)),
           valid_optional_service(maps:get(memory_service, Spec, undefined)),
           valid_optional_session_service(
             maps:get(session_service, Spec, undefined))} of
-        {[], true, true, true, true, true} ->
+        {[], true, true, true, true, true, true} ->
             {ok, Spec#{timeout => Timeout,
                        session_service => maps:get(
                                             session_service, Spec,
@@ -287,6 +306,9 @@ normalize_spec(Spec) ->
                        artifact_service => maps:get(
                                             artifact_service, Spec,
                                             undefined),
+                       artifact_effect_journal => maps:get(
+                                                    artifact_effect_journal,
+                                                    Spec, undefined),
                        memory_service => maps:get(
                                           memory_service, Spec,
                                           undefined),
@@ -295,13 +317,16 @@ normalize_spec(Spec) ->
                                            undefined),
                        memory_scope => maps:get(memory_scope, Spec,
                                                 undefined)}};
-        {[_ | _], _, _, _, _, _} ->
+        {[_ | _], _, _, _, _, _, _} ->
             {error, {unknown_context_capability_options,
                      lists:sort(Unknown)}};
-        {_, false, _, _, _, _} -> {error, invalid_context_capability_timeout};
-        {_, _, false, _, _, _} -> {error, invalid_context_identity};
-        {_, _, _, false, _, _} -> {error, invalid_artifact_service};
-        {_, _, _, _, false, _} -> {error, invalid_memory_service};
+        {_, false, _, _, _, _, _} ->
+            {error, invalid_context_capability_timeout};
+        {_, _, false, _, _, _, _} -> {error, invalid_context_identity};
+        {_, _, _, false, _, _, _} -> {error, invalid_artifact_service};
+        {_, _, _, _, false, _, _} ->
+            {error, invalid_artifact_effect_journal};
+        {_, _, _, _, _, false, _} -> {error, invalid_memory_service};
         _ -> {error, invalid_session_service}
     end.
 
@@ -317,6 +342,10 @@ valid_optional_service(undefined) -> true;
 valid_optional_service({Module, Handle}) ->
     is_atom(Module) andalso Handle =/= undefined;
 valid_optional_service(_) -> false.
+
+valid_optional_artifact_journal(undefined) -> true;
+valid_optional_artifact_journal(Handle) ->
+    adk_artifact_effect_journal:is_handle(Handle).
 
 valid_optional_session_service(undefined) -> true;
 valid_optional_session_service(Module) -> is_atom(Module).
@@ -380,12 +409,126 @@ execute_artifact(Operation, Request, Grant,
             Service = maps:get(artifact_service, Spec),
             Scope = maps:get(artifact_scope, Spec, undefined),
             Timeout = maps:get(timeout, Spec),
-            case artifact_call(Operation, Service, Scope, Request, Timeout) of
+            Journal = maps:get(artifact_effect_journal, Spec, undefined),
+            JournalSequence = next_journal_sequence(Grant, State),
+            case artifact_call_with_journal(
+                   Operation, Service, Scope, Request, Timeout,
+                   Journal, maps:get(identity, Spec), Grant,
+                   JournalSequence) of
                 {Reply, none} -> {reply, Reply, State};
                 {Reply, Effect} ->
                     add_effect_reply(Reply, Effect, Grant, State)
             end
     end.
+
+artifact_call_with_journal(Operation, Service, Scope, Request, Timeout,
+                           undefined, _Identity, _Grant, _Sequence) ->
+    artifact_call(Operation, Service, Scope, Request, Timeout);
+artifact_call_with_journal(artifact_put, Service, Scope,
+                           #{name := Name, data := Data,
+                             options := Options} = Request,
+                           Timeout, Journal, Identity, Grant, Sequence) ->
+    case adk_artifact_core:validate_put(Scope, Name, Data, Options) of
+        {ok, MimeType, _Metadata} ->
+            Intent = artifact_intent(
+                       put, Scope, Name,
+                       adk_artifact_core:digest(Data),
+                       #{mime_type => MimeType, size => byte_size(Data)},
+                       Identity, Grant, Sequence),
+            journaled_artifact_call(
+              Journal, Intent,
+              fun() -> artifact_call(
+                         artifact_put, Service, Scope, Request, Timeout)
+              end);
+        {error, _} = Error -> {Error, none}
+    end;
+artifact_call_with_journal(artifact_delete, Service, Scope,
+                           #{name := Name, selector := Selector} = Request,
+                           Timeout, Journal, Identity, Grant, Sequence) ->
+    case adk_artifact_core:validate_delete(Scope, Name, Selector) of
+        ok ->
+            Digest = adk_artifact_core:digest(
+                       term_to_binary({Name, Selector}, [deterministic])),
+            Intent = artifact_intent(
+                       delete, Scope, Name, Digest,
+                       #{selector => journal_selector(Selector)},
+                       Identity, Grant, Sequence),
+            journaled_artifact_call(
+              Journal, Intent,
+              fun() -> artifact_call(
+                         artifact_delete, Service, Scope, Request, Timeout)
+              end);
+        {error, _} = Error -> {Error, none}
+    end;
+artifact_call_with_journal(Operation, Service, Scope, Request, Timeout,
+                           _Journal, _Identity, _Grant, _Sequence) ->
+    artifact_call(Operation, Service, Scope, Request, Timeout).
+
+journaled_artifact_call(Journal, Intent, Call) ->
+    case adk_artifact_effect_journal:record_intent(Journal, Intent) of
+        {ok, #{effect_id := EffectId, deduplicated := false}} ->
+            case Call() of
+                {Reply, Effect} when is_map(Effect) ->
+                    Receipt = artifact_journal_receipt(Effect),
+                    Scope = maps:get(scope, Intent),
+                    case adk_artifact_effect_journal:effect_applied(
+                           Journal, Scope, EffectId, Receipt) of
+                        {ok, _} ->
+                            {Reply,
+                             Effect#{artifact_journal_id => EffectId,
+                                     artifact_journal_receipt => Receipt}};
+                        {error, _} ->
+                            %% The service may already have committed. Do not
+                            %% return success or stage an unjournaled effect;
+                            %% the durable intent is left for reconciliation.
+                            {{error, artifact_effect_journal_unavailable},
+                             none}
+                    end;
+                {Reply, none} ->
+                    %% Adapter failures can be ambiguous (for example a
+                    %% deadline after the remote store committed). Preserve
+                    %% the intent for bounded orphan reconciliation.
+                    {Reply, none}
+            end;
+        {ok, #{deduplicated := true}} ->
+            %% Never repeat an external mutation after a crash window. The
+            %% existing row contains the only safe source of truth.
+            {{error, artifact_effect_pending_reconciliation}, none};
+        {error, _} ->
+            {{error, artifact_effect_journal_unavailable}, none};
+        _ ->
+            {{error, artifact_effect_journal_unavailable}, none}
+    end.
+
+artifact_intent(Operation, Scope, Name, Digest, Metadata,
+                Identity, Grant, Sequence) ->
+    InvocationId = maps:get(invocation_id, Identity),
+    CallId = maps:get(call_id, Grant, undefined),
+    Idempotency = adk_artifact_core:digest(
+                    term_to_binary(
+                      {InvocationId, CallId, Sequence, Operation, Name},
+                      [deterministic])),
+    #{scope => Scope, operation => Operation, resource_id => Name,
+      request_digest => Digest, idempotency_key => Idempotency,
+      metadata => Metadata}.
+
+next_journal_sequence(Grant, #state{effects = Effects}) ->
+    CallId = maps:get(call_id, Grant, undefined),
+    1 + length([ok || #{call_id := Seen} <- Effects,
+                       Seen =:= CallId]).
+
+journal_selector(Selector) when is_atom(Selector) ->
+    atom_to_binary(Selector, utf8);
+journal_selector(Selector) -> Selector.
+
+artifact_journal_receipt(Effect) ->
+    maps:filter(
+      fun(_Key, Value) -> Value =/= undefined end,
+      #{operation => atom_to_binary(maps:get(operation, Effect), utf8),
+        version => maps:get(version, Effect, undefined),
+        digest => maps:get(digest, Effect, undefined),
+        size => maps:get(size, Effect, undefined),
+        mime_type => maps:get(mime_type, Effect, undefined)}).
 
 artifact_call(artifact_put, {Module, _} = Service, Scope,
               #{name := Name, data := Data, options := Options}, Timeout) ->
@@ -800,6 +943,36 @@ prepare_effect_storage(
     end;
 prepare_effect_storage(Effect, State) ->
     {ok, Effect, State}.
+
+public_effect(Effect) ->
+    maps:without([call_id, artifact_journal_receipt], Effect).
+
+commit_journal_effects(Effects,
+                       #{artifact_effect_journal := Journal})
+  when Journal =/= undefined ->
+    commit_journal_effects(Effects, Journal, ok);
+commit_journal_effects(_Effects, _Spec) -> ok.
+
+commit_journal_effects([], _Journal, Result) -> Result;
+commit_journal_effects(_Effects, _Journal, {error, _} = Error) -> Error;
+commit_journal_effects(
+  [#{artifact_journal_id := EffectId,
+     artifact_journal_receipt := Receipt,
+     scope := Scope} | Rest], Journal, ok) ->
+    Result = case adk_artifact_effect_journal:commit(
+                    Journal, Scope, EffectId, Receipt) of
+        {ok, _} -> ok;
+        {error, _} -> {error, artifact_effect_journal_unavailable};
+        _ -> {error, artifact_effect_journal_unavailable}
+    end,
+    commit_journal_effects(Rest, Journal, Result);
+commit_journal_effects(
+  [#{kind := artifact_delta, operation := Operation} | _Rest],
+  _Journal, ok)
+  when Operation =:= put; Operation =:= delete ->
+    {error, artifact_effect_journal_unavailable};
+commit_journal_effects([_NonJournalEffect | Rest], Journal, ok) ->
+    commit_journal_effects(Rest, Journal, ok).
 
 revoke_call_tokens(Tokens, RootToken, CallId) ->
     maps:filter(

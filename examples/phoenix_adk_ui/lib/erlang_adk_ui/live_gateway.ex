@@ -25,6 +25,8 @@ defmodule ErlangAdkUi.LiveGateway do
           optional(:input_sample_rate) => 16_000 | 24_000
         }
   @type evaluation :: %{required(:id) => binary(), required(:label) => binary()}
+  @type graph_id :: binary()
+  @type cursor :: non_neg_integer()
   @type voice_ref :: term()
   @type voice_connection :: %{
           required(:voice_ref) => voice_ref(),
@@ -54,6 +56,13 @@ defmodule ErlangAdkUi.LiveGateway do
   @callback evaluation_report(identity(), binary()) :: {:ok, binary()} | {:error, atom()}
   @callback compare_evaluations(identity(), binary(), binary()) ::
               {:ok, binary()} | {:error, atom()}
+  @callback list_graphs(identity()) :: {:ok, map()} | {:error, atom() | tuple()}
+  @callback graph_detail(identity(), graph_id()) ::
+              {:ok, map()} | {:error, atom() | tuple()}
+  @callback graph_overlay(identity(), graph_id(), cursor()) ::
+              {:ok, map()} | {:error, atom() | tuple()}
+  @callback trace_timeline(identity(), cursor()) ::
+              {:ok, map()} | {:error, atom() | tuple()}
 
   def discover(identity), do: invoke(:discover, [identity])
 
@@ -86,6 +95,17 @@ defmodule ErlangAdkUi.LiveGateway do
 
   def compare_evaluations(identity, baseline_id, current_id),
     do: invoke(:compare_evaluations, [identity, baseline_id, current_id])
+
+  def list_graphs(identity), do: invoke(:list_graphs, [identity])
+
+  def graph_detail(identity, graph_id),
+    do: invoke(:graph_detail, [identity, graph_id])
+
+  def graph_overlay(identity, graph_id, cursor),
+    do: invoke(:graph_overlay, [identity, graph_id, cursor])
+
+  def trace_timeline(identity, cursor),
+    do: invoke(:trace_timeline, [identity, cursor])
 
   defp invoke(function, arguments) do
     adapter = Application.fetch_env!(:erlang_adk_ui, :live_gateway)

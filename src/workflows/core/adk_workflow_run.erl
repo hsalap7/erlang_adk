@@ -447,7 +447,9 @@ valid_runtime(Deadline, Steps, Transfers, Concurrency, Retention, Receiver,
     andalso is_integer(Retention) andalso Retention >= 0
     andalso (Receiver =:= undefined orelse is_pid(Receiver))
     andalso (LifecycleReceiver =:= undefined
-             orelse is_pid(LifecycleReceiver)).
+             orelse is_pid(LifecycleReceiver)
+             orelse adk_trace_store:is_lifecycle_receiver(
+                      LifecycleReceiver)).
 
 persist_checkpoint(Checkpoint, State = #{durable := undefined}) ->
     {ok, State#{checkpoint => Checkpoint}};
@@ -659,8 +661,11 @@ notify_event(Receiver, Ref, Event) ->
     ok.
 
 notify_lifecycle(undefined, _Ref, _Event) -> ok;
-notify_lifecycle(Receiver, Ref, Event) ->
+notify_lifecycle(Receiver, Ref, Event) when is_pid(Receiver) ->
     Receiver ! {adk_workflow_lifecycle, Ref, Event},
+    ok;
+notify_lifecycle(Receiver, Ref, Event) ->
+    adk_trace_store:deliver_lifecycle(Receiver, Ref, Event),
     ok.
 
 cancel_timer(undefined) -> ok;

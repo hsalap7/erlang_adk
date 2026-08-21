@@ -16,6 +16,18 @@ allocation ceiling for scopes, names, and versions, described below. A service
 handle is passed to a Runner as `{Module, Handle}`.
 Provider code never receives an ETS table or filesystem root.
 
+The 0.9 release already included these artifact adapters and their Runner
+integration. The 0.10 branch adds an opt-in supervised configuration layer:
+`adk_runtime_service_bundle:start_link(ephemeral_local, #{})` selects one
+shared ETS artifact adapter, while `durable_local` selects exact-scope
+filesystem workers and requires an absolute `artifact_root`. The shared
+adapter enforces one global quota across scopes; durable limits remain per
+worker/shard. Separately, 0.10 adds a GCS-compatible object-store adapter,
+bounded transfer facade, and durable effect journal. The runtime profile does
+not select or operate those external services automatically. See
+[`VERSION_0_10_0.md`](VERSION_0_10_0.md) and note that 0.10 remains **IN
+DEVELOPMENT**.
+
 ## Capability and listing API
 
 Adapters expose their versioned contract and configured bounds:
@@ -124,11 +136,12 @@ ETS quotas without bound.
 
 ## Exact-scope sharded adapter
 
-`adk_artifact_sharded` preserves the artifact-service API while assigning one
-stable supervised worker to each exact app, user, or session scope. Calls for
-one scope retain the selected adapter's ordering; after first resolution,
-callers reach that worker through a protected ETS fast path, so unrelated
-scopes do not queue behind the router or one storage GenServer:
+`adk_artifact_sharded` preserves the artifact-service API. Its default
+`exact_scope` strategy assigns one active supervised worker to each exact app,
+user, or session scope. Calls for one scope retain the selected adapter's
+ordering; after first resolution, callers reach that worker through a
+protected ETS fast path, so unrelated scopes do not queue behind the router or
+one storage GenServer:
 
 ```erlang
 {ok, ShardedArtifacts} = adk_artifact_sharded:start_link(
@@ -158,13 +171,29 @@ volatile, while a filesystem shard reloads its published versions.
 independent guard monitors each unresolved caller, owns the atomic cold-route
 permit, and releases it on caller death or timeout. The router rechecks that
 caller before starting a worker, so a stale queued request cannot create an
-abandoned shard. There is no idle-worker eviction in 0.5, so reaching the
-active-scope ceiling returns `{error, max_active_scopes_reached}` until a
-worker exits or the router is restarted. Adapter quotas are enforced
-independently inside each shard;
-capabilities deliberately report `global_quota => false`. Use an outer
-admission policy or a custom adapter when the deployment requires one aggregate
-budget across all scopes.
+abandoned shard.
+
+For the default volatile ETS adapter, idle reclamation is disabled: evicting a
+worker would discard its artifacts. Its active-scope ceiling is therefore a
+lifetime/cardinality bound until a worker exits or the router restarts, and a
+new scope at capacity returns `{error, max_active_scopes_reached}`. With the
+durable filesystem adapter, the router can instead reclaim the
+least-recently-used worker at capacity after all of its operation leases are
+idle for `idle_scope_timeout_ms` (default 60000; range 1 through 86400000).
+The next worker for that scope reopens the same durable data. If no worker is
+eligible, admission still returns `max_active_scopes_reached`.
+
+Exact-scope adapter quotas are enforced independently inside each shard;
+capabilities report `quotas.enforcement_scope => exact_scope_shard` and
+`global_quota => false`. A direct wrapper can instead set
+`scope_strategy => shared`, creating one adapter instance that preserves all
+authorized scopes, reports `active_scopes => 1`, and enforces the adapter
+limits globally (`shared_adapter` and `global_quota => true`). The 0.10
+`ephemeral_local` profile uses that shared shape. Status exposes routing, idle
+timeout, whether reclamation is active, and the eviction count; sharding
+capabilities expose the strategy, timeout, and reclamation mode. Use an outer
+admission policy or a custom adapter when a durable exact-scope deployment
+requires one aggregate budget across all scopes.
 
 ## Durable filesystem adapter
 
@@ -271,6 +300,72 @@ least-privilege filesystem permissions, keep it outside a served document
 root, and use an encrypted volume when artifact confidentiality requires it.
 The adapter does not encrypt content itself and must not be used as a secret
 store.
+
+## GCS-compatible object storage and bounded transfer (0.10)
+
+`adk_artifact_gcs` implements the same exactly scoped immutable-version
+contract over Google Cloud Storage-compatible object operations. Scope and
+logical names become deterministic SHA-256 tokens rather than object-name
+components. A create-only reservation allocates a version, the data object is
+written create-only, and a create-only manifest is the publication point.
+Loaded manifests are validated against the requested scope, name, and version.
+
+```erlang
+{ok, Gcs} = adk_artifact_gcs:start_link(
+    #{bucket => <<"my-artifacts">>,
+      project => <<"my-project">>,
+      credential => {my_gcs_credential, credential_handle},
+      max_artifact_bytes => 67108864,
+      max_concurrency => 32,
+      stream => #{chunk_bytes => 65536,
+                  max_credit_messages => 8,
+                  timeout_ms => 30000}}),
+GcsService = {adk_artifact_gcs, Gcs}.
+```
+
+The default transport is `adk_artifact_gcs_http_transport`; applications may
+inject only a trusted module implementing `adk_artifact_gcs_transport`. The
+credential handle must implement `access_token/1`; resolution runs in a
+deadline- and heap-bounded worker and the token is never accepted from an
+artifact request. Operators still own bucket policy, endpoint and TLS trust,
+credential lifecycle, retention, encryption, audit, and regional durability.
+This is an adapter, not a managed GCS provisioning service.
+
+`get_range/6` performs a bounded byte-range read. `adk_artifact_stream`
+negotiates transfer support through `capabilities/1` and exposes
+`open_upload/5`, `send_chunk/3,4`, `finish_upload/1,2`, `open_download/5`,
+`credit/3`, `ack/2`, `recv/2`, and `cancel/2`. Upload chunks receive a
+synchronous acknowledgement and next credit grant. Downloads require explicit
+message/byte credit and an acknowledgement for every chunk; at most one chunk
+is in flight. A stream is owner-bound, size/deadline limited, and cancelled
+when its owner exits. Unsupported adapters return `unsupported_transfer`
+instead of silently falling back. The current GCS transfer worker applies
+mailbox backpressure but still materializes the complete bounded artifact; it
+is not a resumable/multipart zero-copy GCS upload or download.
+
+## Durable artifact effects and reconciliation (0.10)
+
+Pass an initialized `adk_artifact_effect_journal` handle as Runner option
+`artifact_effect_journal` to protect least-authority artifact writes whose
+storage effect and session-event commit cross two durability boundaries. The
+Mnesia journal stores only intent, request digests, opaque resource IDs,
+bounded metadata/receipts, phases, and lease state—never artifact bytes,
+credentials, or service handles. The context path records intent before the
+external mutation, records the applied effect, and marks it committed only
+after the correlated event is durable. If the effect may have happened but the
+journal/event boundary cannot complete, the call returns
+`artifact_effect_pending_reconciliation` rather than pretending it rolled
+back.
+
+`adk_artifact_orphan_reconciler:run/3` performs a bounded synchronous pass over
+lease-fenced orphan claims. Its application-owned
+The `adk_artifact_reconcile_handler` callback `reconcile/3` must return `committed`,
+`compensated`, or `not_applied`; callback time and item count are bounded, and
+failures return to bounded retry policy. The core cannot infer an external
+backend's outcome. Each deployment must supply an idempotent observation and
+compensation policy appropriate to its backend. Terminal journal history has
+explicit bounded retention/pruning; no automatic background reconciler or
+universal compensation algorithm is claimed.
 
 ## Runner integration
 
@@ -386,18 +481,22 @@ Each returned version must also embed that exact scope. A mismatched adapter
 record is rejected as unavailable instead of being relabelled under the HTTP
 path scope.
 
-Current 0.5 limitations are explicit:
+## Current limits
 
-- whole-binary operations are bounded, but credit/ack upload/download and
-  byte-range streaming are not implemented;
+- ETS and filesystem operations remain whole-binary. Capability-negotiated
+  credit/ack transfer and byte ranges are implemented by the GCS-compatible
+  adapter; callers must handle `unsupported_transfer` for other adapters;
 - the filesystem adapter provides atomic reader visibility and repairable
   staging but cannot promise a portable directory `fsync` through Erlang's
   cross-platform `file` API;
-- artifact event deltas are implemented, while full durable orphan recovery
-  after a session-event persistence failure remains partial;
+- the effect journal makes ambiguous artifact writes visible and lease-fenced,
+  but recovery requires an operator/backend-specific reconcile handler and
+  explicit idempotency/compensation policy;
 - direct ETS and filesystem services serialize operations per process; the
-  optional sharded wrapper provides bounded exact-scope overlap, but does not
-  aggregate quotas, idle-evict workers, or expose a cross-shard `repair/2`
+  optional router wrapper provides bounded exact-scope overlap or shared
+  routing. Durable exact-scope workers support idle LRU reclamation only at
+  capacity; volatile exact-scope workers are not reclaimed. The wrapper does
+  not aggregate exact-scope quotas or expose a cross-shard `repair/2`
   operation;
 - filesystem lifetime allocation is deliberately finite for scopes, names,
   and versions; deletion preserves non-reuse slots/reservations and therefore

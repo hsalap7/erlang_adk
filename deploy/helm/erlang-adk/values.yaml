@@ -1,0 +1,127 @@
+replicaCount: 1
+
+topology:
+  # Keep this guard enabled while using node-local runtime/session/task stores.
+  singleReplicaOnly: true
+
+image:
+  repository: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+  capabilities:
+    drop: ["ALL"]
+
+strategy:
+  type: Recreate
+
+terminationGracePeriodSeconds: 60
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+service:
+  enabled: false
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: true
+    secretName: ""
+
+runtimeConfig:
+  # A pre-existing ConfigMap may provide a deployment-owned `sys.config` key.
+  # It is loaded as the release configuration; never place secrets in it.
+  existingConfigMap: ""
+
+credentials:
+  # Only a pre-existing Secret is accepted. Literal credentials are not values.
+  existingSecret: ""
+
+readinessHook:
+  # Optional executable `readiness` key mounted from this ConfigMap.
+  existingConfigMap: ""
+  path: /opt/erlang_adk/hooks/readiness
+
+storage:
+  data:
+    existingClaim: ""
+    emptyDir:
+      sizeLimit: 2Gi
+  log:
+    emptyDir:
+      sizeLimit: 1Gi
+  tmp:
+    emptyDir:
+      medium: Memory
+      sizeLimit: 256Mi
+
+probes:
+  startup:
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+otlp:
+  enabled: false
+  endpoint: ""
+  # Headers belong in credentials.existingSecret, never in values.
+  headersSecretKey: OTEL_EXPORTER_OTLP_HEADERS
+
+networkPolicy:
+  enabled: true
+  allowDns: true
+  # Add deployment-owned ingress and provider/OTLP egress rules explicitly.
+  ingress: []
+  egress: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

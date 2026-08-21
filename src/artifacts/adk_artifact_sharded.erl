@@ -16,12 +16,14 @@
     {ok, adk_scope_shard_router:handle()} | {error, term()}.
 start_link(Config) when is_map(Config) ->
     Allowed = [adapter, adapter_config,
-               max_active_scopes, max_router_queue],
+               max_active_scopes, max_router_queue,
+               idle_scope_timeout_ms, scope_strategy],
     Unknown = lists:sort(maps:keys(maps:without(Allowed, Config))),
     Adapter = maps:get(adapter, Config, adk_artifact_ets),
     AdapterConfig = maps:get(adapter_config, Config, #{}),
     RouterOptions = maps:with(
-                      [max_active_scopes, max_router_queue], Config),
+                      [max_active_scopes, max_router_queue,
+                       idle_scope_timeout_ms, scope_strategy], Config),
     case {Unknown, is_atom(Adapter), is_map(AdapterConfig)} of
         {[], true, true} ->
             adk_scope_shard_router:start_link(
@@ -130,15 +132,21 @@ deadline_call(Handle, Scope, CallOptions, Function) ->
                 {ok, Timeout, Deadline} ->
                     case adk_scope_shard_router:resolve(
                            Handle, Scope, Timeout) of
-                        {ok, Adapter, Worker} ->
-                            case remaining_timeout(Deadline) of
-                                0 -> {error, timeout};
-                                Remaining ->
-                                    safe_apply(
-                                      fun() ->
-                                          Function(Adapter, Worker,
-                                                   #{timeout_ms => Remaining})
-                                      end)
+                        {ok, Adapter, Worker, Lease} ->
+                            try
+                                case remaining_timeout(Deadline) of
+                                    0 -> {error, timeout};
+                                    Remaining ->
+                                        safe_apply(
+                                          fun() ->
+                                              Function(
+                                                Adapter, Worker,
+                                                #{timeout_ms => Remaining})
+                                          end)
+                                end
+                            after
+                                adk_scope_shard_router:release(
+                                  Handle, Lease)
                             end;
                         {error, _} = Error -> Error
                     end;
@@ -152,8 +160,12 @@ scoped_call(Handle, Scope, Function) ->
         ok ->
             case adk_scope_shard_router:resolve(
                    Handle, Scope, ?DEFAULT_TIMEOUT_MS) of
-                {ok, Adapter, Worker} ->
-                    safe_apply(fun() -> Function(Adapter, Worker) end);
+                {ok, Adapter, Worker, Lease} ->
+                    try safe_apply(
+                          fun() -> Function(Adapter, Worker) end)
+                    after
+                        adk_scope_shard_router:release(Handle, Lease)
+                    end;
                 {error, _} = Error -> Error
             end;
         {error, _} = Error -> Error

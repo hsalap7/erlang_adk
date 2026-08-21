@@ -34,8 +34,13 @@ start_link(Config) ->
 %% Compatibility constructor.  The tagged clause is the OTP callback.
 init(Config) when is_map(Config) -> start_link(Config);
 init({server_limits, Limits}) ->
-    Table = ets:new(?MODULE, [set, private, {read_concurrency, true}]),
-    {ok, #state{table = Table, limits = Limits}}.
+    case adk_memory_erasure_epoch:ensure_table() of
+        ok ->
+            Table = ets:new(?MODULE, [set, private,
+                                      {read_concurrency, true}]),
+            {ok, #state{table = Table, limits = Limits}};
+        {error, Reason} -> {stop, Reason}
+    end.
 
 stop(Pid) ->
     try gen_server:stop(Pid, normal, 5000) of
@@ -263,7 +268,11 @@ handle_call({delete_user, Scope, Deadline}, _From, State) ->
                                       EntryScope =:= CanonScope],
             case request_expired(Deadline) of
                 true -> {reply, {error, timeout}, State};
-                false -> delete_matches(Entries, State)
+                false ->
+                    case adk_memory_erasure_epoch:advance(CanonScope) of
+                        {ok, _Epoch} -> delete_matches(Entries, State);
+                        {error, _} = Error -> {reply, Error, State}
+                    end
             end;
         {error, _} = Error -> {reply, Error, State}
     end;
@@ -314,6 +323,12 @@ legacy_add_internal(Content, Metadata, State) ->
     end.
 
 store_entries(Entries, State) ->
+    case assert_consistent_epoch(Entries) of
+        ok -> store_entries_checked(Entries, State);
+        {error, _} = Error -> Error
+    end.
+
+store_entries_checked(Entries, State) ->
     case classify_entries(Entries, State, #{}, 0) of
         {ok, NewByKey, Duplicates} ->
             NewEntries = maps:values(NewByKey),
@@ -371,7 +386,26 @@ lookup_entry(Entry, State) ->
     [{Key, Stored}] = ets:lookup(State#state.table, Key),
     Stored.
 
-public_entry(Entry) -> maps:without([storage_bytes], Entry).
+public_entry(Entry) ->
+    maps:without([storage_bytes, idempotency_key, erasure_epoch], Entry).
+
+assert_consistent_epoch([]) -> ok;
+assert_consistent_epoch(Entries) ->
+    Scope = maps:get(scope, hd(Entries)),
+    Epochs = lists:usort([maps:get(erasure_epoch, Entry, undefined)
+                          || Entry <- Entries]),
+    case Epochs of
+        [undefined] -> ok;
+        [Expected] ->
+            case adk_memory_erasure_epoch:current(Scope) of
+                {ok, Expected} -> ok;
+                {ok, Actual} ->
+                    {error, {memory_erasure_epoch_stale,
+                             Expected, Actual}};
+                {error, _} = Error -> Error
+            end;
+        _ -> {error, inconsistent_memory_erasure_epochs}
+    end.
 
 compare_hits(Left, Right) ->
     {-maps:get(score, Left), maps:get(timestamp, Left), maps:get(id, Left)} =<

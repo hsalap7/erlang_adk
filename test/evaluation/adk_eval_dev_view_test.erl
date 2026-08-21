@@ -45,7 +45,18 @@ classify_and_render(Baseline) ->
     {ok, Markdown} = adk_eval_dev_view:render(
                        Baseline, <<"markdown">>, #{}),
     ?assertNotEqual(
-       nomatch, binary:match(Markdown, <<"# Evaluation report">>)).
+       nomatch, binary:match(Markdown, <<"# Evaluation report">>)),
+    {ok, Junit} = adk_eval_dev_view:render(
+                    Baseline, <<"junit">>,
+                    #{<<"suite_name">> => <<"dev-suite">>}),
+    ?assertNotEqual(nomatch, binary:match(Junit, <<"<testsuite">>)),
+    {ok, Sarif} = adk_eval_dev_view:render(Baseline, <<"sarif">>, #{}),
+    ?assertEqual(<<"2.1.0">>,
+                 maps:get(<<"version">>,
+                          jsx:decode(Sarif, [return_maps]))),
+    {ok, Annotations} = adk_eval_dev_view:render(
+                          Baseline, <<"annotations">>, #{}),
+    ?assert(is_list(jsx:decode(Annotations, [return_maps]))).
 
 strict_comparison(Baseline, Failing, Tolerated) ->
     {ok, Regression} = adk_eval_dev_view:compare(
@@ -134,6 +145,11 @@ size_limits(Baseline) ->
        tagged(output_limit_exceeded),
        adk_eval_dev_view:render(
          Baseline, <<"json">>, #{<<"max_output_bytes">> => 1})),
+    ?assertEqual(
+       tagged(invalid_output_limit),
+       adk_eval_dev_view:render(
+         Baseline, <<"json">>,
+         #{<<"max_output_bytes">> => 16777217})),
     Oversized = binary:copy(<<"x">>, 1048577),
     ?assertEqual(tagged(input_limit_exceeded),
                  adk_eval_dev_view:classify(#{<<"value">> => Oversized})),

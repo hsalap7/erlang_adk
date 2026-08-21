@@ -49,6 +49,31 @@ bounded_queue_and_fifo_release_test() ->
           assert_empty(Server)
       end).
 
+drain_rejects_new_work_and_cancels_queue_test() ->
+    with_server(
+      #{global_limit => 1, default_agent_limit => 1,
+        overflow => queue, max_queue => 2,
+        default_queue_timeout => 5000},
+      fun(Server) ->
+          {ok, Active} = adk_admission_control:acquire(
+                           Server, <<"agent">>, #{}),
+          {ok, Queued, {queued, _}} =
+              adk_admission_control:submit(Server, <<"agent">>, #{}),
+          {ok, Draining} = adk_admission_control:begin_drain(Server),
+          ?assertEqual(true, maps:get(draining, Draining)),
+          ?assertEqual(1, maps:get(active, Draining)),
+          ?assertEqual(0, maps:get(queue_length, Draining)),
+          ?assertEqual({error, deployment_draining},
+                       adk_admission_control:await(Queued, 1000)),
+          ?assertEqual(
+             {error, deployment_draining},
+             adk_admission_control:submit(Server, <<"other">>, #{})),
+          ok = adk_admission_control:release(Server, Active),
+          {ok, Drained} = adk_admission_control:begin_drain(Server),
+          ?assertEqual(0, maps:get(active, Drained)),
+          ?assertEqual(true, maps:get(draining, Drained))
+      end).
+
 oldest_eligible_avoids_cross_agent_head_blocking_test() ->
     with_server(
       #{global_limit => 2, default_agent_limit => 1,
