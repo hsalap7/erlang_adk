@@ -1,0 +1,8 @@
+{
+  "name": "erlang-adk-mcp-external-conformance",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  }
+}

@@ -1,0 +1,139 @@
+{
+  "contractVersion": "erlang-adk.agent-runtime-feasibility/1",
+  "classification": "feasibility-only",
+  "managedServiceSupport": {
+    "claimed": false,
+    "status": "not-supported",
+    "reason": "This contract records an OCI and A2A boundary experiment. It is not a managed Agent Runtime deployment adapter, certification, or support claim."
+  },
+  "mutationPolicy": {
+    "cloudMutations": false,
+    "agentTaskMutations": false,
+    "probeRpcMethod": "ListTasks"
+  },
+  "ociBoundary": {
+    "dockerfile": "Dockerfile",
+    "promotedImageReference": "registry/image@sha256:<64 lowercase hex characters>",
+    "runtimeUser": {
+      "uid": 10001,
+      "gid": 10001,
+      "mustRunAsNonRoot": true
+    },
+    "entrypoint": "/opt/erlang_adk/bin/container-entrypoint",
+    "stopSignal": "SIGTERM",
+    "rootFilesystem": "read-only-at-platform-boundary",
+    "writableMounts": [
+      "/var/lib/erlang_adk",
+      "/var/log/erlang_adk",
+      "/tmp/erlang_adk"
+    ],
+    "replicaPolicy": "single-until-distributed-state-is-configured"
+  },
+  "httpBoundary": {
+    "baseUrl": "operator-supplied exact HTTPS origin; HTTP is accepted only for an explicitly allowed loopback probe",
+    "redirects": "forbidden",
+    "maximumProbeResponseBytes": 1048576,
+    "a2aProtocolVersion": "1.0",
+    "endpoints": [
+      {
+        "id": "liveness",
+        "method": "GET",
+        "path": "/livez",
+        "authentication": "deployment-policy",
+        "expectedStatus": 200,
+        "sideEffect": "none"
+      },
+      {
+        "id": "readiness",
+        "method": "GET",
+        "path": "/readyz",
+        "authentication": "deployment-policy",
+        "expectedStatus": 200,
+        "sideEffect": "none"
+      },
+      {
+        "id": "public-agent-card",
+        "method": "GET",
+        "path": "/.well-known/agent-card.json",
+        "authentication": "public-discovery",
+        "expectedStatus": 200,
+        "sideEffect": "none",
+        "pin": "sha256"
+      },
+      {
+        "id": "extended-agent-card",
+        "method": "GET",
+        "path": "/extendedAgentCard",
+        "authentication": "bearer-token-from-environment",
+        "requiredHeaders": {
+          "A2A-Version": "1.0"
+        },
+        "expectedStatus": 200,
+        "sideEffect": "none",
+        "cachePolicy": "private, no-store",
+        "pin": "sha256"
+      },
+      {
+        "id": "a2a-jsonrpc",
+        "method": "POST",
+        "path": "/a2a/v1",
+        "authentication": "bearer-token-from-environment",
+        "requiredHeaders": {
+          "A2A-Version": "1.0",
+          "Content-Type": "application/json"
+        },
+        "expectedStatus": 200,
+        "probeMethod": "ListTasks",
+        "sideEffect": "read-only"
+      }
+    ]
+  },
+  "requiredOperatorInputs": {
+    "immutableImageReference": "required by the deployment system, never applied by this spike",
+    "baseUrl": "exact origin supplied with --base-url",
+    "token": "read from the environment variable named by --token-env; never accepted as an argument",
+    "publicCardSha256": "supplied with --expected-card-sha256",
+    "extendedCardSha256": "supplied with --expected-extended-card-sha256"
+  },
+  "unresolvedBlockers": [
+    {
+      "id": "vendor-lifecycle",
+      "status": "unresolved",
+      "blocksSupportClaim": true,
+      "exitEvidence": "A documented adapter proves startup, shutdown, drain, upgrade, rollback, resource-limit, and failure semantics in the target managed runtime."
+    },
+    {
+      "id": "identity",
+      "status": "unresolved",
+      "blocksSupportClaim": true,
+      "exitEvidence": "Workload identity, token audience and rotation, A2A authorization, tenant scope, and least-privilege behavior pass target-environment tests."
+    },
+    {
+      "id": "network",
+      "status": "unresolved",
+      "blocksSupportClaim": true,
+      "exitEvidence": "TLS, ingress, DNS, egress, proxy headers, request limits, streaming, timeouts, and private connectivity pass target-environment tests."
+    },
+    {
+      "id": "state",
+      "status": "unresolved",
+      "blocksSupportClaim": true,
+      "exitEvidence": "Sessions, tasks, artifacts, memory, evaluations, and traces survive managed-runtime restart and migration without relying on ephemeral container storage."
+    },
+    {
+      "id": "conformance",
+      "status": "unresolved",
+      "blocksSupportClaim": true,
+      "exitEvidence": "The target vendor OCI contract, official external A2A 1.0 conformance suite, and staged interoperability and fault-injection matrix pass."
+    }
+  ],
+  "repositoryEvidence": [
+    "Dockerfile",
+    "src/protocols/http/erlang_adk_http.erl",
+    "src/protocols/http/adk_health_handler.erl",
+    "src/protocols/a2a/v1/adk_a2a_v1_handler.erl",
+    "src/protocols/a2a/v1/adk_a2a_v1_rpc.erl",
+    "scripts/deployment/probe-agent-runtime.sh",
+    "scripts/deployment/verify-agent-runtime-contract.sh"
+  ]
+}

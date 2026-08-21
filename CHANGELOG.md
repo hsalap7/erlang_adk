@@ -11,7 +11,297 @@ documents under [`docs/`](docs/README.md).
 
 ## [Unreleased]
 
-No changes have been assigned to the next release.
+The following expanded v0.10.0 implementation is **IN DEVELOPMENT**. It is not
+a release record: merged-candidate validation is recorded below, while release
+approval, tagging, and publication remain pending.
+
+### Added
+
+- Strict `ephemeral_local` and `durable_local` runtime-service profiles plus
+  `adk_runtime_service_bundle`, which owns session, sharded artifact, and
+  sharded memory selection as one supervised, fail-stop generation and exposes
+  validated service references and a Runner-ready option split. The ephemeral
+  profile uses one shared ETS adapter per component with global quotas; the
+  durable profile uses exact-scope filesystem/Mnesia workers with per-shard
+  quotas and lease-protected, LRU-on-capacity idle reclamation. `durable_local`
+  also atomically owns and health-checks a private Mnesia ingestion outbox,
+  exposes its redacted service/status surface, and injects validated durable
+  memory ingestion into the standard Runner path. Pending jobs survive bundle
+  process restarts; stale or unhealthy service references fail closed.
+  Deterministic registry hydration gates bounded rotating claims by exact
+  adapter identity; a constant-row four-table sentinel provides health, and
+  due/lease/erasure/terminal work is indexed and bounded. Majority mode requires
+  at least two shared nodes. Epoch-bound job IDs preserve same-epoch idempotency
+  while allowing post-erasure resubmission, and a hard active-plus-terminal
+  reservation supports explicit migration/pruning. Nested options and adapter
+  capabilities are strict, status is redacted, and legacy named APIs resolve
+  the one durable bundle owner without a duplicate processor. Disabled and
+  `ephemeral_local` configurations preserve the standalone-outbox path without
+  creating a profile-owned outbox.
+- Reusable schema-v2 `adk_agent_config` compilation/loading for JSON and a
+  strict YAML subset, with schema-1 compatibility, normalized cross-format
+  snapshot-stable fingerprints and opaque registry lineage/revision
+  provenance. Immutable-generation `adk_config_registry` snapshots now cover
+  provider, MCP, OpenAPI, tool-pack, credential-profile, runtime-policy,
+  workflow, and agent-template descriptors. `adk_agent_composition` resolves
+  data-only references against the exact sealed snapshot and materializes
+  bounded sub-agent trees, workflows, Runner policy, and opaque credential
+  profile IDs. Agent names use the runtime identifier grammar, reserve `user`,
+  and are limited to 256 bytes. Toolset references are capped at 64, duplicates
+  are rejected, and one authenticated bulk lookup resolves the accepted list.
+  Independently created non-empty registries have distinct instance IDs; every
+  non-empty snapshot has a fresh revision. Neither ID is a descriptor-content
+  digest, and the internal keyed content seal is never exposed.
+- Registry-only connector descriptors and strict manifests for permissions,
+  side-effect class, confirmation policy, and concurrency safety, plus
+  in-tree Google, GitHub, Slack, and Postgres connector packages. The packages
+  require application-owned backends/credentials and are prepared for a future
+  publication; they are not claimed as published packages. Their local Hex
+  workflow includes a required post-build normalizer because `rebar3_hex`
+  7.1.0 omits the `_checkouts/erlang_adk` dependency from generated
+  requirements. Only the normalized tarball, with non-optional
+  `erlang_adk ~> 0.10.0`, is eligible for offline inspection or
+  clean-extracted tests. It is not a publish input: `rebar3_hex` 7.1.0 rebuilds
+  on `hex publish`. `packages/build_connector_packages.sh` is the sole offline
+  all-connector release gate. Its package suites execute every advertised
+  operation through the real registry, Agent Config, and `adk_toolset` path and
+  assert the projected permission/side-effect/confirmation/concurrency policy
+  metadata. All four connectors remain explicitly unpublished.
+- A GCS-compatible, exactly scoped immutable artifact adapter with bounded
+  ranges and credit/ack upload/download; a durable metadata-only artifact
+  effect journal; and a bounded lease-fenced orphan reconciler. Reconciliation
+  deliberately requires an operator/backend-specific handler to decide whether
+  an external effect committed, was compensated, or was not applied.
+- A bounded, killable embedding-provider boundary; a local volatile cosine and
+  weighted lexical/vector ETS reference adapter; an opt-in fail-closed memory
+  governance hook with a static consent/TTL/retention/legal-hold policy; durable
+  erasure epochs shared by Mnesia memory and the ingestion outbox; and bounded
+  terminal-outbox retention/pruning.
+- Explicit MCP 2025-11-25 legacy and 2026-07-28 modern protocol eras, including
+  stateless per-request metadata, discovery/cache metadata, deterministic
+  catalogs, modern input-required and subscription flows, credit-driven
+  incremental SSE, RFC 9728/RFC 8414 discovery with S256 PKCE, a bounded
+  owner-leased connection pool, and immutable atomic tool/resource/prompt
+  catalog generations. Legacy GET/SSE remains opt-in compatibility behavior;
+  the modern era does not reintroduce removed GET/replay semantics.
+- A supervised bounded `adk_eval_service` and `adk_eval_store` contract with
+  immutable eval-set revisions, atomic set-plus-job creation, atomic job
+  transitions, exact application scopes, named baselines, byte quotas,
+  bounded default-safe pruning with explicit baseline cleanup, restart
+  recovery, terminal-record quota headroom, and bounded ETS or local durable
+  Mnesia adapters with strict schema/config checks and batched accounting
+  repair. Backend-canonical store ownership, including across wrapper modules,
+  prevents concurrent schedulers/recovery on one backend; ETS and Mnesia
+  recovery are batched. Raw submissions are prepared in a hard-capped set of
+  monitored timeout/heap-bounded workers outside the service mailbox.
+- First-party bounded evaluation metrics for latency, token cost, safety, and
+  deterministic semantic similarity; persisted-score ensembles and threshold
+  calibration; operator-selected user/environment simulators; confidence and
+  longitudinal-regression helpers; a revision-safe human-review state machine;
+  one canonical `adk_eval_export` renderer for JSON, Markdown, JUnit, SARIF,
+  and annotations; a stored-result `adk_eval_dev_api:report/5` API; an
+  authenticated HTTP report route; `adk eval report`; a safe Developer UI
+  authoring facade; and optional explicit-node RPC evaluation workers with
+  owner-bound cancellation and no replay. Direct, API, HTTP, CLI, and existing
+  eval-run report paths return the same canonical bytes under one 16 MiB
+  default/hard report ceiling. `dev_evaluation_report_max_bytes` can lower the
+  report-route ceiling; unrelated CLI responses stay at 1 MiB and Developer
+  request bodies at 64 KiB.
+- A supervised bounded `adk_trace_store` for principal-isolated metadata-only
+  observability and workflow lifecycle retention, cursor paging, explicit
+  replay gaps, content rejection/pruning, and global/per-principal quotas,
+  plus a fixed-principal observability exporter and an opaque best-effort
+  workflow lifecycle receiver that preserves PID-receiver compatibility.
+- A bounded server-owned Developer UI graph catalog, metadata-only trace
+  timelines and graph overlays, and evaluation authoring/history routes. A
+  separate provider payload inspector is disabled by default and requires an
+  explicit local-development opt-in; it is redacted, normalized, bounded, and
+  short-lived rather than a production trace/audit store.
+- Runner-backed A2A 1.0 execution, callback-driven incremental client streams,
+  extended Agent Cards, bounded ETS or local Mnesia task-snapshot stores, and
+  push-notification configuration CRUD plus SSRF/DNS/HTTPS-bounded delivery.
+  Push secrets and the drop-new delivery queue remain process-local.
+- Render/review-first deployment assets: an OTP/relx release, non-root
+  read-only-root container contract, dependency-aware health and draining,
+  Cloud Run and Helm/GKE manifests, explicit-apply CLI/scripts, and SBOM,
+  scanning, signing, and provenance helpers. A bundled health-only HTTP profile
+  serves `/livez` and `/readyz` on the platform-selected `PORT` while leaving
+  agent/A2A/developer routes disabled. The container bounds inherited
+  open-file limits before ERTS startup, and PID 1 owns one drain/forward/reap
+  sequence with target-specific shutdown budgets.
+- A strict deployment OTLP environment bridge. `ERLANG_ADK_OTLP_ENDPOINT`
+  explicitly activates a bounded metadata-only OTLP/HTTP JSON exporter;
+  optional `OTEL_EXPORTER_OTLP_HEADERS` are ignored without that activation,
+  parsed as bounded W3C-Baggage-style headers with optional-whitespace trimming
+  and one strict value percent-decoding pass. Raw semicolons, malformed escapes,
+  decoded invalid UTF-8, and case-insensitive duplicate names fail closed
+  without reflecting values; headers are never accepted from agent data. The
+  bridge forces batch size one; the HTTP/exporter bounds are 3/4 seconds, and
+  the bus timeout must exceed the
+  sum of all final exporter descriptor timeouts plus 250 ms. It includes the
+  trace-store exporter before validating/auto-sizing an absent timeout and
+  rejects an explicit undersized value. Standard configured Runner paths emit
+  through the asynchronous observability bus even when local trace retention
+  is disabled.
+- [`docs/VERSION_0_10_0.md`](docs/VERSION_0_10_0.md), the in-development 0.10
+  contract and merged-candidate evidence ledger.
+
+### Changed
+
+- `adk config validate` now uses the reusable Agent Config compiler and reports
+  schema version, registry generation, opaque registry instance/revision IDs,
+  and configuration fingerprint. Direct module names in the `tools` field are
+  disabled by default; trusted API callers must explicitly opt into that
+  legacy path. Arbitrary `adk_llm_*` provider module names have a separate
+  trusted opt-in and are also disabled by default; normal declarative configs
+  use fixed/registry-backed provider IDs and registry-backed `toolsets` IDs.
+- `adk_agent_config:current_schema_version/0` now returns 2. `.yaml` and `.yml`
+  files use the strict YAML decoder; anchors, aliases, tags, directives, merge
+  keys, multi-document input, non-JSON scalar behavior, and unbounded input are
+  rejected instead of being interpreted.
+- `adk serve --config` now compiles before application startup and merges the
+  agent's bounded Runner options into developer configuration. Trusted
+  operator options win conflicts, while profile-owned service references stay
+  authoritative.
+- `erlang_adk:runtime_runner_spec/0`, CLI run/console, the evaluation agent
+  adapter, and developer HTTP setup now resolve an enabled application runtime
+  profile. Its service references are authoritative, missing/mismatched enabled
+  bundles fail closed, and console/evaluation cleanup uses the selected session
+  backend.
+- Enabling the trace store now strictly configures and starts its observability
+  bus/exporter, injects asynchronous metadata-only observability into the
+  configured Runner paths, and supplies store-minted lifecycle receivers to
+  the public start/run workflow facade. Direct Runner/workflow constructors
+  remain explicit. Lifecycle delivery has atomic pending admission and drop
+  accounting; paging and expiry pruning use ordered indexes and bounded
+  batches. Receiver TTL now follows monitored local workflow owners, retaining
+  authority for a quiet live workflow and returning to normal expiry after
+  every owner exits.
+- Durable scope routers now carry one absolute deadline across admission,
+  resolution, and handoff, and bind exactly-once operation leases to the caller
+  and worker generation. Killed/timed-out callers cannot pin capacity or create
+  a stale shard. Existing durable invocation-ledger Mnesia tables also fail
+  closed unless their record schema, `set` type, majority, and local
+  `disc_copies` durability match the configured contract.
+- Development application, OTLP instrumentation, package-verifier, and
+  Phoenix path-dependency version surfaces now identify `0.10.0`; this
+  metadata bump does not mark the version as released.
+- The Cloud Run manifest now selects the built-in health-only relx config at
+  `/opt/erlang_adk/etc/health-http.sys.config` and relies on Cloud Run to inject
+  its reserved `PORT`. Helm selects the same profile only when its Service is
+  enabled and no custom runtime config is present. A custom runtime ConfigMap
+  must provide the exact `sys.config` key mounted at
+  `/opt/erlang_adk/etc/runtime/sys.config`; it replaces, rather than augments,
+  the built-in profile. These form three explicit modes: a closed base release,
+  the packaged health-only release, and an application-owned runtime config.
+- The Cloud Run renderer now emits `maxScale: "1"` at both Service and revision
+  scopes and accepts no other maximum. This is an autoscaling envelope, not a
+  hard singleton lease or a promise that revisions cannot overlap during
+  rollout.
+- The container entrypoint now validates `ERLANG_ADK_NOFILE_CAP` from 1024
+  through 1048576 (default 65536) and only lowers inherited soft/hard limits.
+  Helm no longer adds a duplicate `preStop` drain; PID 1 performs the single
+  drain and stays alive until BEAM exits. The default/Helm drain budget is 30
+  seconds within a 60-second grace period, while Cloud Run uses 3 seconds.
+- The read-only managed Agent Runtime feasibility probe now retrieves the
+  bearer token exactly from a named environment variable, bounds and validates
+  the RFC 6750 token shape, and passes its curl header through standard-input
+  config rather than exposing the token as a process argument. This remains a
+  feasibility boundary, not managed-runtime support or staging evidence.
+- Feature documentation now describes the 0.9 release as the existing base:
+  artifacts and Runner-integrated memory, evaluation v2, stdio and Streamable
+  HTTP MCP, Developer UI/Phoenix, A2A 1.0, and partial Agent Config were already
+  present before the expanded 0.10 work.
+
+### Validation
+
+- Evidence refers to the named `codex/version_0.10.0` working-tree candidate.
+  Its HEAD, `78f31fd6b72295ebeb37cecbd7c11a6c5a666b34`, is the v0.9 baseline;
+  the v0.10 work remains uncommitted and is not a reproducible commit or tag.
+  The changed-candidate aggregate passed 1,826/1,826 non-coverage EUnit and an
+  independent 1,826/1,826 coverage EUnit run, 6 deterministic Common Test cases
+  with 22 expected paid-provider skips, clean compile/xref, Dialyzer over 309
+  project files with 0 warnings, and 36,574/49,312 = 74.17% line coverage
+  (12,738 missed; 83 covered lines over the exact floor). Escript, doctor, and
+  checked config validation passed. README checks passed 30/30 plus 4/4,
+  all three checked example modules compiled with `-Werror`, and ExDoc, local
+  link/anchor/fence, root Hex/verifier/extracted compile, and diff gates passed.
+  Root artifact hashes/freshness remain out of packaged documentation to avoid
+  self-reference.
+- Focused durable-runtime validation passed 46/46 EUnit with compile, xref, and
+  Dialyzer clean. Focused canonical evaluation-report parity and size-boundary
+  validation passed 56 tests across direct, stored-result API, authenticated
+  HTTP, existing eval-run, stdout, and file paths, including an approximately
+  1.4 MiB exact-parity report.
+- The sole offline connector wrapper passed all four packages: 12/12 source and
+  12/12 clean-extracted EUnit, including real registry/Agent Config/toolset
+  execution for every advertised operation and policy projection. Warning-
+  strict compilation, four normalized Hex archives with the exact non-optional
+  `erlang_adk ~> 0.10.0` requirement and no checkout leakage, and four docs
+  archives passed. These are inspection artifacts, not publication inputs; all
+  connectors remain unpublished.
+- The pinned official MCP Python/TypeScript 2.0.0 matrix passed modern
+  2026-07-28 and legacy-auto-fallback 2025-11-25 in all four cells. The pinned
+  official A2A 1.0 JSON-RPC TCK passed 100 tests with 165 expected
+  transport/capability skips and no failures/errors/xfail; its selected
+  JSON-RPC surface was 94 passed plus seven inapplicable skips.
+- The Phoenix companion passed 107 ExUnit and 40 Node/browser-audio tests,
+  production assets/release, and trusted-proxy plus CA-verified direct-TLS
+  health smokes. The exact advisory verifier accepted only the two documented
+  Cowlib advisories and Gun's duplicate response-splitting advisory. Live Hex
+  registry access still failed with `Unknown CA`, so cached locked dependency
+  success is not represented as a live-registry result.
+- The final local image `erlang-adk:0.10.0-final` built with fresh locked
+  dependencies at OCI/index digest
+  `sha256:d74eb0a349d45692b5bb59e5ac7f1bbbe3710a59cd2e0be5301a179ce28f92d7`.
+  A constrained non-root/read-only-root 1 GiB direct smoke passed health-only
+  routing, nofile 65536 for PID 1/BEAM, memory/OOM/restart checks, and graceful
+  SIGTERM. A disposable Kind cluster passed closed/headless and
+  service-enabled Helm rollouts, nondefault `PORT=18081`, health/404 routing,
+  drain readiness/liveness behavior, and graceful pod recovery, then was
+  deleted.
+- Complete aggregate Erlang, documentation/package, protocol, Phoenix, and
+  deployment evidence is recorded in the in-development candidate ledger;
+  these passing gates do not release 0.10.0.
+
+### Compatibility and known limitations
+
+- The 0.10 additions remain opt-in development APIs. They do not add a managed
+  cloud product, visual/no-code builder, hosted evaluation control plane,
+  durable/distributed trace backend, automatic instruction optimizer, or
+  complete external MCP/A2A ecosystem.
+- The pinned external protocol gates are recorded narrowly. Official MCP
+  Python 2.0.0 (`6f69a3758ebf2ee55ce050f58b470ce11af71133`)
+  and TypeScript client 2.0.0
+  (`cc4b41617ce3601b1290d67216ea0b194a3cd9ac`) passed both modern
+  2026-07-28 and legacy-auto-fallback 2025-11-25 modes without waivers. The
+  official A2A 1.0 TCK at
+  `5996b79f9cefa6fc390980e383e358a66fb9e49e` passed 100 tests with 165
+  expected transport/capability skips and no failures, errors, or expected
+  failures; the selected JSON-RPC surface was 94 passed plus 7 inapplicable
+  skips. These loopback fixtures do not prove arbitrary peers, HTTPS/IAM, or
+  unselected A2A transports. No multi-node node-loss Common Test proves
+  Mnesia/task/outbox recovery. Cloud Run/GKE staging, registry push, generated
+  SBOM/Grype scan, Cosign sign/attest, verified provenance, and managed Agent
+  Runtime gates remain separate and unclaimed.
+- The built-in deployment listener is health-only. A callable agent endpoint
+  still requires a deployment-owned listener, authentication, TLS/proxy,
+  ingress, and network policy. The Cloud Run template requests a one-instance
+  maximum at both annotation scopes, but that is not a hard singleton
+  guarantee; its writable storage is ephemeral, and no successful Cloud Run
+  staging deployment is claimed.
+- Artifact effect recovery is not automatic inference: an operator-owned
+  backend handler must provide idempotency, observation, and compensation
+  policy. Memory governance hooks are opt-in and must be invoked by the owning
+  application/adapter path; the local vector implementation is not a managed
+  or distributed vector database.
+- Developer payload inspection is explicit development-only capture. Redaction
+  is bounded defense in depth, not a general PII classifier. A2A push secrets
+  and delivery jobs are process-local; queue saturation drops the new delivery,
+  and restart does not guarantee webhook delivery.
+- This section must remain unreleased until the complete candidate gates in
+  [`docs/RELEASING.md`](docs/RELEASING.md) pass and the evidence ledger is
+  populated from one reviewed revision.
 
 ## [0.9.0] - 2026-08-06
 

@@ -421,15 +421,34 @@ compile_module_metric(Metric, Id, Kind, Threshold, Config) ->
                     end,
                     case Callback of
                         true ->
-                            {ok, #{id => Id, module => Module,
-                                   config => Config, kind => Kind,
-                                   threshold => Threshold, scope => Scope,
-                                   source => module}};
+                            case validate_metric_module_config(Module,
+                                                               Config) of
+                                ok ->
+                                    {ok, #{id => Id, module => Module,
+                                           config => Config, kind => Kind,
+                                           threshold => Threshold,
+                                           scope => Scope,
+                                           source => module}};
+                                {error, _} = Error -> Error
+                            end;
                         false -> {error, missing_callback}
                     end;
                 _ -> {error, module_unavailable}
             end;
         _ -> {error, invalid_module_or_scope}
+    end.
+
+validate_metric_module_config(Module, Config) ->
+    case erlang:function_exported(Module, validate_config, 1) of
+        false -> ok;
+        true ->
+            try Module:validate_config(Config) of
+                ok -> ok;
+                {error, Reason} -> {error, reason_tag(Reason)};
+                _ -> {error, invalid_config_validation_result}
+            catch
+                _:_ -> {error, config_validation_exception}
+            end
     end.
 
 validate_options(Opts) ->
@@ -815,8 +834,13 @@ evaluate_turns([Turn | Rest], Index, State0, CaseContext, Target,
                 <<"turn_id">> => maps:get(<<"id">>, Turn),
                 <<"turn_index">> => Index
             },
+            CallStarted = erlang:monotonic_time(millisecond),
             case call_adapter(Adapter, Target, Turn, State0, Context0) of
                 {ok, Actual, Events, State1, AdapterMetadata} ->
+                    RuntimeLatency = elapsed_ms(CallStarted),
+                    RuntimeMetadata = AdapterMetadata#{
+                        <<"runtime_latency_ms">> => RuntimeLatency
+                    },
                     TurnId = maps:get(<<"id">>, Turn),
                     FullTrajectory = event_trajectory(
                                        Events, TurnId,
@@ -824,7 +848,8 @@ evaluate_turns([Turn | Rest], Index, State0, CaseContext, Target,
                     PublicTrajectory = event_trajectory(
                                          Events, TurnId, Opts),
                     Context = Context0#{
-                        <<"trajectory">> => FullTrajectory
+                        <<"trajectory">> => FullTrajectory,
+                        <<"adapter_metadata">> => RuntimeMetadata
                     },
                     MetricResults = score_turn_metrics(
                                       Metrics,
@@ -849,7 +874,7 @@ evaluate_turns([Turn | Rest], Index, State0, CaseContext, Target,
                         <<"events">> => CapturedEvents,
                         <<"trajectory">> => PublicTrajectory,
                         <<"metadata">> => maps:get(<<"metadata">>, Turn),
-                        <<"adapter_metadata">> => AdapterMetadata
+                        <<"adapter_metadata">> => RuntimeMetadata
                     },
                     evaluate_turns(Rest, Index + 1, State1, CaseContext,
                                    Target, Adapter, Metrics, Opts, Deadline,

@@ -252,6 +252,112 @@ defmodule ErlangAdkUiWeb.LiveSessionLiveTest do
     assert render(view) =~ "Baseline comparison"
   end
 
+  test "graph and trace panels accept only catalog IDs and server-owned cursor state", %{
+    conn: conn
+  } do
+    {conn, _handle, context} = authenticated(conn)
+    {:ok, view, html} = live(conn, ~p"/live")
+
+    assert_receive {:live_gateway, {:list_graphs, graph_identity}}, 1_000
+    assert graph_identity == context.identity
+    assert_receive {:live_gateway, {:trace_timeline, trace_identity, 0}}, 1_000
+    assert trace_identity == context.identity
+
+    assert html =~ "checkout"
+    assert html =~ "workflow_lifecycle"
+    refute html =~ "RAW_TRACE_RESPONSE_SHOULD_NOT_RENDER"
+
+    render_submit(view, "show-graph", %{
+      "graph_id" => "checkout",
+      "graph_catalog" => "browser-catalog",
+      "graph_owner" => "browser-owner",
+      "trace_store" => "browser-store",
+      "trace_principal" => "browser-principal",
+      "module" => "Elixir.System",
+      "path" => "/etc/passwd",
+      "cursor" => "999"
+    })
+
+    assert_receive {:live_gateway, {:graph_detail, detail_identity, "checkout"}}, 1_000
+    assert detail_identity == context.identity
+    assert_receive {:live_gateway, {:graph_overlay, overlay_identity, "checkout", 0}}, 1_000
+    assert overlay_identity == context.identity
+
+    html = render(view)
+    assert html =~ "authorize"
+    assert html =~ "node_states"
+    refute html =~ "RAW_GRAPH_PROMPT_SHOULD_NOT_RENDER"
+    refute html =~ "RAW_TRACE_RESPONSE_SHOULD_NOT_RENDER"
+    refute html =~ "browser-owner"
+    refute html =~ "/etc/passwd"
+
+    render_click(view, "refresh-traces", %{
+      "cursor" => "999",
+      "trace_principal" => "forged"
+    })
+
+    assert_receive {:live_gateway, {:trace_timeline, refreshed_identity, 1}}, 1_000
+    assert refreshed_identity == context.identity
+    refute render(view) =~ "RAW_TRACE_RESPONSE_SHOULD_NOT_RENDER"
+  end
+
+  test "trace and overlay replay gaps require an explicit server-derived recovery", %{conn: conn} do
+    Application.put_env(:erlang_adk_ui, :test_trace_gap, true)
+    Application.put_env(:erlang_adk_ui, :test_graph_overlay_gap, true)
+
+    on_exit(fn ->
+      Application.delete_env(:erlang_adk_ui, :test_trace_gap)
+      Application.delete_env(:erlang_adk_ui, :test_graph_overlay_gap)
+    end)
+
+    {conn, _handle, context} = authenticated(conn)
+    {:ok, view, html} = live(conn, ~p"/live")
+
+    assert html =~ "Trace timeline has a replay gap"
+    assert has_element?(view, "#resume-traces", "Resume at retained boundary")
+
+    render_click(view, "resume-traces", %{"cursor" => "browser-forged"})
+    assert_receive {:live_gateway, {:trace_timeline, trace_identity, 3}}, 1_000
+    assert trace_identity == context.identity
+    refute has_element?(view, "#resume-traces")
+    assert render(view) =~ "next_cursor"
+
+    render_click(view, "refresh-traces")
+    assert_receive {:live_gateway, {:trace_timeline, ^trace_identity, 4}}, 1_000
+
+    render_submit(view, "show-graph", %{"graph_id" => "checkout"})
+    assert_receive {:live_gateway, {:graph_overlay, overlay_identity, "checkout", 0}}, 1_000
+    assert overlay_identity == context.identity
+
+    assert render(view) =~ "Graph overlay has a replay gap"
+    assert has_element?(view, "#graph-detail")
+    assert has_element?(view, "#resume-graph-overlay", "Resume overlay at retained boundary")
+
+    render_click(view, "resume-graph-overlay", %{
+      "cursor" => "browser-forged",
+      "trace_store" => "browser-forged"
+    })
+
+    assert_receive {:live_gateway, {:graph_overlay, ^overlay_identity, "checkout", 3}}, 1_000
+    refute has_element?(view, "#resume-graph-overlay")
+    assert has_element?(view, "#graph-overlay")
+    refute render(view) =~ "RAW_TRACE_RESPONSE_SHOULD_NOT_RENDER"
+  end
+
+  test "a graph identifier absent from the current catalog is never sent to the gateway", %{
+    conn: conn
+  } do
+    {conn, _handle, _context} = authenticated(conn)
+    {:ok, view, _html} = live(conn, ~p"/live")
+    flush_gateway_messages()
+
+    render_submit(view, "show-graph", %{"graph_id" => "hidden"})
+
+    assert render(view) =~ "could not be inspected safely"
+    refute_receive {:live_gateway, {:graph_detail, _identity, "hidden"}}, 100
+    refute_receive {:live_gateway, {:graph_overlay, _identity, "hidden", _cursor}}, 100
+  end
+
   test "a session identifier not returned by discovery is never sent to the gateway", %{
     conn: conn
   } do

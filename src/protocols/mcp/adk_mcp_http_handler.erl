@@ -1,9 +1,11 @@
-%% @doc Cowboy boundary for the MCP 2025-11-25 Streamable HTTP transport.
+%% @doc Cowboy boundary for legacy and stateless modern MCP Streamable HTTP.
 -module(adk_mcp_http_handler).
 
 -export([init/2]).
 
 -define(JSON, <<"application/json">>).
+-define(SSE, <<"text/event-stream">>).
+-define(SUBSCRIPTION_HEARTBEAT_MS, 15000).
 -define(MAX_CALLBACK_RESULT_BYTES, 4096).
 
 init(Req0, Config) ->
@@ -16,10 +18,7 @@ init(Req0, Config) ->
 dispatch(Req0, Config, AuthContext) ->
     case cowboy_req:method(Req0) of
         <<"POST">> -> handle_post(Req0, Config, AuthContext);
-        <<"GET">> ->
-            %% This bounded implementation does not expose an unsolicited SSE
-            %% channel. MCP explicitly permits a 405 response for GET.
-            reply_empty(405, Req0, Config);
+        <<"GET">> -> handle_get(Req0, Config);
         <<"DELETE">> -> handle_delete(Req0, Config, AuthContext);
         _ -> reply_empty(405, Req0, Config)
     end.
@@ -56,8 +55,19 @@ dispatch_message(Message, Req0, Config, AuthContext) ->
     Version = cowboy_req:header(<<"mcp-protocol-version">>, Req0),
     Server = maps:get(server, Config),
     Timeout = maps:get(request_timeout, Config),
-    case safe_server_call(Server, Session, Version, Message,
-                          AuthContext, Timeout) of
+    Reply = case Version of
+        <<"2026-07-28">> ->
+            case maps:get(modern_enabled, Config, true) of
+                true -> dispatch_modern(Server, Message, Req0, AuthContext,
+                                        Config, Timeout);
+                false -> {http_error, 426,
+                          [{<<"mcp-protocol-version">>, <<"2025-11-25">>}]}
+            end;
+        _ ->
+            safe_server_call(Server, Session, Version, Message,
+                             AuthContext, Timeout)
+    end,
+    case Reply of
                 {json, Status, Headers, Response} ->
                     BodyOut = jsx:encode(Response),
                     Req1 = cowboy_req:reply(
@@ -73,8 +83,89 @@ dispatch_message(Message, Req0, Config, AuthContext) ->
                 {http_error, Status, Headers} ->
                     Req1 = cowboy_req:reply(Status, maps:from_list(Headers),
                                             <<>>, Req0),
-                    {ok, Req1, Config}
+                    {ok, Req1, Config};
+                {subscription, Id, Ack} ->
+                    stream_modern_subscription(Server, Id, Ack,
+                                               Req0, Config)
     end.
+
+dispatch_modern(Server, Message, Req, AuthContext, Config, Timeout) ->
+    Headers = modern_protocol_headers(Req),
+    case adk_mcp_protocol:validate_http_request(modern, Headers, Message) of
+        {ok, Context} ->
+            case {maps:get(modern_subscriptions, Config, false), Message} of
+                {true, #{<<"id">> := Id,
+                         <<"method">> := <<"subscriptions/listen">>,
+                         <<"params">> := Params}} ->
+                    open_modern_subscription(
+                      Server, Id, Params, AuthContext, Timeout);
+                _ ->
+                    safe_modern_server_call(Server, Message, Context,
+                                            AuthContext, Timeout)
+            end;
+        {error, _Reason} ->
+            {json, 400, [], jsonrpc_error(null, -32600,
+                                          <<"Invalid modern request">>)}
+    end.
+
+open_modern_subscription(Server, Id, Params, AuthContext, Timeout) ->
+    Filter = maps:get(<<"notifications">>, Params, invalid),
+    case adk_mcp_server:open_modern_subscription(
+           Server, Id, Filter, self(), AuthContext, Timeout) of
+        {ok, Ack} -> {subscription, Id, Ack};
+        {error, mcp_subscription_capacity_reached} ->
+            {json, 200, [], jsonrpc_error(
+                              Id, -32000,
+                              <<"Subscription capacity reached">>)};
+        {error, _} ->
+            {json, 200, [], jsonrpc_error(
+                              Id, -32602,
+                              <<"Invalid subscription request">>)}
+    end.
+
+stream_modern_subscription(Server, Id, Ack, Req0, Config) ->
+    Headers = #{<<"content-type">> => ?SSE,
+                <<"cache-control">> => <<"no-cache, no-transform">>,
+                <<"x-accel-buffering">> => <<"no">>},
+    Req1 = cowboy_req:stream_reply(200, Headers, Req0),
+    try stream_subscription_message(Ack, nofin, Req1) of
+        ok ->
+            Req2 = modern_subscription_loop(Server, Id, Req1),
+            {ok, Req2, Config};
+        closed -> {ok, Req1, Config}
+    after
+        ok = adk_mcp_server:close_modern_subscription(
+               Server, self(), Id)
+    end.
+
+modern_subscription_loop(Server, Id, Req) ->
+    receive
+        {adk_mcp_subscription_event, Id, Kind, Notification} ->
+            case stream_subscription_message(Notification, nofin, Req) of
+                ok ->
+                    ok = adk_mcp_server:acknowledge_modern_subscription(
+                           Server, self(), Id, Kind),
+                    modern_subscription_loop(Server, Id, Req);
+                closed -> Req
+            end
+    after ?SUBSCRIPTION_HEARTBEAT_MS ->
+        case safe_stream_body(<<": heartbeat\n\n">>, nofin, Req) of
+            ok -> modern_subscription_loop(Server, Id, Req);
+            closed -> Req
+        end
+    end.
+
+stream_subscription_message(Message, Fin, Req) ->
+    Body = <<"event: message\ndata: ", (jsx:encode(Message))/binary,
+             "\n\n">>,
+    safe_stream_body(Body, Fin, Req).
+
+modern_protocol_headers(Req) ->
+    maps:from_list(
+      [{Name, Value}
+       || Name <- [<<"mcp-protocol-version">>, <<"mcp-method">>,
+                    <<"mcp-name">>],
+          Value <- [cowboy_req:header(Name, Req)], Value =/= undefined]).
 
 authorize_operation(Message, AuthContext,
                     #{authorization := {hook, Fun}} = Config) ->
@@ -126,6 +217,35 @@ safe_server_call(Server, Session, Version, Message, AuthContext, Timeout) ->
         exit:{timeout, _} -> {http_error, 504, []};
         exit:_ -> {http_error, 503, []}
     end.
+
+safe_modern_server_call(Server, Message, Context, AuthContext, Timeout) ->
+    try adk_mcp_server:handle_modern_http(
+          Server, Message, Context, AuthContext, Timeout) of
+        Reply -> Reply
+    catch
+        exit:{timeout, _} -> {http_error, 504, []};
+        exit:_ -> {http_error, 503, []}
+    end.
+
+handle_get(Req0, #{legacy_sse_compat := true} = Config) ->
+    Version = cowboy_req:header(<<"mcp-protocol-version">>, Req0),
+    Accept = lower(cowboy_req:header(<<"accept">>, Req0, <<>>)),
+    Legacy = Version =:= undefined orelse Version =:= <<"2025-11-25">>
+        orelse Version =:= <<"2025-06-18">>,
+    case Legacy andalso
+         binary:match(Accept, <<"text/event-stream">>) =/= nomatch of
+        true ->
+            Path = maps:get(path, Config),
+            Body = <<"event: endpoint\ndata: ", Path/binary, "\n\n">>,
+            Headers = #{<<"content-type">> => <<"text/event-stream">>,
+                        <<"cache-control">> => <<"no-store">>,
+                        <<"deprecation">> => <<"true">>,
+                        <<"mcp-protocol-version">> => <<"2025-11-25">>},
+            Req1 = cowboy_req:reply(200, Headers, Body, Req0),
+            {ok, Req1, Config};
+        false -> reply_empty(405, Req0, Config)
+    end;
+handle_get(Req0, Config) -> reply_empty(405, Req0, Config).
 
 handle_delete(Req0, Config, AuthContext) ->
     Session = cowboy_req:header(<<"mcp-session-id">>, Req0),
@@ -347,6 +467,12 @@ reply_json(Status, Message, Req0, Config) ->
                             #{<<"content-type">> => ?JSON},
                             jsx:encode(Message), Req0),
     {ok, Req1, Config}.
+
+safe_stream_body(Body, Fin, Req) ->
+    try cowboy_req:stream_body(Body, Fin, Req) of
+        ok -> ok
+    catch _:_ -> closed
+    end.
 
 jsonrpc_error(Id, Code, Message) ->
     #{<<"jsonrpc">> => <<"2.0">>, <<"id">> => Id,

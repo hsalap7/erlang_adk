@@ -10,8 +10,8 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    case configure_oidcc() of
-        ok -> start_after_oidcc();
+    case adk_deployment_env:configure() of
+        ok -> start_after_deployment_env();
         {error, _} = Error -> Error
     end.
 
@@ -19,6 +19,12 @@ stop(_State) ->
     ok.
 
 %% internal functions
+
+start_after_deployment_env() ->
+    case configure_oidcc() of
+        ok -> start_after_oidcc();
+        {error, _} = Error -> Error
+    end.
 
 start_after_oidcc() ->
     case init_configured_session_backend() of

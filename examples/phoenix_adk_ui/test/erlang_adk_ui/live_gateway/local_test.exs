@@ -13,6 +13,134 @@ defmodule ErlangAdkUi.LiveGateway.LocalTest do
     assert {:error, :forbidden} = Local.close_voice(identity, make_ref())
     assert {:error, :forbidden} = Local.observability_snapshot(identity)
     assert {:error, :forbidden} = Local.list_evaluations(identity)
+    assert {:error, :forbidden} = Local.list_graphs(identity)
+    assert {:error, :forbidden} = Local.graph_detail(identity, "checkout")
+    assert {:error, :forbidden} = Local.graph_overlay(identity, "checkout", 0)
+    assert {:error, :forbidden} = Local.trace_timeline(identity, 0)
+
+    graph_only = %{principal: "principal", scopes: ["adk.graph.read"]}
+    trace_only = %{principal: "principal", scopes: ["adk.trace.read"]}
+
+    assert {:error, :service_unavailable} = Local.list_graphs(graph_only)
+    assert {:error, :forbidden} = Local.graph_overlay(graph_only, "checkout", 0)
+    assert {:error, :forbidden} = Local.graph_overlay(trace_only, "checkout", 0)
+    assert {:error, :service_unavailable} = Local.trace_timeline(trace_only, 0)
+  end
+
+  test "graph and trace reads use only fixed server ownership and preserve replay gaps" do
+    original = Application.fetch_env!(:erlang_adk_ui, :graph_trace)
+
+    {:ok, catalog} = :adk_dev_graph_catalog.start_link(%{name: :undefined})
+
+    {:ok, store} =
+      :adk_trace_store.start_link(%{
+        name: :undefined,
+        max_events: 2,
+        max_bytes: 65_536,
+        max_event_bytes: 16_384,
+        max_principals: 4,
+        max_events_per_principal: 2,
+        max_bytes_per_principal: 65_536,
+        retention_ms: 60_000,
+        max_query_events: 2,
+        max_query_bytes: 65_536,
+        content_policy: :prune
+      })
+
+    on_exit(fn ->
+      Application.put_env(:erlang_adk_ui, :graph_trace, original)
+      if Process.alive?(store), do: GenServer.stop(store)
+      if Process.alive?(catalog), do: GenServer.stop(catalog)
+    end)
+
+    {:ok, compiled} = compiled_graph()
+
+    assert {:ok, _published} =
+             :adk_dev_graph_catalog.publish(
+               catalog,
+               "operations-owner",
+               "checkout",
+               compiled
+             )
+
+    assert {:ok, _hidden} =
+             :adk_dev_graph_catalog.publish(catalog, "other-owner", "hidden", compiled)
+
+    assert {:ok, 1} =
+             :adk_trace_store.append_lifecycle(
+               store,
+               "other-trace-principal",
+               lifecycle("node_completed", 1, "other-workflow")
+             )
+
+    assert {:ok, 2} =
+             :adk_trace_store.append_lifecycle(
+               store,
+               "operations-trace-principal",
+               Map.put(lifecycle("node_started", 1), "response", "PRIVATE_RESPONSE")
+             )
+
+    assert {:ok, 3} =
+             :adk_trace_store.append_lifecycle(
+               store,
+               "operations-trace-principal",
+               lifecycle("node_completed", 2)
+             )
+
+    Application.put_env(:erlang_adk_ui, :graph_trace, %{
+      graph_catalog: catalog,
+      graph_owner: "operations-owner",
+      trace_store: store,
+      trace_principal: "operations-trace-principal",
+      trace_selector: %{workflow_id: "checkout"},
+      graph_list_limit: 10,
+      trace_limit: 2,
+      trace_max_bytes: 65_536
+    })
+
+    identity = %{
+      principal: "browser-principal",
+      scopes: ["adk.graph.read", "adk.trace.read"]
+    }
+
+    assert {:ok, %{"graphs" => [%{"id" => "checkout"}]}} = Local.list_graphs(identity)
+    assert {:error, :not_found} = Local.graph_detail(identity, "hidden")
+
+    assert {:ok, detail} = Local.graph_detail(identity, "checkout")
+    refute :erlang.term_to_binary(detail) =~ "PRIVATE_RESPONSE"
+
+    assert {:ok, timeline} = Local.trace_timeline(identity, 1)
+    assert Enum.map(timeline["events"], & &1["cursor"]) == [2, 3]
+    assert timeline["events"] |> hd() |> Map.fetch!("content_pruned")
+    refute :erlang.term_to_binary(timeline) =~ "PRIVATE_RESPONSE"
+    refute :erlang.term_to_binary(timeline) =~ "other-workflow"
+
+    assert {:ok, overlay} = Local.graph_overlay(identity, "checkout", 1)
+    assert overlay["content_captured"] == false
+    refute :erlang.term_to_binary(overlay) =~ "PRIVATE_RESPONSE"
+
+    assert {:error, {:cursor_ahead, ahead}} = Local.trace_timeline(identity, 99)
+    assert ahead["latest_cursor"] == 3
+    assert {:error, {:cursor_ahead, _ahead}} = Local.graph_overlay(identity, "checkout", 99)
+
+    assert {:ok, 4} =
+             :adk_trace_store.append_lifecycle(
+               store,
+               "operations-trace-principal",
+               lifecycle("node_started", 3)
+             )
+
+    assert {:error, {:replay_gap, gap}} = Local.trace_timeline(identity, 0)
+    assert gap["evicted_through"] == 2
+    assert {:error, {:replay_gap, _gap}} = Local.graph_overlay(identity, "checkout", 0)
+
+    Application.put_env(
+      :erlang_adk_ui,
+      :graph_trace,
+      Map.put(Application.fetch_env!(:erlang_adk_ui, :graph_trace), :module, System)
+    )
+
+    assert {:error, :invalid_graph_trace_config} = Local.list_graphs(identity)
   end
 
   test "evaluation catalog accepts only a bounded server-configured map" do
@@ -160,6 +288,32 @@ defmodule ErlangAdkUi.LiveGateway.LocalTest do
     assert_receive {:test_live_transport, :sent, ^transport, setup_frame}
     assert is_binary(setup_frame)
     {session_id, session, transport}
+  end
+
+  defp compiled_graph do
+    :adk_workflow.compile(%{
+      version: 1,
+      id: "checkout",
+      kind: :graph,
+      entry: "authorize",
+      max_steps: 4,
+      nodes: [%{id: "authorize", run: fn _state -> {:ok, %{}} end}],
+      edges: %{"authorize" => :end_node}
+    })
+  end
+
+  defp lifecycle(type, sequence, workflow_id \\ "checkout") do
+    %{
+      "schema_version" => 1,
+      "type" => type,
+      "sequence" => sequence,
+      "timestamp" => System.system_time(:millisecond),
+      "workflow_id" => workflow_id,
+      "workflow_kind" => "graph",
+      "invocation_id" => "invocation-1",
+      "node_id" => "authorize",
+      "outcome" => "ok"
+    }
   end
 
   defp start_openai_live_session do

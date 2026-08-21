@@ -5,7 +5,7 @@
 -define(DEV_TOKEN, <<"0123456789abcdef-startup-dev-token">>).
 
 -define(HTTP_ENV_KEYS,
-        [a2a_enabled, a2a_v1_enabled, a2a_v1_card,
+        [a2a_enabled, a2a_v1_enabled, http_health_enabled, a2a_v1_card,
          a2a_v1_server_options, a2a_v1_auth,
          a2a_v1_jwt_policy,
          a2a_v1_max_body_bytes, a2a_v1_sse_heartbeat_ms,
@@ -14,6 +14,7 @@
          a2a_v1_agent_name,
          dev_enabled, dev_auth_token, dev_auth_token_env,
          dev_session_service, dev_runner_options, dev_run_options,
+         dev_provider_payload_inspection,
          dev_max_body_bytes, dev_max_field_bytes, dev_sse_heartbeat_ms,
          dev_sse_max_events, dev_sse_max_bytes, dev_sse_max_duration_ms,
          dev_max_session_results, dev_live_principal, dev_live_credit,
@@ -33,7 +34,18 @@ secure_startup() ->
     SavedAdkEnv = save_env(erlang_adk,
                            [session_backend, admission_control,
                             oidc_providers,
-                            oidc_max_clock_skew_seconds | ?HTTP_ENV_KEYS]),
+                            oidc_max_clock_skew_seconds,
+                            runtime_service_profile,
+                            runtime_service_profile_config,
+                            evaluation_service_enabled,
+                            evaluation_store,
+                            evaluation_store_options,
+                            evaluation_service_options,
+                            trace_store_enabled,
+                            trace_store_options,
+                            trace_store_principal,
+                            observability_bus_enabled,
+                            observability_bus_options | ?HTTP_ENV_KEYS]),
     SavedMnesiaDir = application:get_env(mnesia, dir),
     TempMnesiaDir = filename:join(
                        os:getenv("TMPDIR", "/tmp"),
@@ -43,10 +55,12 @@ secure_startup() ->
     stop_application(mnesia),
     try
         default_startup_is_lean(),
+        optional_v010_service_restart_ordering(),
         invalid_oidc_clock_skew_fails_startup(),
         configured_mnesia_startup(TempMnesiaDir),
         developer_listener_is_always_loopback(),
         legacy_listener_is_always_loopback(),
+        health_only_listener_exposes_no_agent_routes(),
         a2a_v1_public_listener_fails_closed(),
         supervised_http_is_bounded(),
         supervised_dev_listener_is_authenticated(),
@@ -65,6 +79,7 @@ default_startup_is_lean() ->
     application:unset_env(erlang_adk, session_backend),
     application:set_env(erlang_adk, a2a_enabled, false),
     application:set_env(erlang_adk, a2a_v1_enabled, false),
+    application:set_env(erlang_adk, http_health_enabled, false),
     application:set_env(erlang_adk, dev_enabled, false),
     application:set_env(erlang_adk, oidc_providers, []),
     application:set_env(erlang_adk, oidc_max_clock_skew_seconds, 300),
@@ -78,6 +93,81 @@ default_startup_is_lean() ->
     ?assertEqual({ok, 300},
                  application:get_env(oidcc, max_clock_skew)),
     stop_application(erlang_adk).
+
+optional_v010_service_restart_ordering() ->
+    application:set_env(erlang_adk, runtime_service_profile, disabled),
+    application:set_env(erlang_adk, evaluation_service_enabled, true),
+    application:set_env(erlang_adk, evaluation_store, ets),
+    application:set_env(erlang_adk, evaluation_store_options, #{}),
+    application:set_env(erlang_adk, evaluation_service_options,
+                        #{max_concurrency => 1, max_queue => 2}),
+    application:set_env(erlang_adk, trace_store_enabled, true),
+    application:set_env(erlang_adk, trace_store_options,
+                        #{max_events => 16, max_bytes => 262144,
+                          max_event_bytes => 32768,
+                          max_events_per_principal => 8,
+                          max_bytes_per_principal => 131072,
+                          max_query_events => 8,
+                          max_query_bytes => 131072}),
+    application:set_env(erlang_adk, trace_store_principal,
+                        <<"startup-trace-principal">>),
+    application:set_env(erlang_adk, observability_bus_enabled, false),
+    application:set_env(erlang_adk, observability_bus_options,
+                        #{flush_interval_ms => 10, batch_size => 8}),
+    {ok, _} = application:ensure_all_started(erlang_adk),
+    Eval0 = whereis(adk_eval_service),
+    Trace0 = whereis(adk_trace_store),
+    Run0 = whereis(adk_run_registry),
+    ?assert(is_pid(Eval0)),
+    ?assert(is_pid(Trace0)),
+    ?assert(is_pid(Run0)),
+    ?assert(is_pid(whereis(adk_observability_bus))),
+
+    {ok, #{session_service := TraceSession,
+           runner_options := TraceRunnerOptions}} =
+        erlang_adk:runtime_runner_spec(),
+    ?assertMatch(#{observability := #{delivery := async,
+                                      capture_content := false}},
+                 TraceRunnerOptions),
+    {ok, TraceAgent} = erlang_adk:spawn_agent(
+                         <<"StartupTraceAgent">>,
+                         #{provider => adk_llm_probe,
+                           model => <<"probe">>,
+                           response => <<"traced">>}, []),
+    try
+        TraceRunner = adk_runner:new(
+                        TraceAgent, <<"startup-trace-app">>,
+                        TraceSession, TraceRunnerOptions),
+        ?assertEqual(
+           {ok, <<"traced">>},
+           adk_runner:run(
+             TraceRunner, <<"startup-trace-user">>,
+             <<"startup-trace-session">>, <<"trace me">>)),
+        ok = adk_observability_bus:drain(3000),
+        {ok, TracePage} = adk_trace_store:query(
+                            <<"startup-trace-principal">>, all, #{}),
+        ?assert(maps:get(<<"events">>, TracePage) =/= [])
+    after
+        ok = erlang_adk:stop_agent(TraceAgent)
+    end,
+
+    exit(Run0, kill),
+    _Run1 = await_replaced_registered(adk_run_registry, Run0, 3000),
+    ?assertEqual(Eval0, whereis(adk_eval_service)),
+    ?assertEqual(Trace0, whereis(adk_trace_store)),
+
+    TaskSup0 = whereis(adk_task_sup),
+    exit(TaskSup0, kill),
+    _TaskSup1 = await_replaced_registered(adk_task_sup, TaskSup0, 3000),
+    _Eval1 = await_replaced_registered(adk_eval_service, Eval0, 3000),
+    ?assertEqual(Trace0, whereis(adk_trace_store)),
+    stop_application(erlang_adk),
+    application:set_env(erlang_adk, evaluation_service_enabled, false),
+    application:set_env(erlang_adk, trace_store_enabled, false),
+    application:set_env(erlang_adk, trace_store_principal,
+                        <<"local-runtime">>),
+    application:set_env(erlang_adk, observability_bus_enabled, false),
+    application:set_env(erlang_adk, observability_bus_options, #{}).
 
 invalid_oidc_clock_skew_fails_startup() ->
     application:set_env(erlang_adk, oidc_max_clock_skew_seconds, 301),
@@ -168,6 +258,29 @@ legacy_listener_is_always_loopback() ->
     application:set_env(erlang_adk, a2a_allow_non_loopback, false),
     application:set_env(erlang_adk, a2a_trusted_tls_proxy, false),
     application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}).
+
+health_only_listener_exposes_no_agent_routes() ->
+    Port = free_port(),
+    application:set_env(erlang_adk, a2a_enabled, false),
+    application:set_env(erlang_adk, a2a_v1_enabled, false),
+    application:set_env(erlang_adk, http_health_enabled, true),
+    application:set_env(erlang_adk, dev_enabled, false),
+    application:set_env(erlang_adk, a2a_port, Port),
+    application:set_env(erlang_adk, a2a_ip, {0, 0, 0, 0}),
+    {ok, _} = application:ensure_all_started(erlang_adk),
+    try
+        Base = "http://127.0.0.1:" ++ integer_to_list(Port),
+        {ok, {{_, 200, _}, _, _}} =
+            httpc:request(get, {Base ++ "/livez", []}, [], []),
+        {ok, {{_, 200, _}, _, _}} =
+            httpc:request(get, {Base ++ "/readyz", []}, [], []),
+        {ok, {{_, 404, _}, _, _}} =
+            httpc:request(get, {Base ++ "/a2a/prompt", []}, [], [])
+    after
+        stop_application(erlang_adk),
+        application:set_env(erlang_adk, http_health_enabled, false),
+        application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1})
+    end.
 
 a2a_v1_public_listener_fails_closed() ->
     Port = free_port(),
@@ -269,6 +382,7 @@ supervised_http_is_bounded() ->
 supervised_dev_listener_is_authenticated() ->
     Keys = [a2a_enabled, a2a_v1_enabled, dev_enabled,
             dev_auth_token, dev_resource_provider,
+            dev_provider_payload_inspection,
             dev_max_resource_results, dev_diagnostic_timeout_ms,
             dev_diagnostic_context_policy, dev_live_principal,
             dev_live_credit, a2a_port, a2a_ip],
@@ -293,6 +407,11 @@ supervised_dev_listener_is_authenticated() ->
         application:set_env(erlang_adk, dev_enabled, true),
         application:set_env(erlang_adk, dev_auth_token, ?DEV_TOKEN),
         application:set_env(
+          erlang_adk, dev_provider_payload_inspection,
+          #{enabled => true, max_events => 8,
+            max_event_bytes => 16384, max_total_bytes => 65536,
+            retention_ms => 60000}),
+        application:set_env(
           erlang_adk, dev_resource_provider,
           {adk_dev_v05_resource_provider, ProviderConfig}),
         application:set_env(erlang_adk, dev_max_resource_results, 1),
@@ -309,6 +428,7 @@ supervised_dev_listener_is_authenticated() ->
         application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
         {ok, _} = application:ensure_all_started(erlang_adk),
         ?assert(supervised_child_present(erlang_adk_http)),
+        ?assert(supervised_child_present(adk_dev_payload_store)),
         {ok, _} = erlang_adk_session:create_session(
                     App, User, #{session_id => Session}),
 
@@ -353,7 +473,34 @@ supervised_dev_listener_is_authenticated() ->
               get, {LiveUrl, [{"authorization", Authorization}]}, [],
               [{body_format, binary}]),
         LivePayload = jsx:decode(LiveBody, [return_maps]),
-        ?assert(is_list(maps:get(<<"sessions">>, LivePayload)))
+        ?assert(is_list(maps:get(<<"sessions">>, LivePayload))),
+
+        {ok, _PayloadAgent} = erlang_adk:spawn_agent(
+                                <<"StartupPayloadAgent">>,
+                                #{provider => adk_llm_probe,
+                                  response => <<"payload response">>}, []),
+        RunUrl = "http://127.0.0.1:" ++ integer_to_list(Port) ++
+                 "/dev/v1/runs",
+        RunBody = jsx:encode(
+                    #{<<"agent_name">> => <<"StartupPayloadAgent">>,
+                      <<"app_name">> => App,
+                      <<"user_id">> => User,
+                      <<"session_id">> => Session,
+                      <<"message">> => <<"inspect payload">>}),
+        {ok, {{_HttpVersion6, 202, _Reason6}, _Headers6, _RunReply}} =
+            httpc:request(
+              post,
+              {RunUrl, [{"authorization", Authorization}],
+               "application/json", RunBody}, [], [{body_format, binary}]),
+        PayloadUrl = "http://127.0.0.1:" ++ integer_to_list(Port) ++
+                     "/dev/v1/provider-payloads?limit=1",
+        PayloadWindow = await_payload_window(
+                          PayloadUrl, Authorization,
+                          erlang:monotonic_time(millisecond) + 3000),
+        [PayloadEvent] = maps:get(<<"items">>, PayloadWindow),
+        ?assert(lists:member(
+                  maps:get(<<"phase">>, PayloadEvent),
+                  [<<"request">>, <<"response">>]))
     after
         _ = catch erlang_adk_session:delete_session(App, User, Session),
         _ = adk_artifact_ets:stop(ArtifactPid),
@@ -362,29 +509,77 @@ supervised_dev_listener_is_authenticated() ->
         restore_env(erlang_adk, SavedEnv)
     end.
 
+await_payload_window(Url, Authorization, Deadline) ->
+    case httpc:request(
+           get, {Url, [{"authorization", Authorization}]}, [],
+           [{body_format, binary}]) of
+        {ok, {{_Version, 200, _Reason}, _Headers, Body}} ->
+            Payload = jsx:decode(Body, [return_maps]),
+            case maps:get(<<"items">>, Payload, []) of
+                [] -> retry_payload_window(Url, Authorization, Deadline);
+                _ -> Payload
+            end;
+        _ -> retry_payload_window(Url, Authorization, Deadline)
+    end.
+
+retry_payload_window(Url, Authorization, Deadline) ->
+    case erlang:monotonic_time(millisecond) < Deadline of
+        true ->
+            timer:sleep(10),
+            await_payload_window(Url, Authorization, Deadline);
+        false -> erlang:error(provider_payload_window_timeout)
+    end.
+
 supervised_a2a_v1_is_discoverable() ->
     Port = free_port(),
     Base = <<"http://127.0.0.1:", (integer_to_binary(Port))/binary>>,
+    SecuritySchemes = #{
+      <<"bearer">> => #{
+        <<"httpAuthSecurityScheme">> => #{<<"scheme">> => <<"Bearer">>}}},
+    SecurityRequirements = [
+      #{<<"schemes">> => #{<<"bearer">> => #{<<"list">> => []}}}],
     {ok, Card} = adk_a2a_v1_card:new(
                    #{url => <<Base/binary, "/a2a/v1">>,
                      name => <<"Startup A2A fixture">>,
-                     description => <<"Supervised A2A fixture">>}),
+                     description => <<"Supervised A2A fixture">>,
+                     extended_agent_card => true,
+                     security_schemes => SecuritySchemes,
+                     security_requirements => SecurityRequirements}),
+    {ok, ExtendedCard} = adk_a2a_v1_card:new(
+                           #{url => <<Base/binary, "/a2a/v1">>,
+                             name => <<"Startup A2A private fixture">>,
+                             description =>
+                                 <<"Authenticated extended card">>,
+                             extended_agent_card => true,
+                             security_schemes => SecuritySchemes,
+                             security_requirements => SecurityRequirements}),
     Executor = fun(_Request, _Emit) -> {ok, <<"fixture response">>} end,
     application:set_env(erlang_adk, a2a_enabled, false),
     application:set_env(erlang_adk, a2a_v1_enabled, true),
     application:set_env(erlang_adk, a2a_v1_card, Card),
     application:set_env(erlang_adk, a2a_v1_server_options,
-                        #{executor => Executor}),
-    application:set_env(erlang_adk, a2a_v1_auth, none),
+                        #{executor => Executor,
+                          extended_card => ExtendedCard}),
+    application:set_env(erlang_adk, a2a_v1_auth,
+                        adk_a2a_v1_test_auth),
     application:set_env(erlang_adk, a2a_v1_max_body_bytes, 65536),
     application:set_env(erlang_adk, a2a_port, Port),
     application:set_env(erlang_adk, a2a_ip, {127, 0, 0, 1}),
     {ok, _} = application:ensure_all_started(erlang_adk),
     ?assert(supervised_child_present(adk_a2a_v1_server)),
     ?assert(supervised_child_present(erlang_adk_http)),
-    LocalClient = #{timeout => 3000, allow_http_loopback => true},
+    LocalClient = #{timeout => 3000, allow_http_loopback => true,
+                    auth_scheme => <<"bearer">>,
+                    auth_fun => fun() ->
+                        [{<<"authorization">>,
+                          <<"Bearer alice-secret">>}]
+                    end},
     {ok, Discovered} = adk_a2a_v1_client:discover(Base, LocalClient),
     ?assertEqual(Card, Discovered),
+    ?assertEqual(
+       {ok, ExtendedCard},
+       adk_a2a_v1_client:get_extended_card(
+         Discovered, LocalClient)),
     {ok, #{<<"task">> := Task}} = adk_a2a_v1_client:send(
                                       Discovered,
                                       #{<<"messageId">> => <<"startup-msg">>,
@@ -403,6 +598,22 @@ supervised_a2a_v1_is_discoverable() ->
 
 supervised_child_present(Id) ->
     lists:keymember(Id, 1, supervisor:which_children(erlang_adk_sup)).
+
+await_replaced_registered(Name, OldPid, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    await_replaced_registered_until(Name, OldPid, Deadline).
+
+await_replaced_registered_until(Name, OldPid, Deadline) ->
+    case whereis(Name) of
+        Pid when is_pid(Pid), Pid =/= OldPid -> Pid;
+        _ ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(10),
+                    await_replaced_registered_until(Name, OldPid, Deadline);
+                false -> erlang:error({child_not_restarted, Name})
+            end
+    end.
 
 free_port() ->
     {ok, Socket} = gen_tcp:listen(

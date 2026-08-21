@@ -1,6 +1,8 @@
 %% @doc Cowboy route bundle for the opt-in local ADK developer platform.
 -module(adk_dev_router).
 
+-include("adk_eval_report.hrl").
+
 -export([routes/1, routes_validated/1, compile/1, validate_config/1]).
 
 -define(DEFAULT_MAX_BODY_BYTES, 65536).
@@ -46,10 +48,34 @@ route_list(Config) ->
          Config#{endpoint => diagnostics}},
         {"/dev/v1/observability", adk_dev_handler,
          Config#{endpoint => observability}},
+        {"/dev/v1/provider-payloads", adk_dev_handler,
+         Config#{endpoint => provider_payloads}},
+        {"/dev/v1/graphs/:graph_id/overlay", adk_dev_handler,
+         Config#{endpoint => graph_overlay}},
+        {"/dev/v1/graphs/:graph_id", adk_dev_handler,
+         Config#{endpoint => graph}},
+        {"/dev/v1/graphs", adk_dev_handler,
+         Config#{endpoint => graphs}},
+        {"/dev/v1/traces", adk_dev_handler,
+         Config#{endpoint => traces}},
         {"/dev/v1/evaluation/render", adk_dev_handler,
          Config#{endpoint => evaluation_render}},
         {"/dev/v1/evaluation/compare", adk_dev_handler,
          Config#{endpoint => evaluation_compare}},
+        {"/dev/v1/evaluation/jobs/:job_id/report", adk_dev_handler,
+         Config#{endpoint => evaluation_job_report}},
+        {"/dev/v1/evaluation/jobs/:job_id/result", adk_dev_handler,
+         Config#{endpoint => evaluation_job_result}},
+        {"/dev/v1/evaluation/jobs/:job_id", adk_dev_handler,
+         Config#{endpoint => evaluation_job}},
+        {"/dev/v1/evaluation/jobs", adk_dev_handler,
+         Config#{endpoint => evaluation_jobs}},
+        {"/dev/v1/evaluation/sets/:set_id/:version", adk_dev_handler,
+         Config#{endpoint => evaluation_set}},
+        {"/dev/v1/evaluation/sets", adk_dev_handler,
+         Config#{endpoint => evaluation_sets}},
+        {"/dev/v1/evaluation/baselines/:baseline_name", adk_dev_handler,
+         Config#{endpoint => evaluation_baseline}},
         {"/dev/v1/live/sessions/:session_id/events", adk_dev_handler,
          Config#{endpoint => live_session_events}},
         {"/dev/v1/live/sessions/:session_id/text", adk_dev_handler,
@@ -92,6 +118,8 @@ route_list(Config) ->
 valid_sanitized_config(Config) when is_map(Config) ->
     Digest = maps:get(auth_token_digest, Config, undefined),
     MaxBody = maps:get(max_body_bytes, Config, undefined),
+    EvaluationReportMax = maps:get(evaluation_report_max_bytes, Config,
+                                   undefined),
     MaxField = maps:get(max_field_bytes, Config, undefined),
     Heartbeat = maps:get(sse_heartbeat_ms, Config, undefined),
     SseMaxEvents = maps:get(sse_max_events, Config, undefined),
@@ -102,11 +130,20 @@ valid_sanitized_config(Config) when is_map(Config) ->
     DiagnosticTimeout = maps:get(diagnostic_timeout_ms, Config, undefined),
     DiagnosticPolicy = maps:get(diagnostic_context_policy, Config, undefined),
     ResourceProvider = maps:get(resource_provider, Config, undefined),
+    GraphCatalog = maps:get(graph_catalog, Config, undefined),
+    GraphOwner = maps:get(graph_owner, Config, undefined),
+    TraceStore = maps:get(trace_store, Config, undefined),
+    TracePrincipal = maps:get(trace_principal, Config, undefined),
+    EvaluationService = maps:get(evaluation_service, Config, undefined),
+    EvaluationScope = maps:get(evaluation_scope, Config, undefined),
+    PayloadStore = maps:get(provider_payload_store, Config, undefined),
     SessionService = maps:get(session_service, Config, undefined),
     LivePrincipal = maps:get(live_principal, Config, undefined),
     LiveCredit = maps:get(live_credit, Config, undefined),
     is_binary(Digest) andalso byte_size(Digest) =:= 32 andalso
     is_integer(MaxBody) andalso MaxBody > 0 andalso
+    is_integer(EvaluationReportMax) andalso EvaluationReportMax > 0 andalso
+    EvaluationReportMax =< ?ADK_EVAL_REPORT_MAX_BYTES andalso
     is_integer(MaxField) andalso MaxField > 0 andalso MaxField =< MaxBody andalso
     is_integer(Heartbeat) andalso Heartbeat > 0 andalso
     is_integer(SseMaxEvents) andalso SseMaxEvents > 0 andalso
@@ -123,6 +160,12 @@ valid_sanitized_config(Config) when is_map(Config) ->
     DiagnosticTimeout =< ?MAX_DIAGNOSTIC_TIMEOUT_MS andalso
     is_map(DiagnosticPolicy) andalso
     valid_resource_provider(ResourceProvider) andalso
+    valid_optional_server(GraphCatalog) andalso
+    valid_bound_identity(GraphCatalog, GraphOwner, MaxField) andalso
+    valid_optional_server(TraceStore) andalso
+    valid_bound_identity(TraceStore, TracePrincipal, MaxField) andalso
+    valid_evaluation_binding(EvaluationService, EvaluationScope, MaxField) andalso
+    valid_optional_server(PayloadStore) andalso
     valid_live_principal(LivePrincipal, MaxField) andalso
     valid_live_credit(LiveCredit) andalso
     is_atom(SessionService) andalso
@@ -136,6 +179,8 @@ valid_sanitized_config(_Config) ->
 validate_config(Config) when is_map(Config) ->
     Token = maps:get(auth_token, Config, undefined),
     MaxBody = maps:get(max_body_bytes, Config, ?DEFAULT_MAX_BODY_BYTES),
+    EvaluationReportMax = maps:get(evaluation_report_max_bytes, Config,
+                                   ?ADK_EVAL_REPORT_MAX_BYTES),
     MaxField = maps:get(max_field_bytes, Config, ?DEFAULT_MAX_FIELD_BYTES),
     Heartbeat = maps:get(sse_heartbeat_ms, Config, ?DEFAULT_HEARTBEAT_MS),
     SseMaxEvents = maps:get(sse_max_events, Config,
@@ -155,6 +200,13 @@ validate_config(Config) when is_map(Config) ->
                            max_tokens => 262144,
                            overflow => truncate}),
     ResourceProvider = maps:get(resource_provider, Config, undefined),
+    GraphCatalog = maps:get(graph_catalog, Config, undefined),
+    GraphOwner = maps:get(graph_owner, Config, undefined),
+    TraceStore = maps:get(trace_store, Config, undefined),
+    TracePrincipal = maps:get(trace_principal, Config, undefined),
+    EvaluationService = maps:get(evaluation_service, Config, undefined),
+    EvaluationScope = maps:get(evaluation_scope, Config, undefined),
+    PayloadStore = maps:get(provider_payload_store, Config, undefined),
     SessionService = maps:get(session_service, Config,
                               erlang_adk_session),
     LivePrincipal = maps:get(live_principal, Config, undefined),
@@ -164,6 +216,8 @@ validate_config(Config) when is_map(Config) ->
     RunOptions = maps:get(run_options, Config, #{}),
     case is_binary(Token) andalso byte_size(Token) >= 16 andalso
          is_integer(MaxBody) andalso MaxBody > 0 andalso
+         is_integer(EvaluationReportMax) andalso EvaluationReportMax > 0 andalso
+         EvaluationReportMax =< ?ADK_EVAL_REPORT_MAX_BYTES andalso
          is_integer(MaxField) andalso MaxField > 0 andalso
          MaxField =< MaxBody andalso
          is_integer(Heartbeat) andalso Heartbeat > 0 andalso
@@ -181,6 +235,13 @@ validate_config(Config) when is_map(Config) ->
          DiagnosticTimeout =< ?MAX_DIAGNOSTIC_TIMEOUT_MS andalso
          valid_diagnostic_policy(DiagnosticPolicy) andalso
          valid_resource_provider(ResourceProvider) andalso
+         valid_optional_server(GraphCatalog) andalso
+         valid_bound_identity(GraphCatalog, GraphOwner, MaxField) andalso
+         valid_optional_server(TraceStore) andalso
+         valid_bound_identity(TraceStore, TracePrincipal, MaxField) andalso
+         valid_evaluation_binding(
+           EvaluationService, EvaluationScope, MaxField) andalso
+         valid_optional_server(PayloadStore) andalso
          valid_live_principal(LivePrincipal, MaxField) andalso
          valid_live_credit(LiveCredit) andalso
          is_atom(SessionService) andalso
@@ -193,6 +254,7 @@ validate_config(Config) when is_map(Config) ->
             SafeConfig = maps:remove(auth_token, Config),
             {ok, SafeConfig#{auth_token_digest => TokenDigest,
                          max_body_bytes => MaxBody,
+                         evaluation_report_max_bytes => EvaluationReportMax,
                          max_field_bytes => MaxField,
                          sse_heartbeat_ms => Heartbeat,
                          sse_max_events => SseMaxEvents,
@@ -203,6 +265,13 @@ validate_config(Config) when is_map(Config) ->
                          diagnostic_timeout_ms => DiagnosticTimeout,
                          diagnostic_context_policy => DiagnosticPolicy,
                          resource_provider => ResourceProvider,
+                         graph_catalog => GraphCatalog,
+                         graph_owner => GraphOwner,
+                         trace_store => TraceStore,
+                         trace_principal => TracePrincipal,
+                         evaluation_service => EvaluationService,
+                         evaluation_scope => EvaluationScope,
+                         provider_payload_store => PayloadStore,
                          live_principal => LivePrincipal,
                          live_credit => LiveCredit,
                          session_service => SessionService,
@@ -235,6 +304,29 @@ valid_resource_provider({Module, Handle})
     end;
 valid_resource_provider(_) ->
     false.
+
+valid_optional_server(undefined) -> true;
+valid_optional_server(Server) when is_pid(Server) -> true;
+valid_optional_server(Server) when is_atom(Server), Server =/= undefined -> true;
+valid_optional_server(_) -> false.
+
+valid_evaluation_binding(undefined, undefined, _MaxField) -> true;
+valid_evaluation_binding(Service, {app, Scope}, MaxField)
+  when Service =/= undefined, is_binary(Scope), byte_size(Scope) > 0,
+       byte_size(Scope) =< MaxField ->
+    valid_optional_server(Service) andalso
+        adk_eval_store:validate_scope({app, Scope}) =:= ok;
+valid_evaluation_binding(_Service, _Scope, _MaxField) -> false.
+
+valid_bound_identity(undefined, undefined, _MaxField) -> true;
+valid_bound_identity(Server, Identity, MaxField)
+  when Server =/= undefined, is_binary(Identity), byte_size(Identity) > 0,
+       byte_size(Identity) =< MaxField ->
+    case unicode:characters_to_binary(Identity, utf8, utf8) of
+        Identity -> true;
+        _ -> false
+    end;
+valid_bound_identity(_, _, _) -> false.
 
 %% A developer bearer may inspect/control only Live sessions owned by this
 %% exact principal.  There is no administrator bypass in the Live process.

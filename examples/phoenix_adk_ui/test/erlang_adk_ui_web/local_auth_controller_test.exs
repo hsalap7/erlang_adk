@@ -13,7 +13,9 @@ defmodule ErlangAdkUiWeb.LocalAuthControllerTest do
     "adk.live.read",
     "adk.live.control",
     "adk.observability.read",
-    "adk.evaluation.read"
+    "adk.evaluation.read",
+    "adk.graph.read",
+    "adk.trace.read"
   ]
 
   setup do

@@ -6,7 +6,8 @@ data, stream progress, and work with other agents. The project supports
 Gemini, Vertex AI, OpenAI, Anthropic, and selected OpenAI-compatible APIs,
 including an explicit loopback-only local-server mode.
 
-The current release is **v0.9.0**.
+The current release is **v0.10.0**. See the
+[v0.10.0 release scope and validation evidence](docs/VERSION_0_10_0.md).
 
 Agents and workflows use Erlang's lightweight processes, supervision, and
 message passing. The project follows useful behavior from Google ADK, but it
@@ -25,6 +26,7 @@ is designed for OTP rather than copied from the Python package.
 | Work with text, images, audio, or image/video frames | Streaming and media input | [Streaming and multimodal input](#streaming-and-multimodal-input) |
 | Build a two-way voice experience | Gemini Live, OpenAI Realtime, and one supervised Erlang process per session | [Realtime sessions and browser voice](#realtime-sessions-and-browser-voice) |
 | Save conversations, files, memory, or model context | Session, artifact, memory, and context services | [Sessions, artifacts, memory, and context](#sessions-artifacts-memory-and-context) |
+| Configure local runtime services and reusable agents | Supervised runtime-service profiles and schema-v2 JSON/strict-YAML Agent Config | [Sessions, artifacts, memory, and context](#sessions-artifacts-memory-and-context), [v0.10 release scope](docs/VERSION_0_10_0.md) |
 | Connect APIs, MCP servers, or other agents | OpenAPI, Model Context Protocol (MCP), and Agent2Agent (A2A) | [Integrations](#integrations) |
 | Monitor and test agent behavior | Plugins, OpenTelemetry metrics/traces, and evaluations | [Plugins, observability, and evaluation](#plugins-observability-and-evaluation) |
 | Sign users in and authorize tool access | OpenID Connect (OIDC), JSON Web Tokens (JWT), and OAuth | [Authentication](#authentication) |
@@ -76,11 +78,11 @@ Use the released Git tag as a dependency:
 {deps, [
     {erlang_adk,
      {git, "https://github.com/hsalap7/erlang_adk.git",
-      {tag, "v0.9.0"}}}
+      {tag, "v0.10.0"}}}
 ]}.
 ```
 
-For installations from Hex, use `{erlang_adk, "0.9.0"}` once the package is
+For installations from Hex, use `{erlang_adk, "0.10.0"}` once the package is
 available in the configured Hex repository.
 
 In an application that does not use the repository shell configuration, start
@@ -484,13 +486,56 @@ ok = erlang_adk_session:delete_session(
 | Data | Built-in choices | Guide |
 | --- | --- | --- |
 | Session events and state | ETS-backed `erlang_adk_session`, durable local `erlang_adk_session_mnesia` | This section and [feature support](docs/FEATURE_PARITY.md) |
-| Versioned artifacts | `adk_artifact_ets`, `adk_artifact_fs`, and optional storage splitting by app/user/session | [Artifacts](docs/ARTIFACTS.md) |
-| Long-term memory | `adk_memory_ets`, `adk_memory_mnesia`, optional storage splitting, and reliable background writes | [Memory](docs/MEMORY.md) |
+| Versioned artifacts | `adk_artifact_ets`, `adk_artifact_fs`, the GCS-compatible adapter, credit/ack transfer, and optional storage splitting by app/user/session | [Artifacts](docs/ARTIFACTS.md) |
+| Long-term memory | `adk_memory_ets`, `adk_memory_mnesia`, a bounded vector/hybrid reference adapter, policy hooks, erasure fencing, optional storage splitting, and reliable background writes | [Memory](docs/MEMORY.md) |
 | Context selection and limits | `adk_context`, selection rules, compaction, and reuse of stable prompt prefixes | [Context](docs/CONTEXT.md) |
 
 The Runner accepts the relevant services in its options. Tools can receive
 state and data helpers limited to the current app, user, and session without
 receiving raw storage internals.
+
+The v0.10.0 runtime foundation can start the three local services
+as one supervised generation. `ephemeral_local` selects ETS-backed services;
+`durable_local` selects Mnesia sessions/memory and filesystem artifacts and
+requires an absolute `artifact_root`:
+
+```erlang
+{ok, Bundle} = adk_runtime_service_bundle:start_link(
+    ephemeral_local, #{}),
+{ok, #{session_service := SessionService,
+       runner_options := RunnerOptions}} =
+    adk_runtime_service_bundle:runner_spec(Bundle).
+```
+
+The profile chooses trusted adapter modules and accepts only bounded adapter
+and routing limits. `ephemeral_local` uses one shared ETS artifact adapter and
+one shared ETS memory adapter, so each component enforces one global quota
+across its scopes. `durable_local` uses exact-scope workers with per-shard
+quotas and bounded LRU-on-capacity reclamation after the configured idle
+timeout; filesystem and Mnesia data survive worker reclamation. It also starts,
+owns, and health-checks a private Mnesia memory-ingestion outbox as part of the
+same atomic generation, exposes only its validated service/status surface, and
+injects durable ingestion into the returned Runner options. Pending jobs
+survive bundle process restarts; stale or unhealthy references fail closed.
+Registry hydration gates claims by the exact available adapter identity, while
+bounded rotating due/lease/erasure/terminal indexes prevent whole-table work.
+Health uses a constant-row sentinel across all four Mnesia tables, and majority
+mode requires at least two shared nodes. Epoch-bound job IDs permit same-epoch
+deduplication and post-erasure resubmission; a hard active-plus-terminal cap
+requires explicit bounded pruning for headroom. Nested options/capabilities are
+strictly validated and status is redacted. The disabled and `ephemeral_local`
+modes do not create a bundle-owned outbox, and legacy named outbox APIs remain
+compatible by resolving the one durable bundle owner without a duplicate
+processor. When
+enabled with the `runtime_service_profile` application environment key, the
+bundle is registered as `adk_runtime_service_bundle`; pass that atom to
+`runner_spec/1`. See the
+[0.10 release contract](docs/VERSION_0_10_0.md#supervised-runtime-service-profiles).
+
+`erlang_adk:runtime_runner_spec/0` is the application-level resolver. Standard
+CLI run/console, evaluation-agent, and developer HTTP paths use its selected
+session/artifact/memory services. An enabled profile whose bundle is unavailable
+fails closed instead of falling back to unrelated ETS services.
 
 ### Integrations
 
@@ -501,11 +546,12 @@ service. Keep those values in application configuration, not in model input.
 | Integration | How to start | Details |
 | --- | --- | --- |
 | OpenAPI | Decode an OpenAPI 3.0/3.1 document, call `adk_openapi_toolset:compile/2`, wrap it with `adk_toolset:new/2`, and pass it to an agent | The checked example is [`examples/readme_petstore_openapi.json`](examples/readme_petstore_openapi.json) |
-| MCP client | `adk_mcp_client:connect/2,3`, list tools, then wrap the client with `adk_toolset:new/2` | Supports stdio and Streamable HTTP |
-| MCP server | `adk_mcp_server:start/2` | Exposes checked tools, resources, and prompts |
+| MCP client | `adk_mcp_client:connect/2,3`, list tools, then wrap the client with `adk_toolset:new/2` | Supports stdio and Streamable HTTP; 0.10 adds explicit legacy/modern protocol eras, incremental SSE, OAuth/PKCE helpers, pooling, and atomic catalogs |
+| MCP server | `adk_mcp_server:start/2` | Exposes checked tools, resources, and prompts, including the modern stateless runtime; legacy GET/SSE is an explicit compatibility option |
+| [Curated connectors](packages/README.md) | Build a registry-only descriptor, bind an application-owned backend, and create the package toolset | Google, GitHub, Slack, and Postgres packages enforce reviewed permissions, side-effect class, confirmation, and concurrency metadata; their package suites execute every advertised operation through the registry, Agent Config, and `adk_toolset`; the connector packages are not yet published |
 | External code execution | Configure `adk_code_toolset` with an application-owned sandbox adapter | [Code execution](docs/CODE_EXECUTION.md) |
-| A2A 1.0 server | Configure an Agent Card, agent name, listener, and authentication before application startup | [Feature support](docs/FEATURE_PARITY.md) and [security](SECURITY.md) |
-| A2A 1.0 client | `adk_a2a_v1_client:discover/2`, then `send/3` or the task/stream APIs | Unencrypted HTTP can be enabled only for local `127.0.0.1` development |
+| A2A 1.0 server | Configure an Agent Card, Runner-backed agent, listener, authentication, and optional task/push stores before application startup | Includes incremental SSE, extended cards, bounded push delivery, and ETS or local Mnesia task snapshots in v0.10.0 |
+| A2A 1.0 client | `adk_a2a_v1_client:discover/2`, then use `send/3`, callback-driven stream/subscription APIs, or push-config CRUD | Unencrypted HTTP can be enabled only for local `127.0.0.1` development |
 
 OpenAPI and MCP tools use the same checked tool-call path as local Erlang
 tools. Credentials are supplied by the application, not by model arguments.
@@ -520,6 +566,41 @@ tools. Credentials are supplied by the application, not by model arguments.
   collector through a configured exporter.
 - Evaluation supports repeatable datasets, repeated samples, tool-call
   checks, rubric judges, baseline comparison, JSON, and Markdown reports.
+- `adk_eval_service` adds bounded supervised jobs, exact
+  application scope, atomically created immutable eval-set revisions and jobs,
+  named baselines, record/scope/global byte quotas, protected incremental
+  pruning with an explicit baseline-removal opt-in, and ETS or local durable
+  Mnesia storage. Backend-canonical ownership, including through wrapper
+  modules, prevents two services from using the same store, while raw
+  submissions are prepared in a hard-capped set of
+  monitored timeout/heap-bounded workers so the service mailbox stays
+  responsive.
+- The 0.10 evaluation layer also includes deterministic latency, token-cost,
+  safety, and semantic-quality metrics; persisted-score ensembles and
+  calibration; bounded operator-selected user/environment simulators; a
+  revision-checked human-review state machine; confidence and longitudinal
+  regression helpers; one canonical `adk_eval_export` renderer for JSON,
+  Markdown, JUnit, SARIF, and annotations; and optional RPC workers selected
+  only from an operator node allowlist. Stored results are rendered through
+  `adk_eval_dev_api:report/5`, the authenticated HTTP report route, and
+  `adk eval report`; direct, API, HTTP, CLI, and existing eval-run paths return
+  the same canonical bytes. All report paths share a 16 MiB default/hard
+  ceiling; HTTP can lower it with `dev_evaluation_report_max_bytes`. Unrelated
+  CLI responses remain capped at 1 MiB and Developer request bodies at 64 KiB.
+- `adk_trace_store` retains bounded, principal-isolated
+  metadata projections for observability and workflow lifecycle events; it
+  never retains prompts, responses, media, tool arguments, or tool results.
+  Application enablement auto-wires the configured Runner and public start/run
+  workflow paths using a fixed principal, while direct Runner/workflow
+  constructors remain explicit. Lifecycle ingress and expiry pruning are
+  bounded and drop-accounted; monitored local workflow owners keep a quiet
+  active workflow's receiver valid past its nominal TTL until those owners
+  exit.
+- Trace retention remains metadata-only. A separate Developer UI provider
+  payload inspector is available only through an explicit local-development
+  opt-in; it redacts and JSON-normalizes values, applies per-event/total/count/
+  retention bounds, and is disabled by default. It is not a production audit
+  or unrestricted prompt/response capture path.
 
 Run the checked one-turn evaluation smoke from the CLI:
 
@@ -535,6 +616,9 @@ _build/default/bin/adk evaluate \
 See [Plugins, observability, and evaluation](docs/PLUGINS_OBSERVABILITY_EVALUATION.md).
 That guide also covers the newer `adk eval run` command for multi-turn
 evaluation sets, repeated samples, report comparison, and rubric judges.
+
+For job and trace-store APIs, limits, restart semantics, and examples, see the
+[v0.10.0 release contract](docs/VERSION_0_10_0.md).
 
 ### Authentication
 
@@ -563,6 +647,40 @@ Build the CLI and run the two commands that do not call a model:
 _build/default/bin/adk doctor
 _build/default/bin/adk config validate examples/agent.json
 ```
+
+In v0.10.0, config validation uses the reusable
+`adk_agent_config` schema-v2 compiler and reports its fingerprint, immutable
+registry generation, opaque instance ID, and opaque snapshot revision ID.
+Applications can call `adk_agent_config:compile/2` or `load_file/2` with an
+`adk_config_registry` snapshot. Schema 1 remains accepted for compatibility;
+schema 2 adds data-only agent-template, credential-profile, runtime-policy,
+sub-agent, and workflow references. JSON and the strict YAML subset normalize
+to the same intermediate representation and fingerprint when compiled against
+the same snapshot. YAML anchors, aliases, tags, directives, merge keys,
+multi-document input, and non-JSON scalar behavior are rejected.
+
+Fingerprints are stable for the same configuration and immutable snapshot. The
+revision distinguishes replacements, including branches with the same lineage
+and generation; independently created non-empty registries also have different
+lineage provenance. Registry terms carry a private keyed integrity seal, so a
+structural copy with changed trusted entries is rejected; the seal is never
+exposed in diagnostics or fingerprints. Registry kinds cover provider, MCP,
+OpenAPI, tool pack, credential profile, runtime policy, workflow, and agent
+template descriptors. Agent names use the runtime identifier grammar
+`[A-Za-z_][A-Za-z0-9_]*`, reserve `user`, and are limited to 256 bytes. Agent
+files contain binary trusted IDs, never credentials, commands, headers, or
+transport targets.
+Registry-backed `toolsets` are the normal tool path; direct module names in
+`tools` are disabled unless trusted caller code explicitly enables the legacy
+compatibility option. Arbitrary `adk_llm_*` provider module names are likewise
+disabled by default; fixed provider aliases and registry-backed provider IDs
+remain the normal path. Toolset references are capped at 64, duplicates are
+rejected, and accepted references are resolved by one authenticated bulk
+registry lookup. `adk_agent_composition` resolves the exact sealed snapshot and
+materializes sub-agents bottom-up without returning credential descriptors.
+This is Erlang ADK's constrained JSON/strict-YAML contract, not a visual
+builder, code generator, or claim of exact compatibility with another ADK's
+configuration dialect.
 
 The checked configuration uses Gemini. Export its key before running a model
 request, opening the console, running an evaluation, or starting a model run
@@ -604,10 +722,25 @@ Enter that same token when the browser UI asks for it. Other commands include
 `adk session`, `adk resume`, `adk memory`, and `adk artifact`; run
 `_build/default/bin/adk --help` for their arguments.
 
-The simple `adk serve` command provides agents, runs, sessions, and basic
-observability. Live, artifact, memory, and context-management panels require
+The simple `adk serve` command provides agents, runs, sessions, observability,
+and the local UI shell. When their server-owned services are configured, the
+same authenticated loopback API adds a bounded compiled-graph catalog,
+metadata-only trace timelines and graph overlays, and evaluation authoring,
+job, set, result, and baseline views. Live, artifact, memory, and
+context-management panels require
 the owning Erlang application to start those services and expose them through
-the documented developer configuration.
+the documented developer configuration. With `--config`, the CLI compiles the
+agent before starting the application and contributes its bounded
+`runner_options` to developer runs. Trusted application `dev_runner_options`
+win key conflicts, and an enabled runtime profile remains authoritative for
+artifact and memory service references.
+
+Provider payload inspection is separate from the metadata trace store and is
+off by default. Enable `dev_provider_payload_inspection` only for an explicit
+loopback development session: captured request/response/error values are
+secret-redacted, JSON-normalized, bounded, short-lived, and served behind the
+developer bearer. Do not enable it as production telemetry or assume redaction
+is a complete PII policy.
 
 If a command reports `developer_api_unavailable` with `connection_refused`,
 the server is not listening at the selected URL or port.
@@ -615,7 +748,8 @@ the server is not listening at the selected URL or port.
 ## Phoenix UI
 
 The optional Phoenix 1.8 companion provides authenticated agent runs, human
-approval, Live operations, browser voice, observability, and evaluation views.
+approval, Live operations, browser voice, observability, evaluation views,
+and server-owned graph/metadata-trace inspection.
 It runs in the same Erlang runtime as Erlang ADK.
 
 For local development without an external OIDC provider:
@@ -641,6 +775,70 @@ returns you to the repository root.
 For OIDC configuration, realtime voice setup, production TLS/proxy settings,
 and release commands, follow the
 [Phoenix companion guide](examples/phoenix_adk_ui/README.md).
+
+## Deployment assets (v0.10.0)
+
+The v0.10.0 deployment bundle includes an OTP/relx release, a non-root
+multi-stage `Dockerfile`, read-only-root mount conventions, liveness/readiness/
+drain helpers, render-first Cloud Run and Helm/GKE manifests, explicit-apply
+CLI/script boundaries, and SBOM, scan, signing, and provenance helpers. Start
+with the [deployment asset guide](deploy/README.md).
+
+The release has three explicit configuration modes: the closed base release
+with every HTTP listener disabled; the packaged health-only profile; and an
+application-owned `sys.config` that explicitly enables and secures the intended
+listeners. Cloud Run selects the health-only runtime config at
+`/opt/erlang_adk/etc/health-http.sys.config` and consumes the platform-injected
+`PORT`; Helm selects the same profile when `service.enabled=true` and no custom
+runtime ConfigMap is supplied. It serves only `/livez` and `/readyz`; agent,
+A2A, developer, and legacy prompt routes remain disabled. A Helm
+`runtimeConfig.existingConfigMap` must contain the exact `sys.config` key and
+is mounted as `/opt/erlang_adk/etc/runtime/sys.config`; it replaces rather than
+augments the packaged profile.
+
+The Cloud Run renderer writes both Service- and revision-scope `maxScale: "1"`
+annotations and rejects another requested maximum. This is an intended
+single-replica operating envelope, not a hard singleton lease or proof that
+two revisions can never overlap during rollout.
+
+Container PID 1 caps the inherited open-file limit at 65536 by default
+(`ERLANG_ADK_NOFILE_CAP`, validated from 1024 through 1048576), owns the single
+readiness/drain/SIGTERM sequence, and reaps BEAM. The generic and Helm drain
+budget is 30000 ms within Helm's 60-second grace period; Cloud Run uses 3000 ms
+for its shorter shutdown window. Do not add a duplicate Helm `preStop` drain.
+
+Deployments may opt into the strict OTLP environment bridge with
+`ERLANG_ADK_OTLP_ENDPOINT`; optional `OTEL_EXPORTER_OTLP_HEADERS` are consumed
+only when that activation variable is present. The bridge accepts bounded
+W3C-Baggage-style header encoding with one strict value percent-decoding pass,
+trims optional whitespace, and fails startup closed on raw semicolons,
+malformed escapes, decoded invalid UTF-8, duplicate names, or conflicting
+configuration. It wires metadata-only standard Runner observations to the
+bounded asynchronous bus even without a local trace store. The bridge forces
+batch size one; its 3-second HTTP and 4-second exporter bounds must fit below a
+bus timeout greater
+than the sum of all final exporter timeouts plus 250 ms. An absent timeout is
+auto-sized from the final list, including the trace-store exporter; an explicit
+undersized timeout fails startup.
+
+These files are implementation assets, not a managed deployment service. The
+final local release image passed a constrained non-root/read-only-root 1 GiB
+smoke, and a disposable Kind cluster passed both closed/headless and
+service-enabled health-only Helm modes, including nondefault `PORT=18081`,
+200/200 health, agent-route 404, drain readiness 503 with liveness 200, and
+graceful pod recovery. The exact image digest and memory/timing evidence are in
+the [v0.10 release ledger](docs/VERSION_0_10_0.md#development-validation-ledger).
+These local checks do not establish GKE/Cloud Run staging, a registry push,
+generated SBOM/Grype scan, Cosign signing/attestation, provenance verification,
+or managed Agent Runtime support. Review immutable images/manifests and run
+the gates matching the actual project, cluster, registry, and trust policy
+before applying anything.
+
+The Agent Runtime feasibility probe is read-only and makes no managed-service
+claim. It reads a bounded RFC 6750 bearer token from a named environment
+variable and sends it to curl through standard-input config, not a command-line
+argument; identity, lifecycle, network, state, and conformance still require
+target-environment evidence.
 
 ## Developer checks
 
@@ -699,6 +897,22 @@ separately tracked coverage, packaging, Phoenix, and paid-provider gates. The
 Phoenix companion additionally passed 103 ExUnit tests, 40 browser/audio tests,
 production asset/release assembly, and both release health smokes.
 
+The v0.10.0 release validation included focused durable-runtime checks that
+passed 46/46 EUnit with compile, xref, and Dialyzer clean; focused
+evaluation-report parity and size-boundary checks passed 56 tests, including
+exact API/HTTP/stdout/file parity for an approximately 1.4 MiB report. The
+four-package offline connector wrapper passed 12/12 source and 12/12 clean-
+extracted EUnit. The release aggregate passed 1,826/1,826 EUnit,
+6 deterministic Common Test cases with 22 expected paid-provider skips,
+compile/xref, Dialyzer with 0 warnings over 309 project files, and 74.17% line
+coverage (36,574/49,312; 83 lines over the exact floor). Independent README
+checks passed 30/30 examples and 4/4 workflows, all three checked modules
+compiled with `erlc -Werror`, and ExDoc completed without warnings. Root Hex,
+verifier, and extracted-package compilation also passed; artifact hashes and
+post-ledger freshness are reported out of band to avoid self-reference. Exact
+release evidence and unrun external boundaries are in the
+[v0.10 release ledger](docs/VERSION_0_10_0.md#development-validation-ledger).
+
 ### If README examples changed
 
 Run the two focused modules above and compile the checked example modules with
@@ -746,6 +960,7 @@ _build/default/bin/adk config validate examples/agent.json
 ./rebar3 ex_doc
 ./rebar3 hex build
 ./scripts/verify_hex_package.sh
+packages/build_connector_packages.sh
 ```
 
 The Hex command builds a package locally; it does not publish it. Treat any
@@ -753,6 +968,13 @@ ExDoc warning as a failure, matching CI. GitHub Actions additionally builds a
 production Phoenix release and smoke-tests its proxy and direct-TLS modes.
 The exact commands and required environment are in
 [Releasing](docs/RELEASING.md).
+
+`packages/build_connector_packages.sh` is the sole offline package gate for
+the four curated connectors. It warning-strict compiles/tests source and clean
+extractions, creates normalized Hex inspection archives, verifies the required
+core dependency, and rejects checkout leakage. Those archives are not publish
+inputs, and all four connectors remain unpublished; see the
+[connector package guide](packages/README.md).
 
 ### Optional paid Gemini checks
 
@@ -806,12 +1028,14 @@ interpretation.
 | Plugins, telemetry, and evaluation | [Plugins, observability, and evaluation](docs/PLUGINS_OBSERVABILITY_EVALUATION.md) |
 | External code execution | [Code execution](docs/CODE_EXECUTION.md) |
 | Phoenix UI | [Phoenix companion](examples/phoenix_adk_ui/README.md) |
+| Deployment assets | [Container, Cloud Run, Helm/GKE, and supply-chain guide](deploy/README.md) |
 | Tests and coverage | [Testing](docs/TESTING.md) |
 | Release process | [Releasing](docs/RELEASING.md) |
 | Upgrading | [Upgrade guide](docs/UPGRADING.md) |
 | Security | [Security policy](SECURITY.md) |
 | Source and test layout | [Source layout](src/README.md), [test layout](docs/TEST_LAYOUT.md) |
-| Current release scope | [v0.9.0 release details](docs/VERSION_0_9_0.md) |
+| Current release scope | [v0.10.0 release details](docs/VERSION_0_10_0.md) |
+| Previous release | [v0.9.0 release details](docs/VERSION_0_9_0.md) |
 
 ## Project status and security
 

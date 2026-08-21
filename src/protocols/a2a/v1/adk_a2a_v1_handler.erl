@@ -8,23 +8,89 @@
 
 init(Req0, Config = #{endpoint := card}) ->
     handle_card(Req0, Config);
+init(Req0, Config = #{endpoint := extended_card}) ->
+    handle_extended_card(Req0, Config);
 init(Req0, Config = #{endpoint := jsonrpc}) ->
     handle_rpc(Req0, Config).
 
 handle_card(Req0, Config) ->
     case cowboy_req:method(Req0) of
         <<"GET">> ->
-            case adk_a2a_v1_server:card(maps:get(server, Config)) of
+            case adk_a2a_v1_server:card_representation(
+                   maps:get(server, Config)) of
+                {ok, Card, ModifiedAt} ->
+                    {ok, Body} = adk_a2a_v1_card:json(Card),
+                    reply_card(Body, ModifiedAt, Req0, Config)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, Config)
+    end.
+
+handle_extended_card(Req0, Config) ->
+    case cowboy_req:method(Req0) of
+        <<"GET">> ->
+            case cowboy_req:header(<<"a2a-version">>, Req0) of
+                <<"1.0">> -> authorize_extended_card(Req0, Config);
+                _ ->
+                    reply_json(
+                      400,
+                      maps:get(
+                        <<"error">>,
+                        adk_a2a_v1_codec:error_response(
+                          null, -32009,
+                          <<"A2A protocol version not supported">>)),
+                      Req0, Config)
+            end;
+        _ -> method_not_allowed(<<"GET">>, Req0, Config)
+    end.
+
+authorize_extended_card(Req0, Config) ->
+    Headers = cowboy_req:headers(Req0),
+    Summary = #{method => <<"GetExtendedAgentCard">>,
+                path => cowboy_req:path(Req0), peer => peer_ip(Req0),
+                extensions => []},
+    Hook = maps:get(auth, Config, none),
+    AuthOptions = #{timeout_ms => maps:get(auth_timeout_ms, Config, 5000),
+                    max_heap_words => maps:get(auth_max_heap_words, Config,
+                                               300000)},
+    AuthResult = case Hook of
+        none -> {error, unauthenticated};
+        _ -> adk_a2a_v1_auth:authorize(
+               Hook, <<"GetExtendedAgentCard">>, Headers, Summary,
+               AuthOptions)
+    end,
+    case AuthResult of
+        {ok, Auth} ->
+            case adk_a2a_v1_server:extended_card(
+                   maps:get(server, Config), maps:get(scope, Auth)) of
                 {ok, Card} ->
                     {ok, Body} = adk_a2a_v1_card:json(Card),
                     Req1 = cowboy_req:reply(
                              200, #{<<"content-type">> => ?JSON,
                                     <<"cache-control">> =>
-                                        <<"public, max-age=300">>},
+                                        <<"private, no-store">>},
                              Body, Req0),
-                    {ok, Req1, Config}
+                    {ok, Req1, Config};
+                {error, unsupported_operation} ->
+                    reply_json(400, maps:get(
+                                      <<"error">>,
+                                      adk_a2a_v1_rpc:rpc_error(
+                                        null, unsupported_operation)),
+                               Req0, Config);
+                {error, extended_agent_card_not_configured} ->
+                    reply_json(400, maps:get(
+                                      <<"error">>,
+                                      adk_a2a_v1_rpc:rpc_error(
+                                        null,
+                                        extended_agent_card_not_configured)),
+                               Req0, Config);
+                {error, _} -> reply_empty(503, Req0, Config)
             end;
-        _ -> method_not_allowed(<<"GET">>, Req0, Config)
+        {error, unauthenticated} ->
+            Req1 = cowboy_req:reply(
+                     401, #{<<"www-authenticate">> => <<"Bearer">>},
+                     <<>>, Req0),
+            {ok, Req1, Config};
+        {error, forbidden} -> reply_empty(403, Req0, Config)
     end.
 
 handle_rpc(Req0, Config) ->
@@ -97,19 +163,46 @@ authorize_and_dispatch(Id, Method, Params, Extensions, Req0, Config) ->
     AuthOptions = #{timeout_ms => maps:get(auth_timeout_ms, Config, 5000),
                     max_heap_words => maps:get(auth_max_heap_words, Config,
                                                300000)},
-    case adk_a2a_v1_auth:authorize(
-           Hook, Method, Headers, Summary, AuthOptions) of
+    AuthResult = case {Method, Hook} of
+        {<<"GetExtendedAgentCard">>, none} -> {error, unauthenticated};
+        _ -> adk_a2a_v1_auth:authorize(
+               Hook, Method, Headers, Summary, AuthOptions)
+    end,
+    case AuthResult of
         {ok, Auth} ->
             dispatch_authorized(Id, Method, Params, Auth, Req0, Config);
         {error, unauthenticated} ->
-            Req1 = cowboy_req:reply(
-                     401, #{<<"www-authenticate">> => <<"Bearer">>},
-                     <<>>, Req0),
-            {ok, Req1, Config};
-        {error, forbidden} -> reply_empty(403, Req0, Config)
+            case Method of
+                <<"GetExtendedAgentCard">> ->
+                    reply_rpc_auth_error(
+                      401, Id, <<"Authentication required">>, Req0, Config);
+                _ ->
+                    Req1 = cowboy_req:reply(
+                             401,
+                             #{<<"www-authenticate">> => <<"Bearer">>},
+                             <<>>, Req0),
+                    {ok, Req1, Config}
+            end;
+        {error, forbidden} ->
+            case Method of
+                <<"GetExtendedAgentCard">> ->
+                    reply_rpc_auth_error(
+                      403, Id, <<"Permission denied">>, Req0, Config);
+                _ -> reply_empty(403, Req0, Config)
+            end
     end.
 
 dispatch_authorized(Id, Method, Params, Auth, Req0, Config) ->
+    case adk_a2a_v1_codec:normalize_method_params(Method, Params) of
+        {ok, SafeParams} ->
+            dispatch_normalized(
+              Id, Method, SafeParams, Auth, Req0, Config);
+        {error, invalid_params} ->
+            reply_json(200, adk_a2a_v1_rpc:rpc_error(Id, invalid_params),
+                       Req0, Config)
+    end.
+
+dispatch_normalized(Id, Method, Params, Auth, Req0, Config) ->
     case adk_a2a_v1_rpc:method_type(Method) of
         unary ->
             Server = maps:get(server, Config),
@@ -125,16 +218,6 @@ dispatch_authorized(Id, Method, Params, Auth, Req0, Config) ->
                               Id, stream_method_requires_sse),
                     reply_json(200, Error, Req0, Config)
             end;
-        unsupported_push ->
-            reply_json(
-              200,
-              adk_a2a_v1_rpc:rpc_error(
-                Id, push_notification_not_supported), Req0, Config);
-        unsupported ->
-            reply_json(
-              200,
-              adk_a2a_v1_rpc:rpc_error(Id, unsupported_operation),
-              Req0, Config);
         unknown ->
             reply_json(200,
                        adk_a2a_v1_codec:error_response(
@@ -188,10 +271,10 @@ open_stream(Id, <<"SendStreamingMessage">>, Params, Auth, Req0, Config) ->
     Server = maps:get(server, Config),
     case adk_a2a_v1_server:send_message(Server, Auth, Params, self()) of
         {ok, #{task_id := TaskId, frames := Frames}} ->
-            stream_frames(Id, TaskId, Frames, Req0, Config);
+            stream_send_frames(Id, TaskId, Frames, Req0, Config);
         {error, {execution_start_failed, _Reason,
                  #{task_id := TaskId, frames := Frames}}} ->
-            stream_frames(Id, TaskId, Frames, Req0, Config);
+            stream_send_frames(Id, TaskId, Frames, Req0, Config);
         {error, Reason} ->
             reply_json(200, adk_a2a_v1_rpc:rpc_error(Id, Reason),
                        Req0, Config)
@@ -212,6 +295,61 @@ open_stream(Id, <<"SubscribeToTask">>, Params0, Auth, Req0, Config) ->
                     reply_json(200, adk_a2a_v1_rpc:rpc_error(Id, Reason),
                                Req0, Config)
             end
+    end.
+
+%% SendStreamingMessage has two valid response shapes.  Task streams begin
+%% with the Task snapshot, while a direct Message response must contain
+%% exactly that one Message and close.  The executor result is asynchronous,
+%% so hold the synthetic SUBMITTED/WORKING frames until the first real event
+%% determines which shape applies.
+stream_send_frames(Id, TaskId, Frames, Req0, Config) ->
+    Headers = #{<<"content-type">> => ?SSE,
+                <<"cache-control">> => <<"no-cache, no-transform">>,
+                <<"x-accel-buffering">> => <<"no">>},
+    Req1 = cowboy_req:stream_reply(200, Headers, Req0),
+    try case lists:any(fun({_Seq, Payload}) ->
+                           payload_terminal(Payload)
+                       end, Frames) of
+        true ->
+            _ = send_initial_frames(Id, Frames, Req1),
+            _ = safe_stream_body(<<>>, fin, Req1),
+            Req1;
+        false ->
+            buffered_send_loop(
+              Id, TaskId, Frames,
+              maps:get(sse_heartbeat_ms, Config, 15000), Req1)
+    end
+    after
+        _ = catch adk_a2a_v1_server:unsubscribe(
+                    maps:get(server, Config), TaskId, self())
+    end,
+    {ok, Req1, Config}.
+
+buffered_send_loop(Id, TaskId, Frames, Heartbeat, Req) ->
+    receive
+        {adk_a2a_v1_event, TaskId, Seq,
+         #{<<"message">> := _} = Payload, true} ->
+            _ = stream_sse(Id, Seq, Payload, fin, Req),
+            Req;
+        {adk_a2a_v1_event, TaskId, Seq, Payload, Terminal} ->
+            case send_initial_frames(Id, Frames ++ [{Seq, Payload}], Req) of
+                {closed, _} -> Req;
+                {ok, true} ->
+                    _ = safe_stream_body(<<>>, fin, Req),
+                    Req;
+                {ok, false} when Terminal ->
+                    _ = safe_stream_body(<<>>, fin, Req),
+                    Req;
+                {ok, false} -> sse_loop(Id, TaskId, Heartbeat, Req)
+            end;
+        {adk_a2a_v1_overflow, TaskId} ->
+            _ = safe_stream_body(<<>>, fin, Req),
+            Req
+    after Heartbeat ->
+        case safe_stream_body(<<": heartbeat\n\n">>, nofin, Req) of
+            ok -> buffered_send_loop(Id, TaskId, Frames, Heartbeat, Req);
+            closed -> Req
+        end
     end.
 
 stream_frames(Id, TaskId, Frames, Req0, Config) ->
@@ -343,6 +481,57 @@ reply_json(Status, Message, Req0, Config) ->
                        <<"cache-control">> => <<"no-store">>},
              jsx:encode(Message), Req0),
     {ok, Req1, Config}.
+
+reply_card(Body, ModifiedAt, Req0, Config) ->
+    ETag = card_etag(Body),
+    LastModified = http_date(ModifiedAt),
+    Headers = #{<<"content-type">> => ?JSON,
+                <<"cache-control">> => <<"public, max-age=300">>,
+                <<"etag">> => ETag,
+                <<"last-modified">> => LastModified},
+    NotModified = cowboy_req:header(<<"if-none-match">>, Req0) =:= ETag
+                  orelse
+                  (cowboy_req:header(<<"if-none-match">>, Req0) =:= undefined
+                   andalso cowboy_req:header(
+                             <<"if-modified-since">>, Req0) =:= LastModified),
+    case NotModified of
+        true ->
+            Req1 = cowboy_req:reply(304, maps:remove(<<"content-type">>,
+                                                    Headers), <<>>, Req0),
+            {ok, Req1, Config};
+        false ->
+            Req1 = cowboy_req:reply(200, Headers, Body, Req0),
+            {ok, Req1, Config}
+    end.
+
+reply_rpc_auth_error(Status, Id, Message, Req0, Config) ->
+    Response = adk_a2a_v1_codec:error_response(Id, -32000, Message),
+    Headers0 = #{<<"content-type">> => ?JSON,
+                 <<"cache-control">> => <<"no-store">>},
+    Headers = case Status of
+        401 -> Headers0#{<<"www-authenticate">> => <<"Bearer">>};
+        _ -> Headers0
+    end,
+    Req1 = cowboy_req:reply(Status, Headers, jsx:encode(Response), Req0),
+    {ok, Req1, Config}.
+
+card_etag(Body) ->
+    Digest = base64:encode(crypto:hash(sha256, Body)),
+    <<$\", Digest/binary, $\">>.
+
+http_date(Seconds) ->
+    {{Year, Month, Day}, {Hour, Minute, Second}} =
+        calendar:system_time_to_universal_time(Seconds, second),
+    Weekday = element(calendar:day_of_the_week(Year, Month, Day),
+                      {<<"Mon">>, <<"Tue">>, <<"Wed">>, <<"Thu">>,
+                       <<"Fri">>, <<"Sat">>, <<"Sun">>}),
+    MonthName = element(Month,
+                        {<<"Jan">>, <<"Feb">>, <<"Mar">>, <<"Apr">>,
+                         <<"May">>, <<"Jun">>, <<"Jul">>, <<"Aug">>,
+                         <<"Sep">>, <<"Oct">>, <<"Nov">>, <<"Dec">>}),
+    iolist_to_binary(
+      io_lib:format("~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B GMT",
+                    [Weekday, Day, MonthName, Year, Hour, Minute, Second])).
 
 reply_empty(Status, Req0, Config) ->
     Req1 = cowboy_req:reply(Status, #{<<"cache-control">> => <<"no-store">>},

@@ -1,0 +1,167 @@
+{{- if and .Values.topology.singleReplicaOnly (ne (int .Values.replicaCount) 1) }}
+{{- fail "replicaCount must remain 1 while topology.singleReplicaOnly=true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "erlang-adk.fullname" . }}
+  labels:
+    {{- include "erlang-adk.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "erlang-adk.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "erlang-adk.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "erlang-adk.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: erlang-adk
+          image: {{ include "erlang-adk.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.service.enabled }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          {{- end }}
+          env:
+            - name: ERLANG_ADK_DATA_DIR
+              value: /var/lib/erlang_adk
+            - name: ERLANG_ADK_LOG_DIR
+              value: /var/log/erlang_adk
+            - name: ERLANG_ADK_TMP_DIR
+              value: /tmp/erlang_adk
+            {{- if .Values.service.enabled }}
+            - name: PORT
+              value: {{ .Values.service.targetPort | quote }}
+            {{- end }}
+            {{- if .Values.runtimeConfig.existingConfigMap }}
+            - name: RELX_CONFIG_PATH
+              value: /opt/erlang_adk/etc/runtime/sys.config
+            - name: RELX_OUT_FILE_PATH
+              value: /tmp/erlang_adk
+            {{- else if .Values.service.enabled }}
+            - name: RELX_CONFIG_PATH
+              value: /opt/erlang_adk/etc/health-http.sys.config
+            - name: RELX_OUT_FILE_PATH
+              value: /tmp/erlang_adk
+            {{- end }}
+            {{- if .Values.readinessHook.existingConfigMap }}
+            - name: ERLANG_ADK_READINESS_HOOK
+              value: {{ .Values.readinessHook.path | quote }}
+            {{- end }}
+            {{- if .Values.otlp.enabled }}
+            - name: ERLANG_ADK_OTLP_ENDPOINT
+              value: {{ required "otlp.endpoint is required when OTLP is enabled" .Values.otlp.endpoint | quote }}
+            {{- if .Values.credentials.existingSecret }}
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.credentials.existingSecret | quote }}
+                  key: {{ .Values.otlp.headersSecretKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- end }}
+          {{- if .Values.credentials.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.credentials.existingSecret | quote }}
+          {{- end }}
+          startupProbe:
+            exec:
+              command: ["/opt/erlang_adk/bin/deployment-health", "live"]
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          livenessProbe:
+            exec:
+              command: ["/opt/erlang_adk/bin/deployment-health", "live"]
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/opt/erlang_adk/bin/deployment-health", "ready"]
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/erlang_adk
+            - name: log
+              mountPath: /var/log/erlang_adk
+            - name: tmp
+              mountPath: /tmp/erlang_adk
+            {{- if .Values.runtimeConfig.existingConfigMap }}
+            - name: runtime-config
+              mountPath: /opt/erlang_adk/etc/runtime
+              readOnly: true
+            {{- end }}
+            {{- if .Values.readinessHook.existingConfigMap }}
+            - name: readiness-hook
+              mountPath: /opt/erlang_adk/hooks
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.storage.data.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.storage.data.existingClaim | quote }}
+          {{- else }}
+          emptyDir:
+            {{- toYaml .Values.storage.data.emptyDir | nindent 12 }}
+          {{- end }}
+        - name: log
+          emptyDir:
+            {{- toYaml .Values.storage.log.emptyDir | nindent 12 }}
+        - name: tmp
+          emptyDir:
+            {{- toYaml .Values.storage.tmp.emptyDir | nindent 12 }}
+        {{- if .Values.runtimeConfig.existingConfigMap }}
+        - name: runtime-config
+          configMap:
+            name: {{ .Values.runtimeConfig.existingConfigMap | quote }}
+            items:
+              - key: sys.config
+                path: sys.config
+        {{- end }}
+        {{- if .Values.readinessHook.existingConfigMap }}
+        - name: readiness-hook
+          configMap:
+            name: {{ .Values.readinessHook.existingConfigMap | quote }}
+            defaultMode: 0555
+            items:
+              - key: readiness
+                path: readiness
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

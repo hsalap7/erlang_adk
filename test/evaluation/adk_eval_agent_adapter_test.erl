@@ -8,6 +8,7 @@ agent_adapter_test_() ->
      fun setup/0,
      fun(_State) -> ok end,
      [fun successful_agent_turn_is_isolated_and_cleaned_up/0,
+      fun registered_agent_is_borrowed_without_being_stopped/0,
       fun provider_failure_is_reduced_to_runner_failed/0,
       fun paused_agent_turn_is_rejected/0,
       fun owner_death_cleans_up_an_active_turn/0,
@@ -49,6 +50,28 @@ successful_agent_turn_is_isolated_and_cleaned_up() ->
         {'DOWN', GuardMonitor, process, Guard, normal} -> ok
     after 1000 ->
         erlang:error(eval_agent_guard_not_stopped)
+    end.
+
+registered_agent_is_borrowed_without_being_stopped() ->
+    Name = unique_target_name(<<"BorrowedEvalAgent">>),
+    {ok, Agent} = erlang_adk:spawn_agent(
+                    Name,
+                    #{provider => adk_eval_agent_test_provider,
+                      mode => response}, []),
+    try
+        {ok, CaseTarget, 0} = init_target(
+                                #{agent_name => Name,
+                                  runner_options => #{}},
+                                <<"borrowed">>),
+        {ok, Result} = adk_eval_agent_adapter:run_turn(
+                         CaseTarget,
+                         #{<<"input">> => <<"evaluate">>}, 0, #{}, #{}),
+        ?assertEqual(<<"evaluated">>, maps:get(output, Result)),
+        ok = adk_eval_agent_adapter:terminate_case(CaseTarget, 0, #{}),
+        ?assert(is_process_alive(Agent)),
+        ?assertMatch({ok, Agent}, adk_agent_registry:lookup(Name))
+    after
+        _ = catch erlang_adk:stop_agent(Agent)
     end.
 
 provider_failure_is_reduced_to_runner_failed() ->
@@ -261,13 +284,16 @@ terminate_case_protocol_and_validation() ->
     stop_guard(IgnoringGuard).
 
 target(Mode, Tools) ->
-    Suffix = integer_to_binary(
-               erlang:unique_integer([positive, monotonic])),
-    #{name => <<"EvalAdapterTest", Suffix/binary>>,
+    #{name => unique_target_name(<<"EvalAdapterTest">>),
       config => #{provider => adk_eval_agent_test_provider,
                   mode => Mode},
       tools => Tools,
       runner_options => #{}}.
+
+unique_target_name(Prefix) ->
+    Suffix = integer_to_binary(
+               erlang:unique_integer([positive, monotonic])),
+    <<Prefix/binary, Suffix/binary>>.
 
 init_target(Target, SampleId) ->
     adk_eval_agent_adapter:init_case(

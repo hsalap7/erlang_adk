@@ -69,12 +69,11 @@ async_timeout_custom_cancel_and_ownership() ->
                  erlang_adk:await_planning(PlanningRef, 0)),
     _Worker = await_executor_start(NotifyRef),
     Parent = self(),
-    Other = spawn(fun() ->
+    {Other, OtherMonitor} = spawn_monitor(fun() ->
         Parent ! {foreign_planning_results,
                   erlang_adk:await_planning(PlanningRef, 0),
                   erlang_adk:cancel_planning(PlanningRef)}
     end),
-    OtherMonitor = erlang:monitor(process, Other),
     receive
         {foreign_planning_results,
          {error, not_planning_owner},

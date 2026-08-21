@@ -7,7 +7,8 @@ for installation and executable examples.
 ## Release and project documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — cumulative changes from 0.3.0 through
-  the released 0.9.0 version, fixes, evidence, and visible limitations.
+  the released 0.9.0 version plus the explicitly unreleased 0.10 development
+  section, fixes, evidence, and visible limitations.
 - [`TESTING.md`](TESTING.md) — deterministic, paid-provider, Phoenix, browser,
   packaging, and audit gates.
 - [`TEST_LAYOUT.md`](TEST_LAYOUT.md) — test ownership, recursive discovery,
@@ -17,6 +18,17 @@ for installation and executable examples.
 - [`RELEASING.md`](RELEASING.md) — the pre-tag, package, audit, approval, tag,
   and publication checklist. It does not claim that a tag or package was
   published.
+- [Deployment asset guide](../deploy/README.md) — the in-development relx/OCI,
+  closed/health/application-config modes, descriptor cap, PID1 drain,
+  deployment OTLP bridge, Cloud Run, Helm/GKE, credential-safe Agent Runtime
+  feasibility probe, and supply-chain contracts plus their explicit
+  external-evidence boundaries. It also records the final local OCI and
+  disposable Kind two-mode candidate gate without claiming Cloud/GKE or
+  registry promotion.
+- [Curated connector package guide](../packages/README.md) — the sole offline
+  all-package gate, dependency-metadata normalization boundary, and the
+  explicit block on connector publication before core 0.10.0 exists in the
+  target Hex repository.
 - [`SECURITY.md`](../SECURITY.md) — supported versions, private reporting,
   deployment boundaries, secret handling, and known dependency advisories.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — toolchains, design rules, evidence,
@@ -34,6 +46,34 @@ Dialyzer warnings, and 0 undefined or deprecated call/function findings from
 browser/audio tests, production assets/release, and both health smokes. The
 complete evidence boundary is recorded in
 [`VERSION_0_9_0.md`](VERSION_0_9_0.md#release-evidence-ledger).
+
+The [`VERSION_0_10_0.md`](VERSION_0_10_0.md) milestone is **IN DEVELOPMENT**.
+It now includes the work previously proposed for 0.11/0.12: supervised local
+runtime profiles; schema-v2 JSON/strict-YAML Agent Config and composition;
+registry-only connectors; artifact streaming/GCS-compatible storage/effect
+reconciliation; vector/hybrid memory, policy, erasure, and a `durable_local`
+bundle-owned ingestion outbox; modern MCP; durable evaluation jobs plus
+simulators/statistics and canonical multi-format report parity;
+Developer UI graph/trace/evaluation surfaces; A2A streaming/task stores/push;
+and render-first deployment assets. Its pinned official MCP Python/TypeScript
+matrix and A2A JSON-RPC TCK have passed within the loopback scopes recorded in
+the candidate ledger. That ledger is development evidence, not a release
+record or arbitrary-peer/deployed-infrastructure claim.
+
+Current evidence applies to the named `codex/version_0.10.0` working-tree
+candidate, not to a reproducible commit or tag; its HEAD remains the v0.9
+baseline and all v0.10 work is uncommitted. Focused durable-runtime checks
+passed 46/46, canonical evaluation-report parity/boundary checks passed 56,
+and the four-package wrapper passed 12/12 source plus 12/12 clean-extracted
+EUnit. The changed-candidate aggregate passed 1,826/1,826 EUnit, 6 deterministic
+Common Test cases with 22 expected paid-provider skips, clean compile/xref,
+0 Dialyzer warnings, and 36,574/49,312 = 74.17% coverage. README checks passed
+30/30 plus 4/4, all three example modules compiled with `-Werror`, and ExDoc,
+static Markdown, root Hex/verifier/extracted compile, and diff gates passed.
+Root artifact hashes/freshness are intentionally reported out of band. Exact
+scoped evidence and explicitly unrun external gates are in
+[`VERSION_0_10_0.md`](VERSION_0_10_0.md#development-validation-ledger). These
+results do not change the **IN DEVELOPMENT** status.
 
 ## Runtime and workflow guides
 
@@ -99,6 +139,9 @@ not implicit release claims.
 - [`VERSION_0_9_0.md`](VERSION_0_9_0.md) — definition-bound durable workflow
   checkpoints, graph validation/inspection and data contracts, nested
   continuation parity, local-compatible endpoints, and Vertex AI/ADC.
+- [`VERSION_0_10_0.md`](VERSION_0_10_0.md) — **IN DEVELOPMENT**: the expanded
+  0.10 implementation and its explicit interoperability, topology, payload,
+  reconciliation, and deployment-evidence boundaries.
 
 ## Model and test terminology
 

@@ -10,9 +10,12 @@
 
 -export([start_link/0, start_link/1, child_spec/1,
          send_message/3, send_message/4,
-         get_task/3, list_tasks/3, cancel_task/3,
+         get_task/3, send_result/4, list_tasks/3, cancel_task/3,
+         create_push_config/3, get_push_config/3,
+         list_push_configs/3, delete_push_config/3,
          subscribe/4, unsubscribe/3,
-         progress/4, card/1, inspect_task/2]).
+         progress/4, card/1, card_representation/1,
+         extended_card/2, inspect_task/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -34,6 +37,10 @@
 -define(DEFAULT_MAX_HISTORY_MESSAGES, 128).
 -define(DEFAULT_MAX_ARTIFACTS, 128).
 -define(DEFAULT_MAX_PARTS_PER_ARTIFACT, 256).
+-define(DEFAULT_MAX_PUSH_CONFIGS, 8).
+-define(DEFAULT_MAX_PUSH_QUEUE, 128).
+-define(MAX_PUSH_QUEUE, 1024).
+-define(PUSH_WORKER_MAX_HEAP_WORDS, 500000).
 -define(CALL_TIMEOUT_MS, 5000).
 
 -spec start_link() -> gen_server:start_ret().
@@ -72,6 +79,16 @@ send_message(Server, AuthContext, Params, Subscriber) ->
 get_task(Server, Scope, Params) ->
     gen_server:call(Server, {get, Scope, Params}).
 
+%% @doc Resolve the response oneof for a blocking SendMessage call.  A direct
+%% Message returned by the executor is intentionally transient; durable task
+%% snapshots continue to contain only the protocol Task representation.
+-spec send_result(gen_server:server_ref(), binary(), binary(),
+                  undefined | non_neg_integer()) ->
+    {ok, {task, map()} | {message, map()}} | {error, term()}.
+send_result(Server, Scope, TaskId, HistoryLength) ->
+    gen_server:call(Server,
+                    {send_result, Scope, TaskId, HistoryLength}).
+
 -spec list_tasks(gen_server:server_ref(), binary(), map()) ->
     {ok, map()} | {error, term()}.
 list_tasks(Server, Scope, Params) ->
@@ -81,6 +98,26 @@ list_tasks(Server, Scope, Params) ->
     {ok, map()} | {error, term()}.
 cancel_task(Server, Scope, Params) ->
     safe_call(Server, {cancel, Scope, Params}).
+
+-spec create_push_config(gen_server:server_ref(), binary(), map()) ->
+    {ok, map()} | {error, term()}.
+create_push_config(Server, Scope, Params) ->
+    safe_call(Server, {create_push_config, Scope, Params}).
+
+-spec get_push_config(gen_server:server_ref(), binary(), map()) ->
+    {ok, map()} | {error, term()}.
+get_push_config(Server, Scope, Params) ->
+    safe_call(Server, {get_push_config, Scope, Params}).
+
+-spec list_push_configs(gen_server:server_ref(), binary(), map()) ->
+    {ok, map()} | {error, term()}.
+list_push_configs(Server, Scope, Params) ->
+    safe_call(Server, {list_push_configs, Scope, Params}).
+
+-spec delete_push_config(gen_server:server_ref(), binary(), map()) ->
+    {ok, map()} | {error, term()}.
+delete_push_config(Server, Scope, Params) ->
+    safe_call(Server, {delete_push_config, Scope, Params}).
 
 -spec subscribe(gen_server:server_ref(), binary(), map(), pid()) ->
     {ok, binary(), [{non_neg_integer(), map()}]} | {error, term()}.
@@ -99,6 +136,18 @@ progress(Server, TaskId, Scope, Event) ->
 -spec card(gen_server:server_ref()) -> {ok, map()}.
 card(Server) -> gen_server:call(Server, card).
 
+%% @doc Return the public card together with the time this server instance
+%% installed the immutable representation.  HTTP bindings use the timestamp
+%% for a stable Last-Modified validator while the card body supplies the ETag.
+-spec card_representation(gen_server:server_ref()) ->
+    {ok, map(), non_neg_integer()}.
+card_representation(Server) -> gen_server:call(Server, card_representation).
+
+-spec extended_card(gen_server:server_ref(), binary()) ->
+    {ok, map()} | {error, term()}.
+extended_card(Server, Scope) ->
+    safe_call(Server, {extended_card, Scope}).
+
 %% @doc Test/diagnostic view. It intentionally exposes only the public Task.
 -spec inspect_task(gen_server:server_ref(), binary()) ->
     {ok, map()} | {error, not_found}.
@@ -109,59 +158,56 @@ init(Options) ->
     process_flag(trap_exit, true),
     case normalize_options(Options) of
         {ok, Config} ->
-            {ok, #{config => Config,
-                   tasks => #{},
-                   task_refs => #{},
-                   subscriber_refs => #{},
-                   cursor_secret => crypto:strong_rand_bytes(32)}};
+            case restore_task_snapshots(Config) of
+                {ok, Tasks} ->
+                    {ok, #{config => Config,
+                           tasks => Tasks,
+                           task_refs => #{},
+                           subscriber_refs => #{},
+                           push_secrets => #{},
+                           push_active => #{},
+                           push_queue => queue:new(),
+                           card_last_modified =>
+                               erlang:system_time(second),
+                           cursor_secret => crypto:strong_rand_bytes(32)}};
+                {error, Reason} -> {stop, Reason}
+            end;
         {error, Reason} -> {stop, Reason}
     end.
 
 handle_call(card, _From, State) ->
     {reply, {ok, maps:get(card, maps:get(config, State))}, State};
+handle_call(card_representation, _From, State) ->
+    {reply, {ok, maps:get(card, maps:get(config, State)),
+             maps:get(card_last_modified, State)}, State};
+handle_call({extended_card, Scope}, _From, State)
+  when is_binary(Scope), byte_size(Scope) =:= 32 ->
+    Config = maps:get(config, State),
+    Card = maps:get(card, Config),
+    Capabilities = maps:get(<<"capabilities">>, Card, #{}),
+    Reply = case maps:get(<<"extendedAgentCard">>, Capabilities, false) of
+        false -> {error, unsupported_operation};
+        true -> case maps:get(extended_card, Config, undefined) of
+            undefined -> {error, extended_agent_card_not_configured};
+            Extended -> {ok, Extended}
+        end
+    end,
+    {reply, Reply, State};
+handle_call({extended_card, _Scope}, _From, State) ->
+    {reply, {error, invalid_auth_context}, State};
 handle_call({send, AuthContext, Params, Subscriber}, _From, State0) ->
     State1 = prune(State0),
     case validate_send(AuthContext, Params, Subscriber, State1) of
         {ok, Input} ->
             case create_or_continue(Input, State1) of
                 {ok, TaskId, Entry0, State2} ->
-                    case start_execution(Input, TaskId, Entry0, State2) of
+                    case maybe_attach_inline_push(
+                           Input, TaskId, Entry0, State2) of
                         {ok, Entry1, State3} ->
-                            case maybe_subscribe(Subscriber, Entry1, State3) of
-                                {ok, Entry2, State4} ->
-                                    Task = public_task(maps:get(task, Entry2),
-                                                       send_history_length(Params),
-                                                       true),
-                                    Frames = replay_frames(Entry2, 0),
-                                    Reply = #{task_id => TaskId,
-                                              task => Task,
-                                              frames => Frames},
-                                    {reply, {ok, Reply},
-                                     put_entry(Entry2, State4)};
-                                {error, subscriber_capacity} ->
-                                    {reply, {error, subscriber_capacity},
-                                     put_entry(Entry1, State3)}
-                            end;
-                        {error, Reason, FailedEntry, State3} ->
-                            case maybe_subscribe(
-                                   Subscriber, FailedEntry, State3) of
-                                {ok, FailedEntry1, State4} ->
-                                    Reply = #{task_id => TaskId,
-                                              task => public_task(
-                                                        maps:get(task,
-                                                                 FailedEntry1),
-                                                        send_history_length(
-                                                          Params), true),
-                                              frames => replay_frames(
-                                                          FailedEntry1, 0)},
-                                    {reply,
-                                     {error, {execution_start_failed, Reason,
-                                              Reply}},
-                                     put_entry(FailedEntry1, State4)};
-                                {error, subscriber_capacity} ->
-                                    {reply, {error, subscriber_capacity},
-                                     put_entry(FailedEntry, State3)}
-                            end
+                            send_started_reply(Input, Params, Subscriber,
+                                               TaskId, Entry1, State3);
+                        {error, Reason, State3} ->
+                            {reply, {error, Reason}, State3}
                     end;
                 {error, Reason, State2} ->
                     {reply, {error, Reason}, State2}
@@ -182,6 +228,17 @@ handle_call({get, Scope, Params}, _From, State0) ->
         {error, _} = Error -> Error
     end,
     {reply, Reply, State1};
+handle_call({send_result, Scope, TaskId, HistoryLength}, _From, State0) ->
+    State1 = prune(State0),
+    Reply = case visible_entry(TaskId, Scope, State1) of
+        {ok, #{direct_message := Message}} when is_map(Message) ->
+            {ok, {message, Message}};
+        {ok, Entry} ->
+            {ok, {task, public_task(maps:get(task, Entry),
+                                    HistoryLength, true)}};
+        error -> {error, task_not_found}
+    end,
+    {reply, Reply, State1};
 handle_call({list, Scope, Params}, _From, State0) ->
     State1 = prune(State0),
     {reply, list_visible(Scope, Params, State1), State1};
@@ -194,6 +251,24 @@ handle_call({cancel, Scope, Params}, _From, State0) ->
                 {ok, Entry} -> cancel_entry(Entry, State1)
             end;
         {error, _} = Error -> {reply, Error, State1}
+    end;
+handle_call({create_push_config, Scope, Params}, _From, State0) ->
+    State1 = prune(State0),
+    case create_push_configuration(Scope, Params, State1) of
+        {ok, Public, State2} -> {reply, {ok, Public}, State2};
+        {error, Reason, State2} -> {reply, {error, Reason}, State2}
+    end;
+handle_call({get_push_config, Scope, Params}, _From, State0) ->
+    State1 = prune(State0),
+    {reply, get_push_configuration(Scope, Params, State1), State1};
+handle_call({list_push_configs, Scope, Params}, _From, State0) ->
+    State1 = prune(State0),
+    {reply, list_push_configurations(Scope, Params, State1), State1};
+handle_call({delete_push_config, Scope, Params}, _From, State0) ->
+    State1 = prune(State0),
+    case delete_push_configuration(Scope, Params, State1) of
+        {ok, State2} -> {reply, {ok, #{}}, State2};
+        {error, Reason, State2} -> {reply, {error, Reason}, State2}
     end;
 handle_call({subscribe, Scope, Params, Subscriber}, _From, State0)
   when is_pid(Subscriber) ->
@@ -278,6 +353,11 @@ handle_info({adk_task_terminal, TaskRef, Outcome}, State0) ->
             end;
         error -> {noreply, State0}
     end;
+handle_info({a2a_push_delivery_done, Pid, DeliveryRef}, State0) ->
+    case take_push_worker(Pid, DeliveryRef, State0) of
+        {ok, State1} -> {noreply, start_queued_push(State1)};
+        error -> {noreply, State0}
+    end;
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State0) ->
     case maps:take(Ref, maps:get(subscriber_refs, State0)) of
         {{TaskId, Subscriber}, Remaining} ->
@@ -285,7 +365,13 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State0) ->
             {State2, _} = remove_subscriber_ref(
                             TaskId, Subscriber, Ref, State1),
             {noreply, State2};
-        error -> {noreply, State0}
+        error ->
+            case maps:take(Ref, maps:get(push_active, State0)) of
+                {_Worker, RemainingPush} ->
+                    {noreply, start_queued_push(
+                                State0#{push_active => RemainingPush})};
+                error -> {noreply, State0}
+            end
     end;
 handle_info(_Info, State) -> {noreply, State}.
 
@@ -298,6 +384,12 @@ terminate(_Reason, State) ->
               _ -> ok
           end
       end, maps:get(tasks, State, #{})),
+    maps:foreach(
+      fun(_Ref, #{pid := Pid}) ->
+          _ = catch exit(Pid, kill),
+          ok
+      end,
+      maps:get(push_active, State, #{})),
     ok.
 
 code_change(_OldVersion, State, _Extra) -> {ok, State}.
@@ -322,7 +414,13 @@ normalize_options(Options) ->
                         application:get_env(
                           erlang_adk, a2a_v1_executor,
                           {adk_a2a_v1_agent_executor, execute})),
+    ExtendedCard0 = maps:get(
+                      extended_card, Options,
+                      application:get_env(erlang_adk,
+                                          a2a_v1_extended_card, undefined)),
+    PushPolicy0 = maps:get(push_policy, Options, #{}),
     Config0 = #{card => Card0,
+                extended_card => ExtendedCard0,
                 executor => Executor,
                 task_timeout => maps:get(task_timeout, Options,
                                          ?DEFAULT_TIMEOUT),
@@ -360,18 +458,43 @@ normalize_options(Options) ->
                                            ?DEFAULT_MAX_ARTIFACTS),
                 max_parts_per_artifact => maps:get(
                                             max_parts_per_artifact, Options,
-                                            ?DEFAULT_MAX_PARTS_PER_ARTIFACT)},
+                                            ?DEFAULT_MAX_PARTS_PER_ARTIFACT),
+                max_push_configs_per_task => maps:get(
+                                               max_push_configs_per_task,
+                                               Options,
+                                               ?DEFAULT_MAX_PUSH_CONFIGS),
+                max_push_queue => maps:get(max_push_queue, Options,
+                                            ?DEFAULT_MAX_PUSH_QUEUE),
+                task_store => maps:get(task_store, Options, undefined)},
     case {adk_a2a_v1_card:validate(Card0), valid_executor(Executor),
-          valid_config_numbers(Config0)} of
-        {{ok, Card}, true, true} ->
+          valid_config_numbers(Config0),
+          validate_extended_card(ExtendedCard0),
+          adk_a2a_v1_push:normalize_policy(PushPolicy0),
+          adk_a2a_v1_task_store:validate_descriptor(
+            maps:get(task_store, Config0))} of
+        {{ok, Card}, true, true, {ok, ExtendedCard}, {ok, PushPolicy},
+         {ok, TaskStore}} ->
             {ok, Interface} = adk_a2a_v1_card:jsonrpc_interface(Card),
             {ok, Config0#{card => Card,
+                          extended_card => ExtendedCard,
+                          push_policy => PushPolicy,
+                          task_store => TaskStore,
                           tenant => maps:get(<<"tenant">>, Interface,
                                              undefined)}};
-        {{error, Reason}, _, _} -> {error, {invalid_a2a_v1_card, Reason}};
-        {_, false, _} -> {error, invalid_a2a_v1_executor};
+        {{error, Reason}, _, _, _, _, _} ->
+            {error, {invalid_a2a_v1_card, Reason}};
+        {_, false, _, _, _, _} -> {error, invalid_a2a_v1_executor};
+        {_, _, _, {error, Reason}, _, _} ->
+            {error, {invalid_a2a_v1_extended_card, Reason}};
+        {_, _, _, _, {error, _}, _} ->
+            {error, invalid_a2a_v1_push_policy};
+        {_, _, _, _, _, {error, _}} ->
+            {error, invalid_a2a_v1_task_store};
         _ -> {error, invalid_a2a_v1_server_options}
     end.
+
+validate_extended_card(undefined) -> {ok, undefined};
+validate_extended_card(Card) -> adk_a2a_v1_card:validate(Card).
 
 valid_executor(Fun) when is_function(Fun, 2) -> true;
 valid_executor({Module, Function}) -> is_atom(Module) andalso is_atom(Function);
@@ -394,7 +517,9 @@ valid_config_numbers(Config) ->
                maps:get(max_history_bytes, Config),
                maps:get(max_history_messages, Config),
                maps:get(max_artifacts, Config),
-               maps:get(max_parts_per_artifact, Config)])
+               maps:get(max_parts_per_artifact, Config),
+               maps:get(max_push_configs_per_task, Config),
+               maps:get(max_push_queue, Config)])
     andalso valid_payload_limit_maxima(Config).
 
 valid_payload_limit_maxima(Config) ->
@@ -418,7 +543,10 @@ valid_payload_limit_maxima(Config) ->
                 ?MAX_SUBSCRIBER_QUEUE
     andalso maps:get(max_artifacts, Config) =< ?DEFAULT_MAX_ARTIFACTS
     andalso maps:get(max_parts_per_artifact, Config) =<
-                ?DEFAULT_MAX_PARTS_PER_ARTIFACT.
+                ?DEFAULT_MAX_PARTS_PER_ARTIFACT
+    andalso maps:get(max_push_configs_per_task, Config) =<
+                ?DEFAULT_MAX_PUSH_CONFIGS
+    andalso maps:get(max_push_queue, Config) =< ?MAX_PUSH_QUEUE.
 
 positive_integer(Value) -> is_integer(Value) andalso Value > 0.
 
@@ -489,17 +617,24 @@ validate_send(Auth, Params, Subscriber, State)
                                 true ->
                                     case validate_send_config(Params) of
                                         ok ->
-                                            case tenant_matches(Params,
-                                                                State) of
-                                                true ->
-                                                    {ok, #{scope => Scope,
-                                                           principal =>
-                                                               Principal,
-                                                           seeds => Seeds,
-                                                           message => Message,
-                                                           params => Params}};
-                                                false ->
-                                                    {error, invalid_tenant}
+                                            case validate_inline_push_config(
+                                                   Params, State) of
+                                                ok ->
+                                                    case tenant_matches(
+                                                           Params, State) of
+                                                        true ->
+                                                            {ok, #{
+                                                              scope => Scope,
+                                                              principal =>
+                                                                Principal,
+                                                              seeds => Seeds,
+                                                              message => Message,
+                                                              params => Params}};
+                                                        false ->
+                                                            {error,
+                                                             invalid_tenant}
+                                                    end;
+                                                {error, _} = Error -> Error
                                             end;
                                         Error -> Error
                                     end
@@ -518,13 +653,40 @@ validate_send_config(Params) ->
             Return = maps:get(<<"returnImmediately">>, Config, false),
             History = maps:get(<<"historyLength">>, Config, undefined),
             Modes = maps:get(<<"acceptedOutputModes">>, Config, []),
+            Push = maps:get(<<"taskPushNotificationConfig">>, Config,
+                            undefined),
             case is_boolean(Return) andalso valid_optional_nonneg(History)
                  andalso is_list(Modes)
-                 andalso lists:all(fun is_binary/1, Modes) of
+                 andalso lists:all(fun is_binary/1, Modes)
+                 andalso (Push =:= undefined orelse is_map(Push)) of
                 true -> ok;
                 false -> {error, invalid_send_configuration}
             end;
         _ -> {error, invalid_send_configuration}
+    end.
+
+validate_inline_push_config(Params, State) ->
+    Configuration = maps:get(<<"configuration">>, Params, #{}),
+    case maps:get(<<"taskPushNotificationConfig">>, Configuration,
+                  undefined) of
+        undefined -> ok;
+        Push when is_map(Push) ->
+            case push_capability(State) of
+                false -> {error, push_notification_not_supported};
+                true ->
+                    Config = maps:get(config, State),
+                    Id = case maps:get(<<"id">>, Push, <<>>) of
+                        <<>> -> <<"push-validation">>;
+                        Value -> Value
+                    end,
+                    case adk_a2a_v1_push:prepare_config(
+                           <<"task-validation">>, Id,
+                           maps:get(tenant, Config), Push,
+                           maps:get(push_policy, Config)) of
+                        {ok, _Public, _Secret} -> ok;
+                        {error, _} = Error -> Error
+                    end
+            end
     end.
 
 tenant_matches(Params, State) ->
@@ -574,6 +736,7 @@ create_task(Input, State) ->
                                        scope => maps:get(scope, Input),
                                        task => Task,
                                        task_ref => undefined,
+                                       direct_message => undefined,
                                        events => [], next_seq => 1,
                                        subscribers => #{},
                                        updated_ms => Now,
@@ -640,7 +803,12 @@ start_execution(Input, TaskId, Entry0, State0) ->
                 context_id => maps:get(<<"contextId">>, maps:get(task, Entry0)),
                 message => Message,
                 metadata => Metadata,
-                principal => Principal},
+                principal => Principal,
+                %% The opaque authenticated scope is safe to use as the
+                %% Runner user identity; raw principal terms are not retained.
+                scope => Scope,
+                continuation =>
+                    length(maps:get(<<"history">>, maps:get(task, Entry0))) > 1},
     Emit = fun(Event0) ->
         Event = adk_secret_redactor:redact(Event0, Seeds),
         progress(Server, TaskId, Scope, Event)
@@ -675,10 +843,248 @@ start_execution(Input, TaskId, Entry0, State0) ->
             {error, Reason, Entry1, State1}
     end.
 
+send_started_reply(Input, Params, Subscriber, TaskId, Entry0, State0) ->
+    case start_execution(Input, TaskId, Entry0, State0) of
+        {ok, Entry1, State1} ->
+            case maybe_subscribe(Subscriber, Entry1, State1) of
+                {ok, Entry2, State2} ->
+                    Task = public_task(maps:get(task, Entry2),
+                                       send_history_length(Params), true),
+                    Frames = replay_frames(Entry2, 0),
+                    Reply = #{task_id => TaskId, task => Task,
+                              frames => Frames},
+                    {reply, {ok, Reply}, put_entry(Entry2, State2)};
+                {error, subscriber_capacity} ->
+                    {reply, {error, subscriber_capacity},
+                     put_entry(Entry1, State1)}
+            end;
+        {error, Reason, FailedEntry, State1} ->
+            case maybe_subscribe(Subscriber, FailedEntry, State1) of
+                {ok, FailedEntry1, State2} ->
+                    Reply = #{task_id => TaskId,
+                              task => public_task(
+                                        maps:get(task, FailedEntry1),
+                                        send_history_length(Params), true),
+                              frames => replay_frames(FailedEntry1, 0)},
+                    {reply,
+                     {error, {execution_start_failed, Reason, Reply}},
+                     put_entry(FailedEntry1, State2)};
+                {error, subscriber_capacity} ->
+                    {reply, {error, subscriber_capacity},
+                     put_entry(FailedEntry, State1)}
+            end
+    end.
+
 invoke_executor(Fun, Request, Emit) when is_function(Fun, 2) ->
     Fun(Request, Emit);
 invoke_executor({Module, Function}, Request, Emit) ->
     apply(Module, Function, [Request, Emit]).
+
+%% push-notification configuration
+
+maybe_attach_inline_push(Input, TaskId, Entry, State) ->
+    Configuration = maps:get(<<"configuration">>, maps:get(params, Input),
+                             #{}),
+    case maps:get(<<"taskPushNotificationConfig">>, Configuration,
+                  undefined) of
+        undefined -> {ok, Entry, State};
+        Config when is_map(Config) ->
+            case push_capability(State) of
+                false -> {error, push_notification_not_supported, State};
+                true ->
+                    case attach_push_configuration(
+                           TaskId, Config, Entry, State) of
+                        {ok, _Public, State1} ->
+                            {ok, maps:get(TaskId, maps:get(tasks, State1)),
+                             State1};
+                        {error, Reason, State1} ->
+                            {error, Reason, State1}
+                    end
+            end;
+        _ -> {error, invalid_push_notification_config, State}
+    end.
+
+create_push_configuration(Scope, Params, State) when is_map(Params) ->
+    case push_capability(State) of
+        false -> {error, push_notification_not_supported, State};
+        true ->
+            case required_push_task_id(Params) of
+                {ok, TaskId} ->
+                    case tenant_matches(Params, State) of
+                        false -> {error, invalid_tenant, State};
+                        true ->
+                            case visible_entry(TaskId, Scope, State) of
+                                error -> {error, task_not_found, State};
+                                {ok, Entry} ->
+                                    attach_push_configuration(
+                                      TaskId, Params, Entry, State)
+                            end
+                    end;
+                {error, Reason} -> {error, Reason, State}
+            end
+    end;
+create_push_configuration(_Scope, _Params, State) ->
+    {error, invalid_push_notification_config, State}.
+
+attach_push_configuration(TaskId, Config0, Entry0, State0) ->
+    Configs0 = maps:get(push_configs, Entry0, #{}),
+    Maximum = maps:get(max_push_configs_per_task, maps:get(config, State0)),
+    ConfigId = case maps:get(<<"id">>, Config0, <<>>) of
+        <<>> -> uuid(<<"push-">>);
+        Value -> Value
+    end,
+    case map_size(Configs0) >= Maximum orelse maps:is_key(ConfigId, Configs0) of
+        true -> {error, push_notification_capacity_reached, State0};
+        false ->
+            ServerConfig = maps:get(config, State0),
+            Tenant = maps:get(tenant, ServerConfig),
+            Policy = maps:get(push_policy, ServerConfig),
+            case adk_a2a_v1_push:prepare_config(
+                   TaskId, ConfigId, Tenant, Config0, Policy) of
+                {ok, Public, Secret} ->
+                    Entry1 = Entry0#{push_configs =>
+                                        Configs0#{ConfigId => Public}},
+                    Secrets0 = maps:get(push_secrets, State0),
+                    State1 = State0#{push_secrets =>
+                                        Secrets0#{{TaskId, ConfigId} => Secret}},
+                    {ok, Public, put_entry(Entry1, State1)};
+                {error, Reason} -> {error, Reason, State0}
+            end
+    end.
+
+get_push_configuration(Scope, Params, State) ->
+    case push_capability(State) of
+        false -> {error, push_notification_not_supported};
+        true -> get_push_configuration_enabled(Scope, Params, State)
+    end.
+
+get_push_configuration_enabled(Scope, Params, State) ->
+    case tenant_matches(Params, State) of
+        false -> {error, invalid_tenant};
+        true -> get_push_configuration_tenant(Scope, Params, State)
+    end.
+
+get_push_configuration_tenant(Scope, Params, State) ->
+    case push_lookup_input(Params) of
+        {ok, TaskId, ConfigId} ->
+            case visible_entry(TaskId, Scope, State) of
+                {ok, Entry} ->
+                    case maps:find(ConfigId,
+                                   maps:get(push_configs, Entry, #{})) of
+                        {ok, Public} -> {ok, Public};
+                        error -> {error, task_not_found}
+                    end;
+                error -> {error, task_not_found}
+            end;
+        {error, _} = Error -> Error
+    end.
+
+list_push_configurations(Scope, Params, State) when is_map(Params) ->
+    case push_capability(State) of
+        false -> {error, push_notification_not_supported};
+        true -> list_push_configurations_enabled(Scope, Params, State)
+    end;
+list_push_configurations(_Scope, _Params, _State) ->
+    {error, invalid_params}.
+
+list_push_configurations_enabled(Scope, Params, State) ->
+    case tenant_matches(Params, State) of
+        false -> {error, invalid_tenant};
+        true -> list_push_configurations_tenant(Scope, Params, State)
+    end.
+
+list_push_configurations_tenant(Scope, Params, State) ->
+    case required_push_task_id(Params) of
+        {ok, TaskId} ->
+            case visible_entry(TaskId, Scope, State) of
+                {ok, Entry} ->
+                    list_entry_push_configs(Params, Entry);
+                error -> {error, task_not_found}
+            end;
+        {error, _} = Error -> Error
+    end.
+
+list_entry_push_configs(Params, Entry) ->
+    PageSize = maps:get(<<"pageSize">>, Params, 50),
+    Token = maps:get(<<"pageToken">>, Params, <<>>),
+    case is_integer(PageSize) andalso PageSize >= 1 andalso PageSize =< 100
+         andalso is_binary(Token) of
+        false -> {error, invalid_push_notification_list_params};
+        true ->
+            Sorted = lists:keysort(
+                       1, maps:to_list(maps:get(push_configs, Entry, #{}))),
+            case push_after_token(Sorted, Token) of
+                {ok, Remaining} ->
+                    {Page, Tail} = split_at(Remaining, PageSize),
+                    Next = case {Page, Tail} of
+                        {[], _} -> <<>>;
+                        {_, []} -> <<>>;
+                        {_, _} -> element(1, lists:last(Page))
+                    end,
+                    {ok, #{<<"configs">> => [Config || {_Id, Config} <- Page],
+                           <<"nextPageToken">> => Next}};
+                error -> {error, invalid_page_token}
+            end
+    end.
+
+push_after_token(Configs, <<>>) -> {ok, Configs};
+push_after_token([], _Token) -> error;
+push_after_token([{Token, _} | Rest], Token) -> {ok, Rest};
+push_after_token([_ | Rest], Token) -> push_after_token(Rest, Token).
+
+delete_push_configuration(Scope, Params, State0) ->
+    case push_capability(State0) of
+        false -> {error, push_notification_not_supported, State0};
+        true ->
+            case tenant_matches(Params, State0) of
+                false -> {error, invalid_tenant, State0};
+                true -> delete_push_configuration_tenant(
+                          Scope, Params, State0)
+            end
+    end.
+
+delete_push_configuration_tenant(Scope, Params, State0) ->
+    case push_lookup_input(Params) of
+                {ok, TaskId, ConfigId} ->
+                    case visible_entry(TaskId, Scope, State0) of
+                        error -> {error, task_not_found, State0};
+                        {ok, Entry0} ->
+                            Configs = maps:remove(
+                                        ConfigId,
+                                        maps:get(push_configs, Entry0, #{})),
+                            Entry1 = Entry0#{push_configs => Configs},
+                            Secrets = maps:remove(
+                                        {TaskId, ConfigId},
+                                        maps:get(push_secrets, State0)),
+                            State1 = put_entry(
+                                       Entry1,
+                                       State0#{push_secrets => Secrets}),
+                            {ok, cancel_push_key(
+                                   {TaskId, ConfigId}, State1)}
+                    end;
+        {error, Reason} -> {error, Reason, State0}
+    end.
+
+required_push_task_id(Params) when is_map(Params) ->
+    case maps:get(<<"taskId">>, Params, undefined) of
+        Id when is_binary(Id), byte_size(Id) > 0 -> {ok, Id};
+        _ -> {error, invalid_task_id}
+    end.
+
+push_lookup_input(Params) ->
+    case {required_push_task_id(Params),
+          maps:get(<<"id">>, Params, undefined)} of
+        {{ok, TaskId}, ConfigId}
+          when is_binary(ConfigId), byte_size(ConfigId) > 0 ->
+            {ok, TaskId, ConfigId};
+        {{error, _} = Error, _} -> Error;
+        _ -> {error, invalid_push_notification_config_id}
+    end.
+
+push_capability(State) ->
+    Card = maps:get(card, maps:get(config, State)),
+    maps:get(<<"pushNotifications">>,
+             maps:get(<<"capabilities">>, Card, #{}), false).
 
 %% progress and terminal outcomes
 
@@ -757,8 +1163,8 @@ finalize_outcome({completed, {error, _Reason}}, Entry, State) ->
     finalize_status(<<"TASK_STATE_FAILED">>,
                     <<"Agent execution failed">>, true, Entry, State);
 finalize_outcome({completed, {message, Message}}, Entry, State) ->
-    finalize_status(<<"TASK_STATE_COMPLETED">>, Message,
-                    true, Entry, State);
+    DirectMessage = normalize_agent_message(Message, Entry),
+    finalize_direct_message(DirectMessage, Entry, State);
 finalize_outcome({completed, {ok, Value}}, Entry, State) ->
     finalize_success(Value, Entry, State);
 finalize_outcome({completed, Value}, Entry, State) ->
@@ -792,6 +1198,18 @@ finalize_success(Value, Entry0, State0) ->
                             <<"Agent returned an invalid response">>,
                             true, Entry0, State0)
     end.
+
+finalize_direct_message(Message, Entry0, State0) ->
+    Task = set_status(maps:get(task, Entry0),
+                      <<"TASK_STATE_COMPLETED">>, undefined),
+    Entry1 = Entry0#{task => Task,
+                     direct_message => Message,
+                     terminal_at => erlang:system_time(millisecond)},
+    {Entry2, State1} = append_event(
+                         #{<<"message">> => Message}, true,
+                         Entry1, State0),
+    {Entry3, State2} = clear_terminal_push_configs(Entry2, State1),
+    close_subscribers(Entry3, State2).
 
 finalize_status(StateName, Message0, Terminal, Entry0, State0) ->
     Message = normalize_agent_message(Message0, Entry0),
@@ -857,6 +1275,16 @@ cancel_entry(Entry0, State0) ->
                         {error, _} ->
                             {reply, {error, task_not_cancelable}, State0}
                     end;
+                undefined ->
+                    %% Interrupted tasks (INPUT_REQUIRED/AUTH_REQUIRED) have
+                    %% no live worker but remain non-terminal and cancelable.
+                    {Entry1, State1} = finalize_status(
+                                         <<"TASK_STATE_CANCELED">>,
+                                         <<"Task canceled">>, true,
+                                         Entry0, State0),
+                    {reply, {ok, public_task(maps:get(task, Entry1),
+                                             undefined, true)},
+                     put_entry(Entry1, State1)};
                 _ -> {reply, {error, task_not_cancelable}, State0}
             end
     end.
@@ -886,7 +1314,8 @@ terminal_status_event(Task, Entry0, State0) ->
     {Entry2, State1} = append_event(
                          #{<<"statusUpdate">> => Update}, true,
                          Entry1, State0),
-    close_subscribers(Entry2, State1).
+    {Entry3, State2} = clear_terminal_push_configs(Entry2, State1),
+    close_subscribers(Entry3, State2).
 
 append_event(Payload, Terminal, Entry0, State0) ->
     {ok, SafePayload} = adk_a2a_v1_codec:validate_stream_response(Payload),
@@ -900,10 +1329,142 @@ append_event(Payload, Terminal, Entry0, State0) ->
             Events1 = trim_events(Events0 ++ [{Seq, SafePayload}], Max),
             {Entry1, State1} = deliver_event(
                                  Entry0, State0, Seq, SafePayload, Terminal),
+            State2 = enqueue_push_deliveries(
+                       Entry1, State1, Seq, SafePayload),
             {Entry1#{events => Events1,
                      next_seq => Seq + 1,
-                     updated_ms => erlang:system_time(millisecond)}, State1}
+                     updated_ms => erlang:system_time(millisecond)}, State2}
     end.
+
+enqueue_push_deliveries(Entry, State0, Seq, Payload) ->
+    TaskId = maps:get(id, Entry),
+    Secrets = maps:get(push_secrets, State0),
+    Configs = lists:keysort(
+                1, maps:to_list(maps:get(push_configs, Entry, #{}))),
+    lists:foldl(
+      fun({ConfigId, Public}, StateAcc) ->
+          case maps:find({TaskId, ConfigId}, Secrets) of
+              {ok, Secret} ->
+                  DeliveryId = push_delivery_id(TaskId, ConfigId, Seq),
+                  Job = #{key => {TaskId, ConfigId},
+                          task_id => TaskId, sequence => Seq,
+                          config => Public, secret => Secret,
+                          payload => Payload,
+                          delivery_id => DeliveryId},
+                  enqueue_push_job(Job, StateAcc);
+              error -> StateAcc
+          end
+      end, State0, Configs).
+
+enqueue_push_job(Job, State = #{push_active := Active})
+  when map_size(Active) =:= 0 ->
+    start_push_worker(Job, State);
+enqueue_push_job(Job, State0) ->
+    Queue0 = maps:get(push_queue, State0),
+    Maximum = maps:get(max_push_queue, maps:get(config, State0)),
+    case queue:len(Queue0) < Maximum of
+        true -> State0#{push_queue => queue:in(Job, Queue0)};
+        false -> State0
+    end.
+
+start_push_worker(Job, State0) ->
+    Owner = self(),
+    DeliveryRef = make_ref(),
+    Policy = maps:get(push_policy, maps:get(config, State0)),
+    Work = fun() ->
+        WorkerPid = self(),
+        Guard = spawn(fun() -> push_owner_guard(Owner, WorkerPid) end),
+        _ = adk_a2a_v1_push:deliver(Job, Policy),
+        Guard ! finished,
+        _ = erlang:send(Owner,
+                        {a2a_push_delivery_done, self(), DeliveryRef},
+                        [nosuspend, noconnect]),
+        ok
+    end,
+    SpawnOptions =
+        [monitor, {message_queue_data, off_heap},
+         {max_heap_size,
+          #{size => ?PUSH_WORKER_MAX_HEAP_WORDS, kill => true,
+            error_logger => false, include_shared_binaries => true}}],
+    try erlang:spawn_opt(Work, SpawnOptions) of
+        {Pid, Monitor} ->
+            Active = maps:get(push_active, State0),
+            Worker = #{pid => Pid, key => maps:get(key, Job),
+                       delivery_ref => DeliveryRef},
+            State0#{push_active => Active#{Monitor => Worker}}
+    catch
+        _:_ -> State0
+    end.
+
+push_owner_guard(Owner, Worker) ->
+    OwnerMonitor = erlang:monitor(process, Owner),
+    WorkerMonitor = erlang:monitor(process, Worker),
+    receive
+        finished ->
+            erlang:demonitor(OwnerMonitor, [flush]),
+            erlang:demonitor(WorkerMonitor, [flush]),
+            ok;
+        {'DOWN', OwnerMonitor, process, Owner, _Reason} ->
+            exit(Worker, kill),
+            erlang:demonitor(WorkerMonitor, [flush]),
+            ok;
+        {'DOWN', WorkerMonitor, process, Worker, _Reason} ->
+            erlang:demonitor(OwnerMonitor, [flush]),
+            ok
+    end.
+
+take_push_worker(Pid, DeliveryRef, State0) ->
+    Active0 = maps:get(push_active, State0),
+    case [Ref || {Ref, #{pid := WorkerPid,
+                         delivery_ref := RefValue}} <- maps:to_list(Active0),
+                 WorkerPid =:= Pid, RefValue =:= DeliveryRef] of
+        [Monitor] ->
+            _ = erlang:demonitor(Monitor, [flush]),
+            {ok, State0#{push_active => maps:remove(Monitor, Active0)}};
+        [] -> error
+    end.
+
+start_queued_push(State = #{push_active := Active})
+  when map_size(Active) > 0 -> State;
+start_queued_push(State0) ->
+    case queue:out(maps:get(push_queue, State0)) of
+        {{value, Job}, Queue} ->
+            start_push_worker(Job, State0#{push_queue => Queue});
+        {empty, _} -> State0
+    end.
+
+cancel_push_key(Key, State0) ->
+    Active0 = maps:get(push_active, State0),
+    Active = maps:fold(
+      fun(Monitor, #{pid := Pid, key := WorkerKey} = Worker, Acc) ->
+          case WorkerKey =:= Key of
+              true ->
+                  _ = erlang:demonitor(Monitor, [flush]),
+                  exit(Pid, kill),
+                  Acc;
+              false -> Acc#{Monitor => Worker}
+          end
+      end, #{}, Active0),
+    Pending = [Job || Job <- queue:to_list(maps:get(push_queue, State0)),
+                       maps:get(key, Job) =/= Key],
+    start_queued_push(State0#{push_active => Active,
+                              push_queue => queue:from_list(Pending)}).
+
+clear_terminal_push_configs(Entry0, State0) ->
+    TaskId = maps:get(id, Entry0),
+    ConfigIds = maps:keys(maps:get(push_configs, Entry0, #{})),
+    Secrets0 = maps:get(push_secrets, State0),
+    Secrets = lists:foldl(
+                fun(ConfigId, Acc) ->
+                    maps:remove({TaskId, ConfigId}, Acc)
+                end, Secrets0, ConfigIds),
+    {Entry0#{push_configs => #{}}, State0#{push_secrets => Secrets}}.
+
+push_delivery_id(TaskId, ConfigId, Seq) ->
+    Digest = crypto:hash(
+               sha256,
+               term_to_binary({TaskId, ConfigId, Seq}, [deterministic])),
+    base64url(Digest).
 
 %% A slow Cowboy/request process must not turn the task store into an
 %% unbounded mailbox producer. Once the configured queue ceiling is reached,
@@ -1252,6 +1813,7 @@ split_at([Head | Rest], N, Acc) ->
 %% state/capacity helpers
 
 put_entry(Entry, State) ->
+    ok = persist_task_entry(Entry, maps:get(config, State)),
     Tasks = maps:get(tasks, State),
     State#{tasks => Tasks#{maps:get(id, Entry) => Entry}}.
 
@@ -1289,12 +1851,91 @@ prune(State) ->
 remove_task(TaskId, State0) ->
     case maps:take(TaskId, maps:get(tasks, State0)) of
         {Entry, Tasks} ->
+            ok = delete_task_snapshot(TaskId, maps:get(config, State0)),
             State1 = State0#{tasks => Tasks},
             lists:foldl(
               fun({Ref, Pid}, Acc) ->
                   element(1, remove_subscriber_ref(TaskId, Pid, Ref, Acc))
               end, State1, maps:to_list(maps:get(subscribers, Entry)));
         error -> State0
+    end.
+
+%% task-store persistence
+
+restore_task_snapshots(#{task_store := undefined}) -> {ok, #{}};
+restore_task_snapshots(Config = #{task_store := {Module, Handle}}) ->
+    case safe_task_store_call(Module, load, [Handle]) of
+        {ok, Snapshots} when is_list(Snapshots),
+                             length(Snapshots) =< map_get(max_tasks, Config) ->
+            restore_snapshot_list(Snapshots, Config, #{});
+        {ok, _} -> {error, a2a_task_store_capacity_reached};
+        {error, Reason} -> {error, {a2a_task_store_load_failed, Reason}};
+        _ -> {error, a2a_task_store_invalid_load_result}
+    end.
+
+restore_snapshot_list([], _Config, Acc) -> {ok, Acc};
+restore_snapshot_list([Snapshot0 | Rest], Config, Acc) ->
+    case adk_a2a_v1_task_store:prepare_snapshot(Snapshot0) of
+        {ok, Snapshot, _Bytes} ->
+            Entry0 = Snapshot#{task_ref => undefined, subscribers => #{},
+                              direct_message => undefined},
+            Entry = recover_snapshot_entry(Entry0, Config),
+            Id = maps:get(id, Entry),
+            case maps:is_key(Id, Acc) orelse
+                 not retained_task_allowed(maps:get(task, Entry), Config) of
+                true -> {error, invalid_a2a_task_store_snapshot};
+                false ->
+                    ok = persist_task_entry(Entry, Config),
+                    restore_snapshot_list(Rest, Config, Acc#{Id => Entry})
+            end;
+        {error, Reason} -> {error, {invalid_a2a_task_store_snapshot, Reason}}
+    end.
+
+recover_snapshot_entry(Entry0, Config) ->
+    Task0 = maps:get(task, Entry0),
+    case task_state(Task0) of
+        <<"TASK_STATE_SUBMITTED">> -> recover_incomplete_entry(Entry0, Config);
+        <<"TASK_STATE_WORKING">> -> recover_incomplete_entry(Entry0, Config);
+        _ -> Entry0
+    end.
+
+recover_incomplete_entry(Entry0, Config) ->
+    Task = set_status(maps:get(task, Entry0), <<"TASK_STATE_FAILED">>,
+                      undefined),
+    Seq = maps:get(next_seq, Entry0),
+    Payload = #{<<"statusUpdate">> =>
+                    #{<<"taskId">> => maps:get(id, Entry0),
+                      <<"contextId">> => maps:get(<<"contextId">>, Task),
+                      <<"status">> => maps:get(<<"status">>, Task)}},
+    Events = trim_events(maps:get(events, Entry0) ++ [{Seq, Payload}],
+                         maps:get(max_events, Config)),
+    Now = erlang:system_time(millisecond),
+    Entry0#{task => Task, events => Events, next_seq => Seq + 1,
+            updated_ms => Now, terminal_at => Now}.
+
+persist_task_entry(_Entry, #{task_store := undefined}) -> ok;
+persist_task_entry(Entry, #{task_store := {Module, Handle}}) ->
+    Snapshot = maps:with([id, scope, task, events, next_seq,
+                          updated_ms, terminal_at], Entry),
+    case safe_task_store_call(Module, put, [Handle, Snapshot]) of
+        ok -> ok;
+        {error, Reason} -> exit({a2a_task_store_write_failed, Reason});
+        _ -> exit(a2a_task_store_invalid_write_result)
+    end.
+
+delete_task_snapshot(_TaskId, #{task_store := undefined}) -> ok;
+delete_task_snapshot(TaskId, #{task_store := {Module, Handle}}) ->
+    case safe_task_store_call(Module, delete, [Handle, TaskId]) of
+        ok -> ok;
+        {error, Reason} -> exit({a2a_task_store_delete_failed, Reason});
+        _ -> exit(a2a_task_store_invalid_delete_result)
+    end.
+
+safe_task_store_call(Module, Function, Args) ->
+    try apply(Module, Function, Args) of
+        Reply -> Reply
+    catch
+        _:_ -> {error, task_store_unavailable}
     end.
 
 %% scalar helpers

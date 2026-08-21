@@ -206,6 +206,136 @@ defmodule ErlangAdkUi.TestLiveGateway do
     end
   end
 
+  @impl true
+  def list_graphs(identity) do
+    notify({:list_graphs, identity})
+
+    {:ok,
+     %{
+       "graphs" => [graph_summary()],
+       "next_cursor" => nil,
+       "truncated" => false
+     }}
+  end
+
+  @impl true
+  def graph_detail(identity, graph_id) do
+    notify({:graph_detail, identity, graph_id})
+
+    if graph_id == "checkout" do
+      {:ok, graph_detail()}
+    else
+      {:error, :not_found}
+    end
+  end
+
+  @impl true
+  def graph_overlay(identity, graph_id, cursor) do
+    notify({:graph_overlay, identity, graph_id, cursor})
+
+    cond do
+      graph_id != "checkout" ->
+        {:error, :not_found}
+
+      Application.get_env(:erlang_adk_ui, :test_graph_overlay_gap, false) and cursor == 0 ->
+        {:error, {:replay_gap, replay_gap()}}
+
+      true ->
+        {:ok,
+         %{
+           "schema_version" => 1,
+           "content_captured" => false,
+           "graph" => graph_detail(),
+           "overlay" => %{
+             "node_states" => %{"authorize" => "completed"},
+             "active_node" => nil,
+             "routes" => [],
+             "retry_count" => 0,
+             "pause_count" => 0
+           },
+           "trace" => trace_page(cursor)
+         }}
+    end
+  end
+
+  @impl true
+  def trace_timeline(identity, cursor) do
+    notify({:trace_timeline, identity, cursor})
+
+    if Application.get_env(:erlang_adk_ui, :test_trace_gap, false) and cursor == 0 do
+      {:error, {:replay_gap, replay_gap()}}
+    else
+      {:ok, trace_page(cursor)}
+    end
+  end
+
+  defp graph_summary do
+    %{
+      "id" => "checkout",
+      "fingerprint" => String.duplicate("a", 64),
+      "generation" => 1,
+      "updated_at" => 1_726_000_000_000,
+      "encoded_bytes" => 512
+    }
+  end
+
+  defp graph_detail do
+    Map.put(graph_summary(), "graph", %{
+      "schema_version" => 1,
+      "workflow_id" => "checkout",
+      "kind" => "graph",
+      "entry" => "authorize",
+      "node_order" => ["authorize"],
+      "nodes" => [%{"id" => "authorize", "type" => "action"}],
+      "edges" => [%{"from" => "authorize", "to" => "$end", "kind" => "edge"}],
+      "prompt" => "RAW_GRAPH_PROMPT_SHOULD_NOT_RENDER"
+    })
+  end
+
+  defp trace_page(cursor) do
+    next_cursor = cursor + 1
+
+    %{
+      "events" => [
+        %{
+          "cursor" => next_cursor,
+          "kind" => "workflow_lifecycle",
+          "timestamp_ms" => 1_726_000_000_000,
+          "identity" => %{
+            "workflow_id" => "checkout",
+            "invocation_id" => "invocation-1"
+          },
+          "event" => %{
+            "schema_version" => 1,
+            "type" => "node_completed",
+            "sequence" => next_cursor,
+            "timestamp" => 1_726_000_000_000,
+            "workflow_id" => "checkout",
+            "workflow_kind" => "graph",
+            "invocation_id" => "invocation-1",
+            "node_id" => "authorize",
+            "outcome" => "ok",
+            "response" => "RAW_TRACE_RESPONSE_SHOULD_NOT_RENDER"
+          }
+        }
+      ],
+      "next_cursor" => next_cursor,
+      "oldest_available_cursor" => 1,
+      "latest_cursor" => next_cursor,
+      "encoded_bytes" => 512,
+      "truncated" => false
+    }
+  end
+
+  defp replay_gap do
+    %{
+      "after_cursor" => 0,
+      "oldest_available_cursor" => 4,
+      "latest_cursor" => 6,
+      "evicted_through" => 3
+    }
+  end
+
   defp session_id(%{subject: subject}), do: "live-#{subject}"
 
   defp valid_attachment?({__MODULE__, session_id, token}, session_id) when is_reference(token),

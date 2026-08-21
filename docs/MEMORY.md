@@ -14,6 +14,23 @@ SHA-256 digest, and timestamp. Memory is reference data rather than executable
 instructions; Runner frames retrieved text as untrusted input before it reaches
 a model.
 
+Long-term memory and its Runner retrieval/ingestion path were already released
+in 0.9. The 0.10 branch adds an opt-in supervised configuration layer:
+`adk_runtime_service_bundle:start_link(ephemeral_local, #{})` selects one
+shared ETS memory adapter, while `durable_local` selects exact-scope local
+Mnesia workers. The shared adapter enforces one global quota across users;
+durable limits remain per worker/shard. The bundle returns the same native
+memory service reference. `durable_local` also atomically owns a private
+Mnesia ingestion outbox, validates its adapter registration and health, and
+injects durable ingestion into standard Runner options. Pending jobs survive a
+bundle process restart, while stale or unhealthy references fail closed.
+Disabled and `ephemeral_local` profiles do not create this private outbox; the
+standalone opt-in described below remains compatible. Separately, 0.10 adds
+bounded embedding and vector/hybrid contracts, an opt-in governance hook,
+durable erasure epochs, and terminal outbox retention. The included vector
+adapter is local and volatile, not a managed or distributed vector database. See
+[`VERSION_0_10_0.md`](VERSION_0_10_0.md); 0.10 is still **IN DEVELOPMENT**.
+
 ## ETS and Mnesia adapters
 
 `adk_memory_ets` is volatile and intended for tests or local development.
@@ -57,8 +74,8 @@ creates its two local tables if needed:
 In a release, configure Mnesia's directory and distributed table-copy policy
 before starting this adapter. The bundled implementation is a durable local
 lexical reference adapter, not a distributed vector database. Applications
-that need embeddings, managed retention, or multi-region replication should
-implement the same `adk_memory_service` behavior.
+that need a managed index, multi-region replication, or provider-specific
+retention should implement the corresponding service/vector/policy contracts.
 
 Both adapters reject unknown options and expose configured limits through
 `capabilities/1`. Deadline-aware mutations accept
@@ -72,12 +89,35 @@ adk_memory_ets:add_entry(
     #{timeout_ms => 2000}).
 ```
 
+## Embeddings and vector/hybrid retrieval (0.10)
+
+`adk_memory_embedding_provider:embed/5` invokes an application-selected
+embedding provider in a monitored, killable worker. The request and reply are
+validated before crossing the boundary. Defaults cap a call at 5 seconds, 128
+inputs, 64 KiB per input, 1 MiB total input, 8,192 dimensions, and 16 MiB of
+vector result storage. A provider must return the requested model and exactly
+one finite, fixed-width vector per input; credentials and endpoints remain in
+its trusted handle.
+
+`adk_memory_vector_ets` is the bounded local reference implementation of
+`adk_memory_vector_adapter` and `adk_memory_hybrid_adapter`. It supports
+app/user-scoped batch upsert, cosine-similarity search, weighted lexical/vector
+hybrid search, exact-scope deletion, and content-free status. It enforces
+entry, byte, dimension, batch, result-count, and result-byte ceilings. All data
+is volatile and one instance fixes one vector dimension after its first
+upsert.
+
+These contracts are not silently substituted for `adk_memory_ets` or
+`adk_memory_mnesia`, and merely configuring `memory_svc` does not call an
+embedding provider. Applications own embedding refresh, index synchronization,
+managed-vector adapters, and any bridge from vector hits into Runner retrieval.
+
 ## Exact-user sharded concurrency
 
-`adk_memory_sharded` implements the same version-2 behavior with one stable
-supervised adapter worker per exact `{user, App, User}` scope. Same-user calls
-remain ordered by that worker, while unrelated users execute concurrently
-after a protected ETS routing fast path:
+`adk_memory_sharded` implements the same version-2 behavior. Its default
+`exact_scope` strategy uses one active supervised adapter worker per exact
+`{user, App, User}` scope. Same-user calls remain ordered by that worker, while
+unrelated users execute concurrently after a protected ETS routing fast path:
 
 ```erlang
 {ok, ShardedMemory} = adk_memory_sharded:start_link(
@@ -111,10 +151,26 @@ strictly caps simultaneous cold-scope resolutions before they enter the
 router. A guard independently monitors each unresolved caller, owns and
 releases its permit on death or timeout, and prevents a stale queued route from
 creating an abandoned worker. Resolved scopes use the protected ETS fast path.
-There is no idle-worker eviction in 0.5. Limits and quotas belong to each
-exact-scope shard, not one aggregate service budget, and capabilities
-therefore report `global_quota => false`. Use an outer admission controller or
-custom backend for a deployment-wide quota.
+
+For the default volatile ETS adapter, idle reclamation is disabled because
+evicting a worker would discard its entries. Its active-scope ceiling is thus a
+lifetime/cardinality bound until a worker exits or the router restarts. With
+the durable Mnesia adapter, the router may reclaim the least-recently-used
+worker at capacity after all of its operation leases are idle for
+`idle_scope_timeout_ms` (default 60000; range 1 through 86400000). The next
+worker for that exact user reopens the same Mnesia data. If no worker is
+eligible, a new scope returns `{error, max_active_scopes_reached}`.
+
+Exact-scope limits and quotas belong to each shard, not one aggregate service
+budget, and capabilities report `quota_scope => exact_scope_shard` and
+`global_quota => false`. A direct wrapper can instead set
+`scope_strategy => shared`, creating one adapter instance for every authorized
+scope, reporting `active_scopes => 1`, and enforcing its limits globally as
+`shared_adapter`. The 0.10 `ephemeral_local` profile uses this shared shape.
+Status exposes routing, idle timeout, whether reclamation is active, and the
+eviction count; sharding capabilities expose the strategy, timeout, and
+reclamation mode. Use an outer admission controller or custom backend for a
+deployment-wide quota over durable exact-scope shards.
 
 ## Incremental ingestion and erasure
 
@@ -144,6 +200,30 @@ ok = adk_memory_ets:delete_user(MemoryPid, Scope).
 
 `{error, not_found}` is returned when the requested scoped target does not
 exist. There is no cross-user search or deletion API.
+
+### Governance hooks and erasure epochs (0.10)
+
+`adk_memory_policy:check/6` is an opt-in, fail-closed boundary for `ingest`,
+`search`, `delete`, `erase`, `retain`, and `prune`. Resource/context maps are
+secret-redacted, normalized, and bounded before a policy callback runs in a
+monitored worker with a caller-supplied timeout no greater than 60 seconds.
+The result is either allow, allow with checked `expires_at`, `retain_until`,
+`legal_hold`, and `consent_id` obligations, or a structural denial.
+
+`adk_memory_policy_static:compile/1` provides a bounded consent, TTL,
+retention, and legal-hold policy. It is a reusable hook, not an automatically
+installed global policy: the direct adapters and Runner do not invoke it merely
+because the module exists. The application or adapter wrapper that owns a
+memory lifecycle must call the hook at the relevant actions and must persist
+and enforce returned obligations. Redaction is not general PII classification.
+
+For the durable path, `adk_memory_erasure_epoch` keeps a monotonic Mnesia epoch
+for each exact app/user scope. `adk_memory_mnesia:delete_user/2` advances that
+epoch in the deletion transaction. Outbox admission captures the current epoch,
+and delivery checks it in the same transaction as the Mnesia write. A queued or
+in-flight job from an older epoch is cancelled/rejected instead of recreating
+memory after erasure. This fence applies to the built-in Mnesia/outbox path;
+custom and external stores must implement equivalent erasure coordination.
 
 ## Runner retrieval and ingestion
 
@@ -254,12 +334,43 @@ advertising `contract_version >= 2`,
 and deadline-aware `add_events/6` is preferred. Stable event IDs make a
 repeated batch a duplicate rather than a second memory entry.
 
+The volatile registry is also an admission barrier. On initial startup and
+after a registry child restart, processors claim no durable job until the
+application has deterministically re-registered at least one adapter. The
+registry then returns only the bounded set of hydrated stable identities, so
+registering adapter A cannot release queued work for unavailable adapter B.
+Claim discovery scans at most `max_claim_scan` entries in the ordered schedule
+index and persists a rotating cursor; an unavailable identity at the front
+cannot permanently starve later hydrated identities. Resolver readiness and
+the identity snapshot run in bounded monitored workers and malformed,
+oversized, timed-out, or failed replies close the barrier.
+
 Jobs and total bytes have global and per-scope admission limits. Events are
 size/count bounded and sanitized before the enqueue transaction. Retry uses
 bounded exponential backoff and becomes terminal after `max_attempts`.
 `adk_memory_outbox_processor:status/2` and the lower-level
 `adk_memory_outbox:stats/1`, `cancel/3`, and terminal-job `delete/2` expose
 explicit lifecycle operations without returning content or runtime handles.
+
+The ordered schedule table indexes pending/retry due times, running-lease
+expiry, and terminal completion time. Claims, expired-lease recovery, erasure-
+epoch fencing, and terminal pruning therefore scan explicit bounded index
+windows instead of folding the jobs table. Epoch fencing is rechecked inside
+claim and immediately before mutation renewal.
+
+Terminal capacity is a hard reservation across active plus terminal jobs:
+every admitted active job reserves one eventual terminal slot. Defaults retain
+terminal history for seven days, cap the combined reservation at 100,000
+records, and cap one prune pass at 1,000 records. A pre-cap database that is
+already over the configured ceiling remains startable for migration and
+bounded pruning, but new admissions fail closed until delete/prune creates
+headroom. Use `adk_memory_outbox:prune_terminal/2,3`,
+`adk_memory_outbox_processor:prune_terminal/2`, or the supervised
+`adk_memory_outbox_sup:prune_terminal/1` API to remove only terminal rows older
+than the configured retention cutoff. Terminal counts and the ordered index
+are rebuilt during migration from older jobs-only data. Pruning is explicit
+and bounded; there
+is no timer that silently deletes history.
 
 The batch ceiling is 500 events and the default job ceiling is 5,000 events.
 The processor validates `lease_ms >= 2 * call_timeout_ms + 250` to leave a
@@ -269,15 +380,50 @@ an arbitrary adapter: a lease can expire after the final pre-call check while
 adapter code is running. Adapters must honor the supplied deadline where
 available, and correctness across a retry relies on stable event-ID
 idempotency. Job-level deduplication requires an exact adapter, scope, session,
-and ordered event-ID
-sequence; partially overlapping jobs rely on the v2 adapter's event-ID
+and ordered event-ID sequence in one erasure epoch; the epoch is part of the
+durable job identifier. Repeating the same request in the same epoch is
+idempotent. After successful erasure advances the epoch, the same logical
+request receives a new job ID and may be admitted again without reviving pre-
+erasure work. Partially overlapping jobs rely on the v2 adapter's event-ID
 idempotency. This is deliberately not an exactly-once outbox.
 
 The outbox registry must re-register the stable adapter identity after an
 adapter restart. Pending jobs remain durable while resolution is unavailable
 and retry according to policy.
 
-Runner can use this outbox when it is enabled before application startup:
+With the `durable_local` runtime profile, `adk_runtime_service_bundle` owns a
+private outbox supervisor in the same atomic generation as the session,
+artifact, and memory services. Startup validates the selected memory adapter's
+durable-ingestion capabilities—including numeric `contract_version >= 2`,
+idempotent/incremental ingestion, and erasure-epoch fencing—before exposing the
+bundle. Unknown or invalid nested `outbox`, `registry`, and `processor` options
+fail profile compilation; names are forced private and Runner attempts remain
+within its hard ceiling. `services/1`,
+`runner_spec/1`, `status/1`, and `health/1` expose validated, redacted outbox
+service state; `runner_spec/1` injects the required `memory_ingestion` map into
+standard Runner creation. Outbox Mnesia jobs survive a bundle/outbox process
+restart and resume after the stable adapter is re-registered. A stale bundle
+generation, dead private outbox, unhealthy registry/processor, or mismatched
+adapter identity is an error rather than a fallback to process-local writes.
+
+`ephemeral_local` and the disabled runtime-service profile intentionally own no
+private outbox. Existing applications may continue to use the standalone
+`memory_outbox_enabled` application setting and explicit Runner options below;
+when `durable_local` is enabled, legacy module-named `adk_memory_outbox_sup`
+APIs resolve the one bundle-owned supervisor rather than starting or addressing
+a duplicate processor.
+
+Outbox health is independent of retained-job cardinality. It validates the
+jobs, usage, ordered schedule, and erasure-epoch table schemas/topology, then
+performs fixed point reads and one sentinel write in a single transaction. The
+sentinel leaves all four table row counts unchanged. `mnesia_majority` mode
+fails admission, claims, renewal, and health closed unless the four tables
+share at least two configured nodes; single-node mode is explicit and does not
+claim multi-node readiness. Public status and crash formatting omit service
+handles, event content, resolver state, owner tokens, and private inputs.
+
+Runner can use the standalone compatibility outbox when it is enabled before
+application startup:
 
 ```erlang
 ok = application:set_env(erlang_adk, memory_outbox_enabled, true),
@@ -374,22 +520,29 @@ unavailable instead of being relabelled under the HTTP path scope.
 
 ## Current limits
 
-- Search is lexical overlap; semantic/vector retrieval is an adapter.
+- The primary ETS/Mnesia `adk_memory_service` adapters search by lexical
+  overlap. `adk_memory_vector_ets` supplies a separate local vector/hybrid
+  reference contract; managed indexes and automatic synchronization remain
+  adapter/application responsibilities.
 - Direct ETS and Mnesia reference adapters perform storage and lexical ranking
-  in one GenServer per service. The optional sharded wrapper overlaps unrelated
-  user scopes while preserving same-scope ordering, but does not aggregate
-  quotas or idle-evict workers.
+  in one GenServer per service. The optional router wrapper overlaps unrelated
+  exact user scopes while preserving same-scope ordering, or routes through one
+  shared adapter. Durable exact-scope workers support idle LRU reclamation only
+  at capacity; volatile exact-scope workers are not reclaimed. Exact-scope
+  quotas are not aggregated.
 - The core rejects known secret patterns and keys, but this is not general PII
-  detection or a consent policy.
-- Retention/TTL and managed-memory lifecycle policies are adapter concerns in
-  0.5; explicit entry/session/user erasure is implemented. Applications must
-  coordinate erasure with pending outbox jobs so deleted session data is not
-  re-ingested later.
-- The built-in outbox tables are local `disc_copies`. Cross-node recovery needs
-  the deployment's normal Mnesia replication, majority, backup, and restore
-  policy. Completed, failed, or cancelled job history has no automatic
-  retention timer; operators delete terminal jobs explicitly with
-  `adk_memory_outbox:delete/2`.
+  detection. The static governance policy exists but is opt-in; applications
+  must invoke it and enforce its obligations on every relevant path.
+- Explicit entry/session/user erasure is implemented. Built-in Mnesia memory
+  and the durable outbox coordinate user erasure with transactional epochs;
+  ETS, custom, and external backends need their own equivalent fencing.
+- The built-in outbox defaults to local `disc_copies`. Explicit
+  `mnesia_majority` mode requires at least two nodes shared by all four tables
+  and otherwise fails closed. Cross-node recovery still needs the deployment's
+  replication, backup, restore, and partition policy; no multi-node node-loss
+  Common Test is claimed. Completed, failed, or cancelled history uses the hard
+  active-plus-terminal reservation and bounded indexed explicit pruning, not an
+  automatic timer.
 - The outbox has lease-owned, idempotent at-least-once delivery, not an
   adapter-generation fence or exactly-once external side effects.
 - Runner preloading and model-selected loading are independent opt-ins. Merely

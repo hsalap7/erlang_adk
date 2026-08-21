@@ -20,8 +20,21 @@ defmodule ErlangAdkUi.LiveGateway.Local do
     live_read: "adk.live.read",
     live_control: "adk.live.control",
     observability_read: "adk.observability.read",
-    evaluation_read: "adk.evaluation.read"
+    evaluation_read: "adk.evaluation.read",
+    graph_read: "adk.graph.read",
+    trace_read: "adk.trace.read"
   }
+
+  @graph_trace_config_keys MapSet.new([
+                             :graph_catalog,
+                             :graph_owner,
+                             :trace_store,
+                             :trace_principal,
+                             :trace_selector,
+                             :graph_list_limit,
+                             :trace_limit,
+                             :trace_max_bytes
+                           ])
 
   @impl true
   def discover(identity) do
@@ -193,6 +206,79 @@ defmodule ErlangAdkUi.LiveGateway.Local do
       {:error, _reason} = error -> error
     end
   end
+
+  @impl true
+  def list_graphs(identity) do
+    with {:ok, _principal} <- authorize(identity, :graph_read),
+         {:ok, config} <- configured_graph_trace() do
+      safe_fixed_module_call(:adk_dev_graph_catalog, :list, [
+        config.graph_catalog,
+        config.graph_owner,
+        %{limit: config.graph_list_limit}
+      ])
+    end
+  end
+
+  @impl true
+  def graph_detail(identity, graph_id) when is_binary(graph_id) do
+    with {:ok, _principal} <- authorize(identity, :graph_read),
+         true <- valid_id?(graph_id),
+         {:ok, config} <- configured_graph_trace() do
+      safe_fixed_module_call(:adk_dev_graph_catalog, :get, [
+        config.graph_catalog,
+        config.graph_owner,
+        graph_id
+      ])
+    else
+      false -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def graph_detail(_identity, _graph_id), do: {:error, :invalid_request}
+
+  @impl true
+  def graph_overlay(identity, graph_id, cursor)
+      when is_binary(graph_id) and is_integer(cursor) and cursor >= 0 do
+    with {:ok, principal} <- authorize(identity, :graph_read),
+         {:ok, ^principal} <- authorize(identity, :trace_read),
+         true <- valid_id?(graph_id),
+         {:ok, config} <- configured_graph_trace() do
+      safe_fixed_module_call(:adk_dev_trace_view, :graph_overlay, [
+        config.graph_catalog,
+        config.graph_owner,
+        graph_id,
+        config.trace_store,
+        config.trace_principal,
+        %{
+          after_cursor: cursor,
+          limit: config.trace_limit,
+          max_bytes: config.trace_max_bytes
+        }
+      ])
+    else
+      false -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def graph_overlay(_identity, _graph_id, _cursor), do: {:error, :invalid_request}
+
+  @impl true
+  def trace_timeline(identity, cursor) when is_integer(cursor) and cursor >= 0 do
+    with {:ok, _principal} <- authorize(identity, :trace_read),
+         {:ok, config} <- configured_graph_trace() do
+      safe_fixed_module_call(:adk_dev_trace_view, :query, [
+        config.trace_store,
+        config.trace_principal,
+        config.trace_selector,
+        cursor,
+        %{limit: config.trace_limit, max_bytes: config.trace_max_bytes}
+      ])
+    end
+  end
+
+  def trace_timeline(_identity, _cursor), do: {:error, :invalid_request}
 
   defp authorize(%{principal: principal, scopes: scopes}, operation)
        when is_binary(principal) and byte_size(principal) > 0 and byte_size(principal) <= 128 and
@@ -392,6 +478,14 @@ defmodule ErlangAdkUi.LiveGateway.Local do
     _kind, _reason -> {:error, :service_unavailable}
   end
 
+  defp safe_fixed_module_call(module, function, arguments) do
+    apply(module, function, arguments)
+  rescue
+    _error -> {:error, :service_unavailable}
+  catch
+    _kind, _reason -> {:error, :service_unavailable}
+  end
+
   defp normalize_voice_result(:ok), do: :ok
   defp normalize_voice_result({:ok, _sequence}), do: :ok
   defp normalize_voice_result({:error, _reason} = error), do: error
@@ -472,6 +566,58 @@ defmodule ErlangAdkUi.LiveGateway.Local do
   rescue
     _error -> {:error, :invalid_evaluation_catalog}
   end
+
+  defp configured_graph_trace do
+    case Application.get_env(:erlang_adk_ui, :graph_trace, :disabled) do
+      :disabled ->
+        {:error, :service_unavailable}
+
+      config when is_map(config) ->
+        validate_graph_trace_config(config)
+
+      _other ->
+        {:error, :invalid_graph_trace_config}
+    end
+  rescue
+    _error -> {:error, :invalid_graph_trace_config}
+  end
+
+  defp validate_graph_trace_config(config) do
+    keys = config |> Map.keys() |> MapSet.new()
+
+    valid =
+      keys == @graph_trace_config_keys and
+        valid_server_ref?(Map.get(config, :graph_catalog)) and
+        valid_config_id?(Map.get(config, :graph_owner), 256) and
+        valid_server_ref?(Map.get(config, :trace_store)) and
+        valid_config_id?(Map.get(config, :trace_principal), 256) and
+        valid_trace_selector?(Map.get(config, :trace_selector)) and
+        bounded_integer?(Map.get(config, :graph_list_limit), 1, 100) and
+        bounded_integer?(Map.get(config, :trace_limit), 1, 1_000) and
+        bounded_integer?(Map.get(config, :trace_max_bytes), 1, 4_194_304)
+
+    if valid, do: {:ok, config}, else: {:error, :invalid_graph_trace_config}
+  end
+
+  defp valid_server_ref?(server), do: (is_atom(server) and not is_nil(server)) or is_pid(server)
+
+  defp valid_trace_selector?(:all), do: true
+
+  defp valid_trace_selector?(selector) when is_map(selector) do
+    allowed = [:run_id, :trace_id, :workflow_id, :invocation_id]
+
+    map_size(selector) > 0 and map_size(selector) <= 4 and
+      Enum.all?(selector, fn {key, value} ->
+        key in allowed and valid_config_id?(value, 512)
+      end)
+  end
+
+  defp valid_trace_selector?(_selector), do: false
+
+  defp valid_config_id?(value, maximum), do: valid_utf8_binary?(value, maximum)
+
+  defp bounded_integer?(value, minimum, maximum),
+    do: is_integer(value) and value >= minimum and value <= maximum
 
   defp configured_report(report_id) do
     with true <- valid_id?(report_id),

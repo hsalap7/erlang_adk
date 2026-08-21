@@ -191,6 +191,179 @@ Test cases, and reported 0 Dialyzer warnings and 0 undefined or deprecated
 call/function findings from `./rebar3 xref`. These direct gates do not
 substitute for the unrecorded coverage, package, or paid-provider gates.
 
+## Focused v0.10 merged-capability gates (in development)
+
+Use subsystem-focused diagnostics while developing the unreleased 0.10
+branch. These commands are intentionally split so a failure keeps one clear
+owner; they do not replace the clean aggregate gate.
+
+```bash
+./rebar3 eunit \
+  --module=adk_scope_sharded_test,adk_runtime_service_bundle_test,adk_v010_supervision_test,adk_agent_config_test,adk_agent_composition_test,adk_connector_descriptor_test,adk_connector_manifest_test,adk_connector_toolset_test
+
+./rebar3 eunit \
+  --module=adk_artifact_gcs_test,adk_artifact_stream_test,adk_artifact_effect_journal_test,adk_artifact_effect_journal_context_test,adk_artifact_effect_journal_bundle_test,adk_memory_embedding_provider_test,adk_memory_vector_ets_test,adk_memory_policy_test,adk_memory_erasure_epoch_test,adk_memory_outbox_test,adk_memory_outbox_supervision_test,adk_runner_durable_memory_test
+
+./rebar3 eunit \
+  --module=adk_mcp_protocol_foundation_test,adk_mcp_modern_runtime_test,adk_mcp_catalog_foundation_test,adk_mcp_oauth_test,adk_mcp_pool_test,adk_mcp_sse_stream_test,adk_a2a_v1_agent_executor_test,adk_a2a_v1_client_stream_test,adk_a2a_v1_task_store_test,adk_a2a_v1_push_test
+
+./rebar3 eunit \
+  --module=adk_eval_service_test,adk_eval_store_hardening_test,adk_eval_builtin_metric_test,adk_eval_ensemble_test,adk_eval_simulation_test,adk_eval_statistics_test,adk_eval_review_test,adk_eval_export_test,adk_eval_report_parity_test,adk_eval_worker_rpc_test,adk_eval_dev_api_test
+
+./rebar3 eunit \
+  --module=adk_trace_store_test,adk_trace_store_exporter_test,adk_trace_runtime_test,adk_workflow_trace_store_test,adk_dev_graph_trace_test,adk_dev_eval_http_test,adk_dev_payload_inspection_test,adk_runtime_policy_test,adk_deployment_lifecycle_test,adk_deployment_env_test,adk_deployment_contract_test,adk_agent_runtime_feasibility_test,erlang_adk_startup_test,adk_cli_test
+
+./rebar3 ct \
+  --suite test/protocols/mcp/adk_mcp_streamable_http_SUITE.erl
+```
+
+These focused owners cover:
+
+- strict local profiles, shared/global versus exact-scope routing, owner-bound
+  exactly-once operation leases and absolute deadlines, durable idle
+  reclamation, fail-stop generations, and fail-closed application resolution;
+  `durable_local` also atomically owns/health-checks its private Mnesia memory
+  outbox, injects validated Runner ingestion, and preserves jobs across bundle
+  process restarts while rejecting stale/unhealthy service references. This
+  includes deterministic identity-filtered registry hydration, rotating bounded
+  indexed claims/pruning, four-table constant-row health, majority readiness,
+  epoch-bound resubmission, hard active-plus-terminal capacity/migration, strict
+  nested validation, legacy named-API routing, and redacted status;
+- schema-v2 JSON/strict-YAML normalization plus schema-1 compatibility,
+  sealed immutable registry lineage/revision provenance, 64 unique toolset
+  references resolved by one authenticated bulk lookup, data-only composition,
+  connector policy projection, and default-disabled legacy module/provider
+  selection;
+- GCS-compatible immutable artifacts, bounded range/credit transfer and
+  operator/backend-owned effect reconciliation; bounded embedding/vector/
+  hybrid memory, opt-in governance, erasure epochs, and explicit terminal
+  pruning;
+- explicit legacy/modern MCP eras, incremental SSE, OAuth/PKCE, pooling and
+  atomic catalogs; Runner-backed A2A, callback streaming, task stores, and
+  process-local bounded push;
+- atomic/quota-bound evaluation scheduling/storage plus simulators, built-in
+  metrics, ensembles/calibration, review, statistics, CI export and allowlisted
+  RPC workers, including byte-identical canonical JSON/Markdown/JUnit/SARIF/
+  annotations across direct, stored-result API, authenticated HTTP, existing
+  eval-run, and `adk eval report` paths; a roughly 1.4 MiB report covers exact
+  API/HTTP/stdout/file parity and the independent 16 MiB report ceiling while
+  unrelated CLI/request limits remain 1 MiB/64 KiB; and
+- metadata-only trace retention, graph/trace/evaluation Developer UI surfaces,
+  explicit bounded/redacted payload inspection, opt-in runtime policy,
+  fail-closed durable-ledger schema checks, health-only startup, bounded
+  descriptor startup, one PID1-owned drain, strict deployment OTLP wiring, and
+  render-first deployment contracts. Deployment coverage distinguishes the
+  closed, packaged-health, and application-config modes; checks both Cloud Run
+  `maxScale` annotation scopes without treating them as a singleton proof; and
+  verifies that the read-only Agent Runtime probe keeps its bounded bearer out
+  of process arguments.
+
+The curated connector packages own additional package-local deterministic
+tests (`erlang_adk_google_test`, `erlang_adk_github_test`,
+`erlang_adk_slack_test`, and `erlang_adk_postgres_test` plus their injected
+backend fixtures). They execute every advertised operation through the real
+registry, Agent Config, and `adk_toolset` path and assert projected permission,
+side-effect, confirmation, and parallel-safety metadata. Root EUnit does not
+turn those packages into published ecosystem or live-service evidence.
+
+Local source testing uses `_checkouts/erlang_adk`, which `rebar3_hex` 7.1.0
+intentionally omits from the generated requirements metadata. Therefore the
+raw local `rebar3 hex build` tarball is not the connector package artifact to
+inspect or retain. Run the sole supported offline connector package gate from
+the repository root:
+
+```console
+$ packages/build_connector_packages.sh
+```
+
+The wrapper warning-strict compiles/tests source, builds and internally
+normalizes all four package tarballs, prints package/docs SHA-256 hashes,
+rejects checkout leakage, and recompiles/tests clean extractions. Each
+normalized archive must contain the non-optional `erlang_adk ~> 0.10.0`
+requirement. The [connector package guide](../packages/README.md) explains the
+normalizer's use of the declared `rebar.config` dependency and Hex's tarball
+implementation. This is an offline inspection/build gate only:
+`rebar3_hex` 7.1.0 rebuilds during `hex publish` and cannot upload a normalized
+local tarball. The gate is not publication evidence, and all four connectors
+remain unpublished.
+
+No focused or internal fixture run by itself proves an external protocol peer,
+multi-node node-loss recovery, Docker runtime build, Cloud Run staging,
+Helm/Kind/GKE deployment, supply-chain execution, or managed Agent Runtime.
+Record those gates only if they were actually run against the reviewed
+candidate.
+
+Two explicit loopback protocol gates are now recorded separately. The pinned
+official MCP Python/TypeScript 2.0.0 client matrix passed modern 2026-07-28 and
+legacy-auto-fallback 2025-11-25 in all four cells; exact commits, locks, and
+assertions are in `scripts/conformance/mcp_external_sdk/RESULTS.json`. The
+official A2A 1.0 TCK at
+`5996b79f9cefa6fc390980e383e358a66fb9e49e` passed 100 tests with 165
+expected transport/capability skips and no failures/errors/xfail; the selected
+JSON-RPC surface was 94 passed plus seven inapplicable skips. Neither result
+replaces an application-owned authenticated HTTPS peer/push smoke, other A2A
+transports, or multi-node failure testing.
+
+After the final OTLP ordering fix, the deployment-environment, trace-runtime,
+deployment-contract, and lifecycle EUnit modules passed 24/24. A separate
+health/startup-inclusive focused batch had passed 20/20 before that OTLP-only
+fix. These checks cover the relx health-config path and nondefault `PORT`
+rendering, open-file-cap validation, PID1 drain/reap structure, health-only
+listener, final trace-plus-OTLP ordering, and timeout boundary. The batches
+overlap and are focused evidence, not aggregate or image/cluster evidence.
+
+The final local image `erlang-adk:0.10.0-final` built from fresh locked
+dependencies at OCI/index digest
+`sha256:d74eb0a349d45692b5bb59e5ac7f1bbbe3710a59cd2e0be5301a179ce28f92d7`.
+A constrained direct smoke passed uid/gid 10001, read-only root,
+cap-drop/no-new-privileges, 1 GiB/1 CPU, 200/200 health, agent-route 404,
+PID1/BEAM nofile 65536, about 103.9 MiB current memory, no OOM/restart, and
+SIGTERM exit 0 in 1.218 seconds. A disposable Kind cluster passed both
+closed/headless and service-enabled health-only Helm modes. The latter rendered
+nondefault `PORT=18081`, returned 200/200 health and 404 for an agent route,
+and recorded 110,538,752/388,038,656 current/peak bytes with zero restarts;
+headless recorded 119,377,920/397,217,792 bytes. Drain made readiness false and
+`/readyz` 503 while `/livez` stayed 200; pod deletion/recovery completed in
+1.822 seconds. The cluster was deleted. This does not satisfy the custom
+application-config mode, GKE/Cloud Run staging, registry promotion,
+SBOM/Grype/Cosign/provenance execution, or managed-runtime gates; see the
+[deployment guide](../deploy/README.md).
+
+The merged-candidate Phoenix gate passed 107 ExUnit and 40 Node/browser-audio
+tests, production assets and release assembly, and both trusted-proxy and
+CA-verified direct-TLS `/health` smokes with clean shutdown. The exact audit
+wrapper accepted only Cowlib EEF-CVE-2026-43969, Cowlib EEF-CVE-2026-43966,
+and Gun GHSA-w4f7-4cxr-rv3c; raw `mix hex.audit` therefore remains non-zero.
+The earlier Bandit, Cowboy, and HPACK advisories were absent. Live registry
+access failed with `Unknown CA`, so only the cached locked dependency gate is
+claimed.
+
+Current evidence names the `codex/version_0.10.0` working-tree candidate.
+HEAD `78f31fd6b72295ebeb37cecbd7c11a6c5a666b34` is only the v0.9 baseline;
+all v0.10 work remains uncommitted, so the state is not reproducible from a
+commit or tag. The changed-candidate non-coverage and coverage EUnit runs each
+passed 1,826/1,826; deterministic Common Test passed 6 with 22 expected paid-
+provider skips. Compile/xref passed, Dialyzer analyzed 669 PLT files and 309
+project files with 0 warnings, and line coverage was 36,574/49,312 = 74.17%
+(12,738 missed; 83 covered lines over the exact 74% floor). Focused durable-
+runtime validation passed 46/46 EUnit, and focused canonical evaluation-report
+parity plus size-boundary validation passed 56 tests. Escript/doctor/checked-
+config gates passed. README EUnit passed 30/30 plus 4/4, all three checked
+examples compiled with `-Werror`, and ExDoc, local Markdown, root Hex/verifier/
+extracted compile, and diff gates passed. Root artifact hashes/freshness stay
+out of packaged docs to avoid self-reference. The connector wrapper separately passed
+4 packages, 12/12 source EUnit, 12/12 clean-extracted EUnit, and 4 package plus
+4 docs archives, including real registry/Agent Config/toolset execution for
+every advertised operation. Exact identities, hashes, protocol/deployment
+evidence, and not-run boundaries are in
+[`VERSION_0_10_0.md`](VERSION_0_10_0.md#development-validation-ledger).
+
+These passing tests do not prove 0.10 is released. The version remains
+**IN DEVELOPMENT** until explicit maintainer approval, tagging, and publication.
+Do not infer paid-provider, multi-node node-loss, cloud/GKE, promoted-registry,
+supply-chain-artifact, connector-publication, or managed-runtime success from
+the deterministic candidate gates.
+
 Every current README recipe and sanity command is mapped to its prerequisites
 and validation in
 [`README_EXAMPLE_COVERAGE.md`](README_EXAMPLE_COVERAGE.md).
@@ -224,6 +397,18 @@ undefined and deprecated calls/functions without treating a library's public
 exports as unused errors. ExDoc must be warning-free. The non-publishing Hex
 build and artifact verifier must prove required contents, excluded
 caches/secrets, and a clean compile from the extracted package.
+
+On the 0.10 development branch, `adk doctor` should report application version
+`0.10.0`, while the README must continue to identify v0.9.0 as the current
+release and v0.10.0 as **IN DEVELOPMENT**. `adk config validate` must also
+report schema version 1, registry generation, `registry_instance_id`,
+`registry_snapshot_revision_id`, and a 64-byte hexadecimal fingerprint without
+exposing registry descriptors, the internal content seal, or credentials. The
+instance ID identifies a lineage and is stable across `replace/2`; the revision
+is fresh for every replacement, so equal generation numbers on two branches do
+not collide. The initial empty default is the only stable revision. API tests
+must also reject a structurally copied registry/snapshot whose trusted entries
+do not match its seal.
 
 Historically, on 2026-07-17, xref, escript assembly, `adk doctor` reporting
 0.8.0, checked

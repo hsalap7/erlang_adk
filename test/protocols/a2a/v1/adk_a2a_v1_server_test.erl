@@ -6,6 +6,7 @@ a2a_v1_server_test_() ->
      fun setup/0,
      fun cleanup/1,
      [fun lifecycle_history_and_artifact_case/0,
+      fun direct_message_send_result_case/0,
       fun cross_principal_visibility_case/0,
       fun cancellation_stops_execution_case/0,
       fun credentials_are_redacted_case/0,
@@ -22,6 +23,28 @@ setup() ->
     ok.
 
 cleanup(_) -> ok.
+
+direct_message_send_result_case() ->
+    Executor = fun(_Request, _Emit) ->
+        {message,
+         #{<<"role">> => <<"ROLE_AGENT">>,
+           <<"parts">> => [#{<<"text">> => <<"direct">>}]}}
+    end,
+    Server = start_server(Executor),
+    try
+        {ok, #{task_id := TaskId}} = adk_a2a_v1_server:send_message(
+                                      Server, auth(<<"alice">>),
+                                      send_params(<<"direct">>), self()),
+        wait_terminal(TaskId),
+        {ok, {message, Message}} = adk_a2a_v1_server:send_result(
+                                     Server, scope(<<"alice">>), TaskId,
+                                     undefined),
+        ?assertEqual(<<"ROLE_AGENT">>, maps:get(<<"role">>, Message)),
+        ?assertEqual(TaskId, maps:get(<<"taskId">>, Message)),
+        [#{<<"text">> := <<"direct">>}] = maps:get(<<"parts">>, Message)
+    after
+        gen_server:stop(Server)
+    end.
 
 lifecycle_history_and_artifact_case() ->
     Server = start_server(fun(_Request, _Emit) -> {ok, <<"a poem">>} end),

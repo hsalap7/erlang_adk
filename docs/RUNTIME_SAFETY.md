@@ -86,6 +86,11 @@ The policy is fail-closed:
   content.
 
 Use `allow => all` only when the runtime boundary is intentionally permissive.
+The policy is also opt-in: it is enforced only when trusted Runner or Agent
+Config composition options install it. Merely starting Erlang ADK does not
+create organization roles, map users to permissions, or authorize connector
+permission labels. Applications still own identity, role, and backend
+authorization, and must deliberately pass this policy at the runtime boundary.
 
 ```erlang
 {ok, Policy} = adk_runtime_policy:compile(
@@ -144,6 +149,61 @@ Policy enforcement therefore does not replace dynamic toolsets, alter plugin
 precedence, or serialize independent Erlang processes. Admission is centralized
 only for counters and queue ownership; admitted agent and tool work remains
 concurrent.
+
+## In-development 0.10 service supervision
+
+The optional 0.10 services preserve explicit ownership and bounded failure
+semantics:
+
+- `adk_runtime_service_bundle` treats its artifact and memory routers as one
+  generation. A router exit stops the bundle so supervision creates fresh,
+  consistent references; it never swaps a child behind a reference held by a
+  Runner. The ephemeral profile uses one shared ETS adapter per component and
+  globally enforces that adapter's quotas. The durable profile uses
+  exact-scope workers with owner-bound, exactly-once per-operation leases and
+  carries one absolute deadline through cold-route admission, resolution, and
+  handoff. Caller exit, timeout, and dropped-handoff cleanup cannot pin
+  capacity or install a stale shard. Reclamation is LRU-on-capacity only after
+  the configured idle timeout; durable data survives worker reclamation. If
+  every worker is active or too recent, `max_active_scopes` rejects the new
+  cold scope. The durable bundle also privately owns the Mnesia memory outbox:
+  deterministic registry hydration and exact-identity filters gate a bounded
+  rotating claim cursor; ordered indexes cover due/lease/epoch/terminal work;
+  constant-row four-table health and majority readiness fail closed; and
+  epoch-bound IDs plus a hard active-and-terminal reservation preserve erasure
+  and capacity semantics. Legacy named APIs route to that one owner. Nested
+  configuration/capabilities are strict, and status/crash output is redacted.
+- `adk_eval_service` bounds active and queued jobs, stores lifecycle changes
+  atomically, allows only one service owner per backend-canonical identity
+  shared across wrapper modules, and acquires owned durable storage before
+  initialization/reconciliation. Raw
+  submission preparation runs in at most 64 monitored one-second,
+  heap-bounded workers instead of blocking the service mailbox. Recovery fails
+  stored queued/running jobs instead of replaying them, and the service stops
+  if it cannot persist a terminal task outcome.
+- `adk_trace_store` bounds global and per-principal retained metadata by event
+  count, bytes, and time. Workflow delivery through its opaque receiver is
+  a non-blocking best-effort cast with a hard input-size limit and atomic
+  pending-admission ceiling; forged capabilities, oversized events,
+  retention-capacity pressure, back-pressure, or an unavailable store cannot
+  make successful workflow work fail. Ordered indexes bound cursor paging and
+  each expiry-prune batch. The store monitors every local workflow owner bound
+  to a capability and renews an expired receiver while any owner remains live,
+  then allows normal TTL pruning after their `DOWN` messages. Application
+  enablement wires the standard configured Runner and public start/run
+  workflow-facade paths; direct constructors remain explicit.
+- `adk_invocation_ledger_mnesia:init/1` validates an existing table before any
+  durable invocation uses it. Record name/attributes, `set` type, majority
+  setting, and local `disc_copies` durability must match; incompatible or
+  volatile tables fail startup instead of being reinterpreted or downgraded.
+  Migration and table selection remain operator actions.
+
+The three supervised integrations above are disabled by default in application
+environment.
+The durable runtime/evaluation adapters still require deployment-owned backup,
+restore, filesystem/Mnesia, and multi-node policy. Trace retention is volatile
+and never substitutes for a durable audit store. These APIs remain **IN
+DEVELOPMENT**; see [`VERSION_0_10_0.md`](VERSION_0_10_0.md).
 
 ## Telemetry
 

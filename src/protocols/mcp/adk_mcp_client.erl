@@ -1,4 +1,5 @@
-%% @doc Bounded MCP 2025-11-25 client for stdio and Streamable HTTP.
+%% @doc Bounded MCP client for legacy stdio/Streamable HTTP and the explicit
+%% stateless 2026-07-28 Streamable HTTP era.
 %%
 %% Each connection is an independent OTP worker. When erlang_adk is running,
 %% workers are temporary children of adk_mcp_client_sup; callers are never
@@ -6,16 +7,21 @@
 -module(adk_mcp_client).
 -behaviour(gen_server).
 
--export([connect/2, connect/3, start_link/1,
+-export([connect/2, connect/3, connect_pool/3, with_client/4,
+         close_pool/1, start_link/1, request/3,
          list_tools/1, list_tools/2, execute_tool/3,
          list_resources/1, list_resources/2, read_resource/2,
          list_prompts/1, list_prompts/2, get_prompt/3,
+         complete/3, subscribe/2, set_log_level/2,
+         list_roots/1, create_message/2, elicit/2,
+         subscribe_resource/2, unsubscribe_resource/2,
          schemas/1, resolved_call/4,
          server_info/1, close/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3, format_status/1]).
 
 -define(LATEST_PROTOCOL_VERSION, <<"2025-11-25">>).
+-define(MODERN_PROTOCOL_VERSION, <<"2026-07-28">>).
 -define(SUPPORTED_PROTOCOL_VERSIONS,
         [?LATEST_PROTOCOL_VERSION, <<"2025-06-18">>]).
 -define(DEFAULT_INITIALIZE_TIMEOUT, 10000).
@@ -31,6 +37,7 @@
 -define(MAX_CALLBACK_MAX_HEAP_WORDS, 4194304).
 -define(DEFAULT_MAX_RESOLVED_ADDRESSES, 64).
 -define(MAX_RESOLVED_ADDRESSES, 256).
+-define(DEFAULT_MAX_SSE_EVENTS, 1024).
 
 -type options() :: map().
 
@@ -66,6 +73,31 @@ connect(Transport, Target, Options)
 connect(Transport, Target, Options) ->
     {error, {invalid_mcp_connection, Transport, Target, Options}}.
 
+%% @doc Start a bounded FIFO pool of independently managed MCP clients.
+-spec connect_pool(binary(), binary(), map()) ->
+    {ok, pid()} | {error, term()}.
+connect_pool(Transport, Target, Options) when is_map(Options) ->
+    Pool0 = maps:get(pool, Options, #{}),
+    ConnectionOptions = maps:remove(pool, Options),
+    case is_map(Pool0) of
+        false -> {error, invalid_mcp_pool_config};
+        true ->
+            Connect = fun() -> connect(Transport, Target, ConnectionOptions) end,
+            Close = fun(Client) -> close(Client) end,
+            adk_mcp_pool:start(
+              Pool0#{connect_fun => Connect, close_fun => Close})
+    end;
+connect_pool(_Transport, _Target, _Options) ->
+    {error, invalid_mcp_pool_config}.
+
+-spec with_client(pid(), read_only | mutation, fun((pid()) -> term()),
+                  pos_integer()) -> term().
+with_client(Pool, Class, Fun, Timeout) ->
+    adk_mcp_pool:request(Pool, Class, Fun, Timeout).
+
+-spec close_pool(pid()) -> ok.
+close_pool(Pool) -> adk_mcp_pool:stop(Pool).
+
 -spec start_link(term()) -> gen_server:start_ret().
 start_link(Init) ->
     gen_server:start_link(?MODULE, Init, []).
@@ -76,6 +108,12 @@ list_tools(Client) ->
         {ok, Result} -> {ok, maps:get(<<"tools">>, Result, [])};
         Error -> Error
     end.
+
+%% @doc Issue a negotiated method while keeping protocol metadata internal.
+-spec request(pid(), binary(), map()) -> {ok, map()} | {error, term()}.
+request(Client, Method, Params) when is_binary(Method), is_map(Params) ->
+    call(Client, {request, Method, Params, method_capability(Method)});
+request(_Client, _Method, _Params) -> {error, invalid_mcp_request}.
 
 -spec list_tools(pid(), undefined | binary()) ->
     {ok, map()} | {error, term()}.
@@ -127,6 +165,53 @@ get_prompt(Client, Name, Arguments)
     call(Client, {request, <<"prompts/get">>,
                   #{<<"name">> => Name,
                     <<"arguments">> => Arguments}, prompts}).
+
+-spec complete(pid(), map(), map()) -> {ok, map()} | {error, term()}.
+complete(Client, Reference, Argument)
+  when is_map(Reference), is_map(Argument) ->
+    request(Client, <<"completion/complete">>,
+            #{<<"ref">> => Reference, <<"argument">> => Argument});
+complete(_Client, _Reference, _Argument) ->
+    {error, invalid_mcp_completion_request}.
+
+-spec subscribe(pid(), map()) -> {ok, map()} | {error, term()}.
+subscribe(Client, Notifications) when is_map(Notifications) ->
+    request(Client, <<"subscriptions/listen">>,
+            #{<<"notifications">> => Notifications});
+subscribe(_Client, _Notifications) ->
+    {error, invalid_mcp_subscription_request}.
+
+-spec set_log_level(pid(), binary()) -> {ok, map()} | {error, term()}.
+set_log_level(Client, Level) when is_binary(Level) ->
+    request(Client, <<"logging/setLevel">>, #{<<"level">> => Level});
+set_log_level(_Client, _Level) -> {error, invalid_mcp_log_level}.
+
+-spec list_roots(pid()) -> {ok, map()} | {error, term()}.
+list_roots(Client) -> request(Client, <<"roots/list">>, #{}).
+
+-spec create_message(pid(), map()) -> {ok, map()} | {error, term()}.
+create_message(Client, Params) when is_map(Params) ->
+    request(Client, <<"sampling/createMessage">>, Params);
+create_message(_Client, _Params) -> {error, invalid_mcp_sampling_request}.
+
+-spec elicit(pid(), map()) -> {ok, map()} | {error, term()}.
+elicit(Client, Params) when is_map(Params) ->
+    request(Client, <<"elicitation/create">>, Params);
+elicit(_Client, _Params) -> {error, invalid_mcp_elicitation_request}.
+
+-spec subscribe_resource(pid(), binary()) ->
+    {ok, map()} | {error, term()}.
+subscribe_resource(Client, Uri) when is_binary(Uri) ->
+    request(Client, <<"resources/subscribe">>, #{<<"uri">> => Uri});
+subscribe_resource(_Client, _Uri) ->
+    {error, invalid_mcp_resource_subscription}.
+
+-spec unsubscribe_resource(pid(), binary()) ->
+    {ok, map()} | {error, term()}.
+unsubscribe_resource(Client, Uri) when is_binary(Uri) ->
+    request(Client, <<"resources/unsubscribe">>, #{<<"uri">> => Uri});
+unsubscribe_resource(_Client, _Uri) ->
+    {error, invalid_mcp_resource_subscription}.
 
 %% @doc Return MCP tools in the provider-facing adk_tool schema shape.
 %% This callback follows adk_toolset's list contract; discovery failure raises
@@ -217,7 +302,10 @@ start_client(Init) ->
 
 normalize_init(<<"stdio">>, Command, Options) ->
     case normalize_options(Options) of
-        {ok, Config} -> {ok, {stdio, Command, Config}, Config};
+        {ok, #{protocol_era := legacy} = Config} ->
+            {ok, {stdio, Command, Config}, Config};
+        {ok, _Modern} ->
+            {error, {unsupported_transport, modern_mcp_requires_http}};
         Error -> Error
     end;
 normalize_init(<<"streamable_http">>, Url, Options) ->
@@ -258,6 +346,10 @@ normalize_options(Options) ->
     MaxResolvedAddresses = maps:get(
                              max_resolved_addresses, Options,
                              ?DEFAULT_MAX_RESOLVED_ADDRESSES),
+    Protocol0 = maps:get(protocol_version, Options, legacy),
+    MaxSseEvents = maps:get(max_sse_events, Options,
+                            ?DEFAULT_MAX_SSE_EVENTS),
+    Protocol = normalize_protocol(Protocol0),
     case valid_timeout(InitializeTimeout) andalso
          valid_timeout(RequestTimeout) andalso
          valid_timeout(ConnectTimeout) andalso
@@ -274,8 +366,11 @@ normalize_options(Options) ->
                        ?MIN_CALLBACK_MAX_HEAP_WORDS,
                        ?MAX_CALLBACK_MAX_HEAP_WORDS) andalso
          bounded_positive(MaxResolvedAddresses,
-                          ?MAX_RESOLVED_ADDRESSES) of
+                          ?MAX_RESOLVED_ADDRESSES) andalso
+         bounded_positive(MaxSseEvents, 65536) andalso
+         valid_protocol_capabilities(Protocol, Capabilities) of
         true ->
+            {Era, ProtocolVersion, ProtocolVersions} = Protocol,
             {ok, #{initialize_timeout => InitializeTimeout,
                    request_timeout => RequestTimeout,
                    connect_timeout => ConnectTimeout,
@@ -291,9 +386,35 @@ normalize_options(Options) ->
                    resolver_fun => ResolverFun,
                    callback_max_heap_words => CallbackMaxHeapWords,
                    max_resolved_addresses => MaxResolvedAddresses,
-                   protocol_versions => ?SUPPORTED_PROTOCOL_VERSIONS}};
+                   max_sse_events => MaxSseEvents,
+                   protocol_era => Era,
+                   protocol_version => ProtocolVersion,
+                   protocol_versions => ProtocolVersions}};
         false -> {error, invalid_mcp_client_options}
     end.
+
+normalize_protocol(legacy) ->
+    {legacy, ?LATEST_PROTOCOL_VERSION, ?SUPPORTED_PROTOCOL_VERSIONS};
+normalize_protocol(auto) ->
+    {auto, ?MODERN_PROTOCOL_VERSION,
+     [?MODERN_PROTOCOL_VERSION | ?SUPPORTED_PROTOCOL_VERSIONS]};
+normalize_protocol(modern) ->
+    {modern, ?MODERN_PROTOCOL_VERSION, [?MODERN_PROTOCOL_VERSION]};
+normalize_protocol(?MODERN_PROTOCOL_VERSION) ->
+    {modern, ?MODERN_PROTOCOL_VERSION, [?MODERN_PROTOCOL_VERSION]};
+normalize_protocol(?LATEST_PROTOCOL_VERSION) ->
+    {legacy, ?LATEST_PROTOCOL_VERSION, ?SUPPORTED_PROTOCOL_VERSIONS};
+normalize_protocol(<<"2025-06-18">>) ->
+    {legacy, <<"2025-06-18">>, ?SUPPORTED_PROTOCOL_VERSIONS};
+normalize_protocol(_) -> invalid.
+
+valid_protocol_capabilities({Era, _Version, _Versions}, Capabilities) ->
+    ValidationEra = case Era of auto -> modern; _ -> Era end,
+    case adk_mcp_protocol:client_capabilities(ValidationEra, Capabilities) of
+        {ok, _} -> true;
+        {error, _} -> false
+    end;
+valid_protocol_capabilities(_, _) -> false.
 
 valid_timeout(Value) ->
     is_integer(Value) andalso Value > 0 andalso Value =< ?MAX_TIMEOUT.
@@ -394,6 +515,8 @@ init({http, Url, Config}) ->
 base_state(Transport, Config) ->
     #{transport => Transport,
       config => Config,
+      protocol_era => maps:get(protocol_era, Config),
+      protocol_version => maps:get(protocol_version, Config),
       req_id => 1,
       pending => #{},
       initialized => false}.
@@ -509,7 +632,7 @@ format_status(Status) ->
 
 initialize_params(State) ->
     Config = maps:get(config, State),
-    #{<<"protocolVersion">> => ?LATEST_PROTOCOL_VERSION,
+    #{<<"protocolVersion">> => maps:get(protocol_version, Config),
       <<"capabilities">> => maps:get(capabilities, Config),
       <<"clientInfo">> => maps:get(client_info, Config)}.
 
@@ -522,6 +645,7 @@ ready_for(State, Capability) ->
 ready_for_initialized(State, Capability) ->
     case maps:get(initialized, State, false) of
         false -> {error, not_initialized};
+        true when Capability =:= none -> ok;
         true ->
             Capabilities = maps:get(<<"capabilities">>,
                                     maps:get(server_info, State, #{}), #{}),
@@ -531,6 +655,14 @@ ready_for_initialized(State, Capability) ->
                 false -> {error, {capability_not_negotiated, Capability}}
             end
     end.
+
+method_capability(<<"tools/", _/binary>>) -> tools;
+method_capability(<<"resources/", _/binary>>) -> resources;
+method_capability(<<"prompts/", _/binary>>) -> prompts;
+method_capability(<<"completion/", _/binary>>) -> completions;
+method_capability(<<"logging/", _/binary>>) -> logging;
+method_capability(<<"subscriptions/", _/binary>>) -> none;
+method_capability(_) -> none.
 
 ensure_transport_started(<<"streamable_http">>) -> ensure_gun_started();
 ensure_transport_started(<<"http">>) -> ensure_gun_started();
@@ -655,7 +787,28 @@ send_stdio_cancel(Id, Port) ->
                 Port, [jsx:encode(Notification), <<"\n">>]),
     ok.
 
-initialize_http(State0, Deadline) ->
+initialize_http(#{protocol_era := auto} = State, Deadline) ->
+    case initialize_modern_http(State#{protocol_era => modern}, Deadline) of
+        {ok, ModernState} -> {ok, ModernState};
+        {error, Reason, ModernState} ->
+            case safe_legacy_fallback(Reason) of
+                true ->
+                    LegacyState = maps:without(
+                                    [session_id, server_info],
+                                    ModernState#{protocol_era => legacy,
+                                                 protocol_version =>
+                                                     ?LATEST_PROTOCOL_VERSION,
+                                                 initialized => false}),
+                    initialize_legacy_http(LegacyState, Deadline);
+                false -> {error, Reason, ModernState}
+            end
+    end;
+initialize_http(#{protocol_era := modern} = State, Deadline) ->
+    initialize_modern_http(State, Deadline);
+initialize_http(State, Deadline) ->
+    initialize_legacy_http(State, Deadline).
+
+initialize_legacy_http(State0, Deadline) ->
     Id = maps:get(req_id, State0),
     Message = request_message(Id, <<"initialize">>,
                               initialize_params(State0)),
@@ -694,6 +847,55 @@ initialize_http(State0, Deadline) ->
         {error, Reason, State2} -> {error, Reason, State2}
     end.
 
+initialize_modern_http(State0, Deadline) ->
+    case modern_http_operation(<<"server/discover">>, #{}, State0,
+                               Deadline) of
+        {ok, Result, State1} ->
+            case validate_modern_discovery(Result) of
+                {ok, ServerInfo} ->
+                    {ok, State1#{initialized => true,
+                                 server_info => ServerInfo,
+                                 protocol_version =>
+                                     ?MODERN_PROTOCOL_VERSION}};
+                {error, Reason} -> {error, Reason, State1}
+            end;
+        {error, Reason, State1} -> {error, Reason, State1}
+    end.
+
+validate_modern_discovery(
+  #{<<"supportedVersions">> := Versions,
+    <<"capabilities">> := Capabilities,
+    <<"_meta">> := #{<<"io.modelcontextprotocol/serverInfo">> := Info}}
+  = Result)
+  when is_list(Versions), is_map(Capabilities), is_map(Info) ->
+    case {Versions =:= [?MODERN_PROTOCOL_VERSION],
+          maps:get(<<"resultType">>, Result, undefined),
+          adk_mcp_protocol:server_capabilities(modern, Capabilities),
+          valid_server_implementation(Info),
+          adk_mcp_protocol_limits:validate_json(Result)} of
+        {true, <<"complete">>, {ok, SafeCapabilities}, true, {ok, _}} ->
+            {ok, #{<<"protocolVersion">> => ?MODERN_PROTOCOL_VERSION,
+                   <<"capabilities">> => SafeCapabilities,
+                   <<"serverInfo">> => Info,
+                   <<"discovery">> => Result}};
+        _ -> {error, invalid_mcp_modern_discovery}
+    end;
+validate_modern_discovery(_) -> {error, invalid_mcp_modern_discovery}.
+
+valid_server_implementation(#{<<"name">> := Name,
+                              <<"version">> := Version}) ->
+    is_binary(Name) andalso byte_size(Name) > 0 andalso
+    byte_size(Name) =< 256 andalso is_binary(Version) andalso
+    byte_size(Version) > 0 andalso byte_size(Version) =< 256;
+valid_server_implementation(_) -> false.
+
+safe_legacy_fallback({http_status, Status}) ->
+    lists:member(Status, [400, 404, 405, 406, 415, 426, 501]);
+safe_legacy_fallback(invalid_mcp_modern_discovery) -> true;
+safe_legacy_fallback({unsupported_response_content_type, _}) -> true;
+safe_legacy_fallback(missing_response_content_type) -> true;
+safe_legacy_fallback(_) -> false.
+
 send_http_initialized(State, Deadline) ->
     Message = notification_message(<<"notifications/initialized">>, #{}),
     case http_send(Message, notification, State, Deadline) of
@@ -703,6 +905,9 @@ send_http_initialized(State, Deadline) ->
         {error, Reason, NewState} -> {error, Reason, NewState}
     end.
 
+http_operation(Method, Params, #{protocol_era := modern} = State,
+               _RetrySession, Deadline) ->
+    modern_http_operation(Method, Params, State, Deadline);
 http_operation(Method, Params, State0, RetrySession, Deadline) ->
     Id = maps:get(req_id, State0),
     Message = request_message(Id, Method, Params),
@@ -741,6 +946,29 @@ http_operation(Method, Params, State0, RetrySession, Deadline) ->
         {error, Reason, State2} -> {error, Reason, State2}
     end.
 
+modern_http_operation(Method, Params, State0, Deadline) ->
+    Id = maps:get(req_id, State0),
+    Config = maps:get(config, State0),
+    Context = #{client_info => maps:get(client_info, Config),
+                client_capabilities => maps:get(capabilities, Config)},
+    case adk_mcp_protocol:request(modern, Id, Method, Params, Context) of
+        {ok, #{message := Message, headers := ProtocolHeaders}} ->
+            State1 = State0#{req_id => Id + 1},
+            case http_send(Message, operation, ProtocolHeaders, State1,
+                           Deadline) of
+                {ok, 200, Headers, Body, State2} ->
+                    case decode_rpc_response(Headers, Body, Id) of
+                        {ok, {ok, Result}} -> {ok, Result, State2};
+                        {ok, {error, Error}} -> {error, Error, State2};
+                        {error, Reason} -> {error, Reason, State2}
+                    end;
+                {ok, Status, _Headers, _Body, State2} ->
+                    {error, {http_status, Status}, State2};
+                {error, Reason, State2} -> {error, Reason, State2}
+            end;
+        {error, Reason} -> {error, Reason, State0}
+    end.
+
 retryable_after_session_loss(<<"tools/list">>) -> true;
 retryable_after_session_loss(<<"resources/list">>) -> true;
 retryable_after_session_loss(<<"resources/read">>) -> true;
@@ -750,7 +978,10 @@ retryable_after_session_loss(<<"ping">>) -> true;
 retryable_after_session_loss(_Method) -> false.
 
 http_send(Message, Kind, State, Deadline) ->
-    case request_headers(Kind, State, Deadline) of
+    http_send(Message, Kind, #{}, State, Deadline).
+
+http_send(Message, Kind, ProtocolHeaders, State, Deadline) ->
+    case request_headers(Kind, ProtocolHeaders, State, Deadline) of
         {ok, Headers} ->
             case remaining(Deadline) of
                 0 -> {error, timeout, State};
@@ -779,7 +1010,12 @@ await_http(Conn, Ref, State, Deadline) ->
             {ok, Status, Headers, <<>>, State};
         {response, nofin, Status, Headers} ->
             Max = maps:get(max_response_bytes, maps:get(config, State)),
-            case await_http_body(Conn, Ref, Deadline, Max, [], 0) of
+            BodyResult = case response_content_type(Headers) of
+                text_event_stream ->
+                    await_http_sse_body(Conn, Ref, Deadline, State);
+                _ -> await_http_body(Conn, Ref, Deadline, Max, [], 0)
+            end,
+            case BodyResult of
                 {ok, Body} -> {ok, Status, Headers, Body, State};
                 {error, Reason} -> {error, Reason, State}
             end;
@@ -787,6 +1023,54 @@ await_http(Conn, Ref, State, Deadline) ->
         {error, Reason} -> {error, {http_transport, Reason}, State};
         Other -> {error, {invalid_http_response, safe_term(Other)}, State}
     end.
+
+await_http_sse_body(Conn, Ref, Deadline, State) ->
+    Config = maps:get(config, State),
+    MaxBytes = maps:get(max_response_bytes, Config),
+    MaxEvents = maps:get(max_sse_events, Config),
+    case adk_mcp_sse_stream:new(#{max_bytes => MaxBytes,
+                                  max_event_bytes => MaxBytes,
+                                  max_events => MaxEvents}) of
+        {ok, Parser0} ->
+            {ok, Parser} = adk_mcp_sse_stream:grant(Parser0, MaxEvents),
+            await_http_sse_chunks(Conn, Ref, Deadline, Parser, []);
+        {error, Reason} -> {error, Reason}
+    end.
+
+await_http_sse_chunks(Conn, Ref, Deadline, Parser0, Acc) ->
+    case gun:await(Conn, Ref, remaining(Deadline)) of
+        {data, IsFin, Data} when is_binary(Data) ->
+            Fin = IsFin =:= fin,
+            case adk_mcp_sse_stream:decode(Parser0, Data, Fin) of
+                {ok, _Events, _Parser, paused} ->
+                    _ = catch gun:cancel(Conn, Ref),
+                    {error, mcp_sse_backpressure};
+                {ok, Events, _Parser, done} ->
+                    {ok, encode_sse_events(lists:reverse([Events | Acc]))};
+                {ok, Events, Parser, ready} ->
+                    await_http_sse_chunks(Conn, Ref, Deadline, Parser,
+                                          [Events | Acc]);
+                {error, Reason} ->
+                    _ = catch gun:cancel(Conn, Ref),
+                    {error, Reason}
+            end;
+        {trailers, _Headers} ->
+            case adk_mcp_sse_stream:finish(Parser0) of
+                {ok, Events, _Parser, done} ->
+                    {ok, encode_sse_events(lists:reverse([Events | Acc]))};
+                {ok, _Events, _Parser, paused} ->
+                    {error, mcp_sse_backpressure};
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, timeout} -> {error, timeout};
+        {error, Reason} -> {error, {http_transport, Reason}};
+        Other -> {error, {invalid_http_body, safe_term(Other)}}
+    end.
+
+encode_sse_events(EventLists) ->
+    Events = lists:append(EventLists),
+    iolist_to_binary([[<<"data: ">>, maps:get(data, Event), <<"\n\n">>]
+                      || Event <- Events]).
 
 await_http_body(Conn, Ref, Deadline, Max, Acc, Size) ->
     case gun:await(Conn, Ref, remaining(Deadline)) of
@@ -858,6 +1142,9 @@ validate_rpc_response(#{<<"id">> := Other}, _Id) ->
 validate_rpc_response(_, _Id) -> {error, invalid_jsonrpc_response}.
 
 request_headers(Kind, State, Deadline) ->
+    request_headers(Kind, #{}, State, Deadline).
+
+request_headers(Kind, ProtocolHeaders, State, Deadline) ->
     Config = maps:get(config, State),
     Static = maps:get(headers, Config),
     case dynamic_auth_headers(maps:get(auth_fun, Config), Config, Deadline) of
@@ -867,11 +1154,15 @@ request_headers(Kind, State, Deadline) ->
                     {<<"accept">>,
                      <<"application/json, text/event-stream">>},
                     {<<"content-type">>, <<"application/json">>}],
-            Protocol = case Kind of
-                initialize -> [];
-                _ -> [{<<"mcp-protocol-version">>,
-                       maps:get(protocol_version, State,
-                                ?LATEST_PROTOCOL_VERSION)}]
+            Protocol = case map_size(ProtocolHeaders) of
+                0 ->
+                    case Kind of
+                        initialize -> [];
+                        _ -> [{<<"mcp-protocol-version">>,
+                               maps:get(protocol_version, State,
+                                        ?LATEST_PROTOCOL_VERSION)}]
+                    end;
+                _ -> maps:to_list(ProtocolHeaders)
             end,
             Session = case maps:find(session_id, State) of
                 {ok, Id} -> [{<<"mcp-session-id">>, Id}];

@@ -1264,7 +1264,7 @@ valid_nested_workflow_options(Opts) when is_map(Opts) ->
     andalso positive(maps:get(max_concurrency, Opts, 1))
     andalso valid_non_neg(maps:get(retention_ms, Opts, 0))
     andalso valid_nested_receiver(maps:get(event_receiver, Opts, undefined))
-    andalso valid_nested_receiver(
+    andalso valid_nested_lifecycle_receiver(
               maps:get(lifecycle_receiver, Opts, undefined));
 valid_nested_workflow_options(_) -> false.
 
@@ -1273,6 +1273,11 @@ valid_nested_timeout(Value) -> valid_non_neg(Value).
 
 valid_nested_receiver(undefined) -> true;
 valid_nested_receiver(Value) -> is_pid(Value).
+
+valid_nested_lifecycle_receiver(undefined) -> true;
+valid_nested_lifecycle_receiver(Value) when is_pid(Value) -> true;
+valid_nested_lifecycle_receiver(Value) ->
+    adk_trace_store:is_lifecycle_receiver(Value).
 
 compile_graph_router_node(Item, Index, Id, Type) ->
     Choose = get_field(choose, Item, get_field(route, Item, undefined)),

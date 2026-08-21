@@ -5,6 +5,8 @@
 
 -module(erlang_adk_http).
 
+-include("adk_eval_report.hrl").
+
 -behaviour(gen_server).
 
 -export([start_link/0]).
@@ -51,7 +53,8 @@ code_change(_OldVersion, State, _Extra) ->
 
 start_listener(Config) ->
     MaxBodyBytes = maps:get(max_body_bytes, Config),
-    Routes = legacy_a2a_routes(Config, MaxBodyBytes) ++
+    Routes = deployment_routes() ++
+             legacy_a2a_routes(Config, MaxBodyBytes) ++
              a2a_v1_routes(Config) ++ dev_routes(Config),
     Dispatch = cowboy_router:compile([{'_', Routes}]),
     SocketOptions = [{ip, maps:get(ip, Config)},
@@ -74,6 +77,10 @@ start_listener(Config) ->
         {error, Reason} ->
             {stop, {http_listener_start_failed, Reason}}
     end.
+
+deployment_routes() ->
+    [{"/livez", adk_health_handler, #{mode => liveness}},
+     {"/readyz", adk_health_handler, #{mode => readiness}}].
 
 listener_config() ->
     Specs = [
@@ -105,13 +112,17 @@ listener_config() ->
 add_endpoint_config(Config) ->
     A2AEnabled = application:get_env(erlang_adk, a2a_enabled, false),
     A2AV1Enabled = application:get_env(erlang_adk, a2a_v1_enabled, false),
+    HealthEnabled = application:get_env(
+                      erlang_adk, http_health_enabled, false),
     DevEnabled = application:get_env(erlang_adk, dev_enabled, false),
     case is_boolean(A2AEnabled) andalso is_boolean(A2AV1Enabled)
+         andalso is_boolean(HealthEnabled)
          andalso is_boolean(DevEnabled) of
         false -> {error, invalid_http_endpoint_config};
         true ->
             Config1 = Config#{a2a_enabled => A2AEnabled,
                               a2a_v1_enabled => A2AV1Enabled,
+                              http_health_enabled => HealthEnabled,
                               dev_enabled => DevEnabled},
             case add_a2a_v1_config(Config1) of
                 {ok, Config2} ->
@@ -184,16 +195,18 @@ add_a2a_v1_config(Config) ->
     end.
 
 add_dev_config(Config) ->
-    case developer_token() of
-        {ok, Token} ->
-            DevConfig = #{auth_token => Token,
-                          session_service => application:get_env(
-                                               erlang_adk,
-                                               dev_session_service,
-                                               erlang_adk_session),
-                          runner_options => application:get_env(
-                                              erlang_adk,
-                                              dev_runner_options, #{}),
+    case {developer_token(), developer_runtime_spec(),
+          developer_evaluation_config()} of
+        {{ok, Token}, {ok, SessionService, RunnerOptions},
+         {ok, EvaluationService, EvaluationScope}} ->
+            case developer_payload_config(RunnerOptions) of
+                {ok, PayloadStore, SafeRunnerOptions} ->
+                    DevConfig = #{auth_token => Token,
+                          session_service => SessionService,
+                          runner_options => SafeRunnerOptions,
+                          provider_payload_store => PayloadStore,
+                          evaluation_service => EvaluationService,
+                          evaluation_scope => EvaluationScope,
                           run_options => application:get_env(
                                            erlang_adk, dev_run_options, #{}),
                           resource_provider => application:get_env(
@@ -217,6 +230,10 @@ add_dev_config(Config) ->
                           max_body_bytes => application:get_env(
                                               erlang_adk,
                                               dev_max_body_bytes, 65536),
+                          evaluation_report_max_bytes => application:get_env(
+                                                           erlang_adk,
+                                                           dev_evaluation_report_max_bytes,
+                                                           ?ADK_EVAL_REPORT_MAX_BYTES),
                           max_field_bytes => application:get_env(
                                                erlang_adk,
                                                dev_max_field_bytes, 4096),
@@ -246,13 +263,116 @@ add_dev_config(Config) ->
                                            dev_live_credit,
                                            #{messages => 16,
                                              bytes => 4194304})},
-            case adk_dev_router:validate_config(DevConfig) of
-                {ok, SafeDevConfig} ->
-                    {ok, Config#{dev_config => SafeDevConfig}};
-                {error, Reason} ->
-                    {error, {invalid_dev_platform_config, Reason}}
+                    case adk_dev_router:validate_config(DevConfig) of
+                        {ok, SafeDevConfig} ->
+                            {ok, Config#{dev_config => SafeDevConfig}};
+                        {error, Reason} ->
+                            {error, {invalid_dev_platform_config, Reason}}
+                    end;
+                {error, _} = Error -> Error
             end;
-        {error, _} = Error -> Error
+        {{error, _} = Error, _, _} -> Error;
+        {_, {error, _} = Error, _} -> Error;
+        {_, _, {error, _} = Error} -> Error
+    end.
+
+developer_payload_config(RunnerOptions) ->
+    case application:get_env(
+           erlang_adk, dev_provider_payload_inspection, false) of
+        false -> {ok, undefined, RunnerOptions};
+        #{enabled := true} = Config0 ->
+            Config = maps:remove(enabled, Config0),
+            case adk_dev_payload_store:validate_options(Config) of
+                {ok, #{name := Store} = SafeConfig}
+                  when is_atom(Store), Store =/= undefined ->
+                    Plugins = maps:get(plugins, RunnerOptions, []),
+                    case is_list(Plugins) of
+                        true ->
+                            MaxEventBytes = maps:get(max_event_bytes,
+                                                     SafeConfig),
+                            CallTimeout = maps:get(call_timeout_ms,
+                                                   SafeConfig),
+                            Descriptor =
+                                #{id => <<"developer-provider-payloads">>,
+                                  module => adk_dev_payload_plugin,
+                                  mode => observe,
+                                  failure_policy => open,
+                                  timeout_ms => CallTimeout + 250,
+                                  max_heap_words => 250000,
+                                  max_result_bytes => 1024,
+                                  config =>
+                                      #{store => Store,
+                                        max_event_bytes => MaxEventBytes,
+                                        call_timeout_ms => CallTimeout}},
+                            {ok, Store,
+                             RunnerOptions#{plugins =>
+                                                Plugins ++ [Descriptor]}};
+                        false ->
+                            {error, invalid_dev_runner_plugins}
+                    end;
+                {ok, _} ->
+                    {error, dev_provider_payload_named_store_required};
+                {error, Reason} ->
+                    {error, {invalid_dev_provider_payload_inspection,
+                             Reason}}
+            end;
+        _ -> {error, invalid_dev_provider_payload_inspection}
+    end.
+
+developer_evaluation_config() ->
+    case application:get_env(erlang_adk, evaluation_service_enabled, false) of
+        false ->
+            {ok, undefined, undefined};
+        true ->
+            ServiceOptions = application:get_env(
+                               erlang_adk, evaluation_service_options, #{}),
+            ScopeId = application:get_env(
+                        erlang_adk, dev_evaluation_scope,
+                        <<"developer-ui">>),
+            case {is_map(ServiceOptions),
+                  adk_eval_store:validate_scope({app, ScopeId})} of
+                {true, ok} ->
+                    Service = maps:get(name, ServiceOptions,
+                                       adk_eval_service),
+                    case is_atom(Service) andalso Service =/= undefined of
+                        true -> {ok, Service, {app, ScopeId}};
+                        false -> {error, invalid_dev_evaluation_service}
+                    end;
+                _ ->
+                    {error, invalid_dev_evaluation_scope}
+            end;
+        _ ->
+            {error, invalid_evaluation_service_enabled}
+    end.
+
+developer_runtime_spec() ->
+    case erlang_adk:runtime_runner_spec() of
+        {ok, #{profile := Profile,
+               session_service := ProfileSession,
+               runner_options := ProfileOptions}}
+          when is_atom(ProfileSession), is_map(ProfileOptions) ->
+            SessionResult = case application:get_env(
+                                   erlang_adk, dev_session_service) of
+                undefined -> {ok, ProfileSession};
+                {ok, ProfileSession} -> {ok, ProfileSession};
+                {ok, ExplicitSession} when Profile =:= disabled ->
+                    {ok, ExplicitSession};
+                {ok, _ExplicitSession} ->
+                    {error, runtime_profile_session_override_forbidden}
+            end,
+            ExplicitOptions = application:get_env(
+                                erlang_adk, dev_runner_options, #{}),
+            case {SessionResult, is_map(ExplicitOptions)} of
+                {{ok, Session}, true} when is_atom(Session) ->
+                    %% Runtime-profile service handles remain authoritative;
+                    %% other trusted developer options may extend the runner.
+                    {ok, Session,
+                     maps:merge(ExplicitOptions, ProfileOptions)};
+                {{error, _} = Error, _} -> Error;
+                _ -> {error, invalid_dev_runtime_config}
+            end;
+        {error, Reason} -> {error, {runtime_service_unavailable, Reason}};
+        _ -> {error, invalid_runtime_runner_spec}
     end.
 
 developer_token() ->
@@ -283,6 +403,8 @@ legacy_a2a_routes(_Config, _MaxBodyBytes) ->
 a2a_v1_routes(#{a2a_v1_enabled := true, a2a_v1_config := Config}) ->
     [{"/.well-known/agent-card.json", adk_a2a_v1_handler,
       Config#{endpoint => card}},
+     {"/extendedAgentCard", adk_a2a_v1_handler,
+      Config#{endpoint => extended_card}},
      {"/a2a/v1", adk_a2a_v1_handler,
       Config#{endpoint => jsonrpc}}];
 a2a_v1_routes(_Config) -> [].

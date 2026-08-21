@@ -1,6 +1,12 @@
 -module(erlang_adk).
 
--export([spawn_agent/3, stop_agent/1, prompt/2, invoke/3,
+-export([spawn_agent/3, stop_agent/1,
+         spawn_agent_config/1, spawn_agent_config/2,
+         agent_config_root/1, stop_agent_config/1,
+         deployment_liveness/0, deployment_readiness/0,
+         begin_deployment_drain/0, begin_deployment_drain/1,
+         prompt/2, invoke/3,
+         runtime_runner_spec/0,
          delegate/2, delegate/3,
          delegate/4, sequential/2, parallel/2, parallel/3, loop/4,
          compile_workflow/1, inspect_graph/1, render_graph/2,
@@ -43,6 +49,43 @@ spawn_agent(Name, LLMConfig, Tools) ->
 %% @doc Stop an agent gracefully so its name can be reused.
 stop_agent(AgentPid) ->
     adk_agent:stop(AgentPid).
+
+%% @doc Materialize and spawn a compiled Agent Config composition using the
+%% operator-owned registry snapshot that produced it.
+spawn_agent_config(Compiled) ->
+    adk_agent_composition:spawn(Compiled).
+
+%% @doc Materialize against an explicit sealed registry or snapshot.
+spawn_agent_config(Compiled, Registry) ->
+    adk_agent_composition:spawn(Compiled, Registry).
+
+%% @doc Resolve the root process of an Agent Config composition handle.
+agent_config_root(Composition) ->
+    adk_agent_composition:root(Composition).
+
+%% @doc Stop every process owned by an Agent Config composition.
+stop_agent_config(Composition) ->
+    adk_agent_composition:stop(Composition).
+
+%% @doc Coarse process liveness for container/platform probes.
+deployment_liveness() ->
+    adk_deployment_lifecycle:liveness().
+
+%% @doc Dependency-aware readiness; false while admission is draining.
+deployment_readiness() ->
+    adk_deployment_lifecycle:readiness().
+
+%% @doc Stop new admission and wait a bounded time for active owners.
+begin_deployment_drain() ->
+    adk_deployment_lifecycle:begin_drain().
+
+begin_deployment_drain(Timeout) ->
+    adk_deployment_lifecycle:begin_drain(Timeout).
+
+%% @doc Return the session service and owned artifact/memory service options
+%% selected by the application runtime profile.
+runtime_runner_spec() ->
+    adk_runtime_service_bundle:configured_runner_spec().
 
 %% @doc Synchronously prompt an agent.
 prompt(AgentPid, Message) ->
@@ -100,17 +143,25 @@ render_graph(_Compiled, _Format) ->
 
 %% @doc Start an independently supervised workflow coordinator.
 start_workflow(Compiled, InitialState) ->
-    adk_workflow:start(Compiled, InitialState).
+    start_workflow(Compiled, InitialState, #{}).
 
 start_workflow(Compiled, InitialState, Opts) ->
-    adk_workflow:start(Compiled, InitialState, Opts).
+    case adk_trace_runtime:workflow_options(Opts) of
+        {ok, RuntimeOpts} ->
+            adk_workflow:start(Compiled, InitialState, RuntimeOpts);
+        {error, _} = Error -> Error
+    end.
 
 %% @doc Run a compiled workflow synchronously to one terminal outcome.
 run_workflow(Compiled, InitialState) ->
-    adk_workflow:run(Compiled, InitialState).
+    run_workflow(Compiled, InitialState, #{}).
 
 run_workflow(Compiled, InitialState, Opts) ->
-    adk_workflow:run(Compiled, InitialState, Opts).
+    case adk_trace_runtime:workflow_options(Opts) of
+        {ok, RuntimeOpts} ->
+            adk_workflow:run(Compiled, InitialState, RuntimeOpts);
+        {error, _} = Error -> Error
+    end.
 
 await_workflow(WorkflowRef) ->
     adk_workflow:await(WorkflowRef).

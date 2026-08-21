@@ -154,9 +154,19 @@ checked_config_validation_case() ->
                            <<"tool_timeout">> => 1000}}},
     try
         ok = file:write_file(Path, jsx:encode(Config)),
+        {ok, Compiled} = adk_agent_config:compile(Config),
         {ok, Result} = adk_cli:command(
                          ["config", "validate", Path]),
         ?assertEqual(valid, maps:get(status, Result)),
+        ?assertEqual(1, maps:get(schema_version, Result)),
+        ?assertEqual(1, maps:get(registry_generation, Result)),
+        ?assertEqual(maps:get(registry_instance_id, Compiled),
+                     maps:get(registry_instance_id, Result)),
+        ?assertEqual(maps:get(registry_snapshot_revision_id, Compiled),
+                     maps:get(registry_snapshot_revision_id, Result)),
+        ?assertEqual(64, byte_size(maps:get(fingerprint, Result))),
+        ?assertEqual(maps:get(fingerprint, Compiled),
+                     maps:get(fingerprint, Result)),
         ?assertEqual(<<"CliValidateAgent">>, maps:get(name, Result)),
         ?assertEqual(0, maps:get(tool_count, Result))
     after
@@ -356,10 +366,10 @@ config_error_contracts_case() ->
                          {error, invalid_tool_name}),
     assert_config_result(
       "config-tool-unknown", #{<<"tools">> => [<<"no_such_cli_tool">>]},
-      {error, {unknown_tool_module, <<"no_such_cli_tool">>}}),
+      {error, direct_module_tools_disabled}),
     assert_config_result(
       "config-tool-callbacks", #{<<"tools">> => [<<"lists">>]},
-      {error, {invalid_tool_module, <<"lists">>}}),
+      {error, direct_module_tools_disabled}),
     assert_config_result(
       "config-runner-shape", #{<<"runner_options">> => []},
       {error, runner_options_must_be_object}),
@@ -627,6 +637,22 @@ versioned_evaluation_case() ->
         ?assertMatch(#{<<"result_schema_version">> := 2},
                      jsx:decode(maps:get(report, Passing),
                                 [return_maps])),
+
+        {ok, Junit} = adk_cli:command(
+                        BaseArgs ++ ["--format", "junit"]),
+        ?assertNotEqual(
+           nomatch, binary:match(maps:get(report, Junit),
+                                 <<"<testsuite">>)),
+        {ok, Sarif} = adk_cli:command(
+                        BaseArgs ++ ["--format", "sarif"]),
+        ?assertEqual(
+           <<"2.1.0">>,
+           maps:get(<<"version">>,
+                    jsx:decode(maps:get(report, Sarif), [return_maps]))),
+        {ok, Annotations} = adk_cli:command(
+                              BaseArgs ++ ["--format", "annotations"]),
+        ?assert(is_list(jsx:decode(maps:get(report, Annotations),
+                                  [return_maps]))),
 
         ok = file:write_file(
                BaselinePath, jsx:encode(PassingReport)),
@@ -1011,10 +1037,13 @@ successful_developer_commands_case() ->
     OldToken = os:getenv("ERLANG_ADK_DEV_TOKEN"),
     SavedAppEnv = save_application_env(
                     [dev_enabled, dev_auth_token, dev_auth_token_env,
-                     a2a_ip, a2a_port]),
+                     dev_runner_options, a2a_ip, a2a_port]),
     Config = #{<<"name">> => ServedName,
                <<"provider">> => <<"adk_llm_probe">>,
-               <<"response">> => <<"CLI served response">>},
+               <<"response">> => <<"CLI served response">>,
+               <<"runner_options">> =>
+                   #{<<"max_llm_calls">> => 4,
+                     <<"max_tool_rounds">> => 4}},
     try
         ok = file:write_file(ConfigPath, jsx:encode(Config)),
         true = os:putenv("ERLANG_ADK_DEV_TOKEN", ?CLI_DEV_TOKEN),
@@ -1039,6 +1068,9 @@ successful_developer_commands_case() ->
         ?assertEqual(ServedName, maps:get(agent_name, ServeResult)),
         ?assertEqual({ok, true},
                      application:get_env(erlang_adk, dev_enabled)),
+        ?assertEqual(
+           {ok, #{max_llm_calls => 4, max_tool_rounds => 4}},
+           application:get_env(erlang_adk, dev_runner_options)),
         ?assert(is_pid(whereis(erlang_adk_http))),
 
         {ok, AgentList} = adk_cli:command(

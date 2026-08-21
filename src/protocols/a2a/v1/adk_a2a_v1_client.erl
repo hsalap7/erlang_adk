@@ -6,12 +6,15 @@
 -module(adk_a2a_v1_client).
 
 -export([discover/1, discover/2,
-         send/3, send_stream/3,
+         send/3, send_stream/3, send_stream/4,
          get_task/3, list_tasks/3, cancel_task/3,
-         subscribe/3]).
+         subscribe/3, subscribe/4,
+         create_push_config/3, get_push_config/4,
+         list_push_configs/3, delete_push_config/4,
+         get_extended_card/2]).
 
 -ifdef(TEST).
--export([test_resolve_addresses/3]).
+-export([test_resolve_addresses/3, test_stream_chunks/4]).
 -endif.
 
 -define(DEFAULT_TIMEOUT, 65000).
@@ -73,8 +76,19 @@ send(Target, Message, Options) ->
 -spec send_stream(map() | binary() | string(), map(), map()) ->
     {ok, [map()]} | {error, term()}.
 send_stream(Target, Message, Options) ->
+    collect_stream(
+      fun(Callback) ->
+          send_stream(Target, Message, Options, Callback)
+      end).
+
+-spec send_stream(map() | binary() | string(), map(), map(), fun((map()) ->
+    continue | stop | {error, term()})) -> ok | {error, term()}.
+send_stream(Target, Message, Options, Callback)
+  when is_function(Callback, 1) ->
     rpc_message(Target, <<"SendStreamingMessage">>, Message,
-                Options, stream).
+                Options, {stream_callback, Callback});
+send_stream(_Target, _Message, _Options, _Callback) ->
+    {error, invalid_a2a_stream_callback}.
 
 -spec get_task(map() | binary() | string(), binary(), map()) ->
     {ok, map()} | {error, term()}.
@@ -94,8 +108,64 @@ cancel_task(Target, TaskId, Options) ->
 -spec subscribe(map() | binary() | string(), binary(), map()) ->
     {ok, [map()]} | {error, term()}.
 subscribe(Target, TaskId, Options) ->
-    rpc(Target, <<"SubscribeToTask">>, #{<<"id">> => TaskId},
-        Options, stream).
+    collect_stream(
+      fun(Callback) ->
+          subscribe(Target, TaskId, Options, Callback)
+      end).
+
+-spec subscribe(map() | binary() | string(), binary(), map(), fun((map()) ->
+    continue | stop | {error, term()})) -> ok | {error, term()}.
+subscribe(Target, TaskId, Options, Callback)
+  when is_function(Callback, 1) ->
+    rpc(Target, <<"SubscribeToTask">>, #{<<"id">> => TaskId}, Options,
+        {stream_callback, Callback});
+subscribe(_Target, _TaskId, _Options, _Callback) ->
+    {error, invalid_a2a_stream_callback}.
+
+-spec create_push_config(map() | binary() | string(), map(), map()) ->
+    {ok, map()} | {error, term()}.
+create_push_config(Target, Config, Options) when is_map(Config) ->
+    rpc(Target, <<"CreateTaskPushNotificationConfig">>, Config,
+        Options, unary);
+create_push_config(_Target, _Config, _Options) ->
+    {error, invalid_push_notification_config}.
+
+-spec get_push_config(map() | binary() | string(), binary(), binary(), map()) ->
+    {ok, map()} | {error, term()}.
+get_push_config(Target, TaskId, ConfigId, Options) ->
+    rpc(Target, <<"GetTaskPushNotificationConfig">>,
+        #{<<"taskId">> => TaskId, <<"id">> => ConfigId}, Options, unary).
+
+-spec list_push_configs(map() | binary() | string(), map(), map()) ->
+    {ok, map()} | {error, term()}.
+list_push_configs(Target, Params, Options) ->
+    rpc(Target, <<"ListTaskPushNotificationConfigs">>, Params,
+        Options, unary).
+
+-spec delete_push_config(map() | binary() | string(), binary(), binary(),
+                         map()) -> {ok, map()} | {error, term()}.
+delete_push_config(Target, TaskId, ConfigId, Options) ->
+    rpc(Target, <<"DeleteTaskPushNotificationConfig">>,
+        #{<<"taskId">> => TaskId, <<"id">> => ConfigId}, Options, unary).
+
+-spec get_extended_card(map() | binary() | string(), map()) ->
+    {ok, map()} | {error, term()}.
+get_extended_card(Target, Options) ->
+    rpc(Target, <<"GetExtendedAgentCard">>, #{}, Options, unary).
+
+collect_stream(Invoke) ->
+    Key = {?MODULE, make_ref()},
+    put(Key, []),
+    Callback = fun(Payload) ->
+        put(Key, [Payload | get(Key)]),
+        continue
+    end,
+    try Invoke(Callback) of
+        ok -> {ok, lists:reverse(get(Key))};
+        {error, _} = Error -> Error
+    after
+        erase(Key)
+    end.
 
 rpc_message(Target, Method, Message0, Options, Mode) ->
     case adk_a2a_v1_codec:validate_message(Message0) of
@@ -140,10 +210,10 @@ rpc(_Target, _Method, _Params, _Options, _Mode) ->
 rpc_http(Mode, Url, Id, RpcRequest, Card, Options) ->
     Accept = case Mode of
         unary -> <<"application/json">>;
-        stream -> <<"text/event-stream">>
+        {stream_callback, _} -> <<"text/event-stream">>
     end,
     LastEvent = case {Mode, maps:get(last_event_id, Options)} of
-        {stream, N} when is_integer(N), N >= 0 ->
+        {{stream_callback, _}, N} when is_integer(N), N >= 0 ->
             [{<<"last-event-id">>, integer_to_binary(N)}];
         _ -> []
     end,
@@ -154,9 +224,22 @@ rpc_http(Mode, Url, Id, RpcRequest, Card, Options) ->
         {ok, ExtensionHeaders} ->
             case rpc_auth_mode(Card, Options) of
                 {ok, AuthMode} ->
-                    case request(<<"POST">>, Url,
-                                 Headers0 ++ ExtensionHeaders,
-                                 jsx:encode(RpcRequest), Options, AuthMode) of
+                    RequestResult = case Mode of
+                        {stream_callback, Callback} ->
+                            request_stream(
+                              <<"POST">>, Url,
+                              Headers0 ++ ExtensionHeaders,
+                              jsx:encode(RpcRequest), Options, AuthMode,
+                              Id, Callback);
+                        _ ->
+                            request(<<"POST">>, Url,
+                                    Headers0 ++ ExtensionHeaders,
+                                    jsx:encode(RpcRequest), Options,
+                                    AuthMode)
+                    end,
+                    case RequestResult of
+                        {ok, stream_complete} -> ok;
+                        {ok, stream_stopped} -> ok;
                         {ok, 200, RespHeaders, Body} ->
                             decode_rpc_http(
                               Mode, content_type(RespHeaders), Body,
@@ -172,8 +255,6 @@ rpc_http(Mode, Url, Id, RpcRequest, Card, Options) ->
 
 decode_rpc_http(unary, <<"application/json">>, Body, Id, _Options) ->
     decode_unary(Body, Id);
-decode_rpc_http(stream, <<"text/event-stream">>, Body, Id, Options) ->
-    decode_sse(Body, Id, maps:get(max_events, Options));
 decode_rpc_http(_Mode, _Type, _Body, _Id, _Options) ->
     {error, invalid_a2a_response_content_type}.
 
@@ -186,42 +267,6 @@ decode_unary(Body, Id) ->
             {error, {a2a_error, public_a2a_error(Error)}};
         _ -> {error, invalid_a2a_jsonrpc_response}
     catch _:_ -> {error, invalid_a2a_json_response}
-    end.
-
-decode_sse(Body, Id, MaxEvents) ->
-    Blocks = [Block || Block <- binary:split(normalize_newlines(Body),
-                                              <<"\n\n">>, [global]),
-                       byte_size(Block) > 0],
-    case length(Blocks) =< MaxEvents of
-        false -> {error, too_many_a2a_stream_events};
-        true -> decode_sse_blocks(Blocks, Id, undefined, [], first)
-    end.
-
-decode_sse_blocks([], _Id, _LastSeq, Acc, _Position) ->
-    case Acc of
-        [] -> {error, empty_a2a_stream};
-        _ -> {ok, lists:reverse(Acc)}
-    end;
-decode_sse_blocks([Block | Rest], Id, LastSeq, Acc, Position) ->
-    case sse_block(Block) of
-        comment -> decode_sse_blocks(Rest, Id, LastSeq, Acc, Position);
-        {ok, Seq, Data} ->
-            case valid_sequence(LastSeq, Seq) of
-                false -> {error, invalid_a2a_stream_order};
-                true ->
-                    case decode_stream_envelope(Data, Id) of
-                        {ok, Payload} ->
-                            case valid_stream_position(Position, Payload) of
-                                true ->
-                                    decode_sse_blocks(Rest, Id, Seq,
-                                                      [Payload | Acc], next);
-                                false ->
-                                    {error, invalid_a2a_stream_sequence}
-                            end;
-                        Error -> Error
-                    end
-            end;
-        {error, _} = Error -> Error
     end.
 
 sse_block(Block) ->
@@ -261,9 +306,6 @@ valid_stream_position(next, Payload) ->
     maps:is_key(<<"statusUpdate">>, Payload) orelse
     maps:is_key(<<"artifactUpdate">>, Payload).
 
-valid_sequence(undefined, _Seq) -> true;
-valid_sequence(Previous, Seq) -> Seq > Previous.
-
 %% HTTP transport
 
 request(Method, Url, Headers0, Body, Options, AuthMode) ->
@@ -290,6 +332,216 @@ request(Method, Url, Headers0, Body, Options, AuthMode) ->
                 Error -> Error
             end;
         Error -> Error
+    end.
+
+%% Incremental SSE transport. Gun is given one body-flow credit at a time and
+%% a new credit is issued only after every complete event in that chunk has
+%% been validated and accepted by the callback. The callback may return stop
+%% to cancel without waiting for the peer to close the stream.
+request_stream(Method, Url, Headers0, Body, Options, AuthMode, Id, Callback) ->
+    case parse_url(Url) of
+        {ok, Endpoint} ->
+            case resolve_endpoint(Endpoint, Options) of
+                {ok, Target} ->
+                    case dynamic_headers(AuthMode, Target, Options) of
+                        {ok, Dynamic} ->
+                            Headers = [{<<"host">>, host_header(Endpoint)} |
+                                       Headers0 ++ maps:get(headers, Options) ++
+                                       Dynamic],
+                            with_connection(
+                              Target, Options,
+                              fun(Conn) ->
+                                  Ref = gun:request(
+                                          Conn, Method,
+                                          maps:get(path, Endpoint), Headers,
+                                          Body, #{flow => 1}),
+                                  await_stream_response(
+                                    Conn, Ref, Id, Callback, Options)
+                              end);
+                        Error -> Error
+                    end;
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+await_stream_response(Conn, Ref, Id, Callback, Options) ->
+    case gun:await(Conn, Ref, remaining(Options)) of
+        {inform, _Status, _Headers} ->
+            await_stream_response(Conn, Ref, Id, Callback, Options);
+        {response, fin, 200, Headers} ->
+            case content_type(Headers) of
+                <<"text/event-stream">> -> {error, empty_a2a_stream};
+                _ -> {error, invalid_a2a_response_content_type}
+            end;
+        {response, nofin, 200, Headers} ->
+            case content_type(Headers) of
+                <<"text/event-stream">> ->
+                    State = #{buffer => <<>>, id => Id,
+                              last_seq => undefined, position => first,
+                              after_snapshot => false,
+                              count => 0, seen => false, total => 0},
+                    await_stream_data(
+                      Conn, Ref, Callback, Options, State);
+                _ ->
+                    _ = catch gun:cancel(Conn, Ref),
+                    {error, invalid_a2a_response_content_type}
+            end;
+        {response, _Fin, Status, _Headers} ->
+            _ = catch gun:cancel(Conn, Ref),
+            {error, {a2a_http_status, Status}};
+        {error, timeout} -> {error, a2a_timeout};
+        {error, _} -> {error, a2a_transport_failed};
+        _ -> {error, invalid_a2a_http_response}
+    end.
+
+await_stream_data(Conn, Ref, Callback, Options, State0) ->
+    case gun:await(Conn, Ref, remaining(Options)) of
+        {data, Fin, Data} when is_binary(Data) ->
+            case consume_sse_chunk(Data, State0, Callback, Options) of
+                {ok, State1} when Fin =:= fin ->
+                    finish_sse_callback(State1, Callback, Options);
+                {ok, State1} ->
+                    ok = gun:update_flow(Conn, Ref, 1),
+                    await_stream_data(Conn, Ref, Callback, Options, State1);
+                stop ->
+                    _ = catch gun:cancel(Conn, Ref),
+                    {ok, stream_stopped};
+                {error, _} = Error ->
+                    _ = catch gun:cancel(Conn, Ref),
+                    Error
+            end;
+        {trailers, _Headers} ->
+            finish_sse_callback(State0, Callback, Options);
+        {error, timeout} -> {error, a2a_timeout};
+        {error, _} -> {error, a2a_transport_failed};
+        _ -> {error, invalid_a2a_http_body}
+    end.
+
+consume_sse_chunk(Data, State0, Callback, Options) ->
+    Total = maps:get(total, State0) + byte_size(Data),
+    case Total =< maps:get(max_response_bytes, Options) of
+        false -> {error, a2a_response_too_large};
+        true ->
+            Combined = <<(maps:get(buffer, State0))/binary, Data/binary>>,
+            {Blocks, Buffer} = extract_sse_blocks(Combined, []),
+            case byte_size(Buffer) =< maps:get(max_response_bytes, Options) of
+                false -> {error, a2a_sse_event_too_large};
+                true ->
+                    consume_sse_callback_blocks(
+                      Blocks, State0#{buffer => Buffer, total => Total},
+                      Callback, Options)
+            end
+    end.
+
+finish_sse_callback(#{buffer := <<>>, seen := true},
+                    _Callback, _Options) ->
+    {ok, stream_complete};
+finish_sse_callback(#{buffer := <<>>, seen := false},
+                    _Callback, _Options) ->
+    {error, empty_a2a_stream};
+finish_sse_callback(State0, Callback, Options) ->
+    Block = maps:get(buffer, State0),
+    case consume_sse_callback_blocks(
+           [Block], State0#{buffer => <<>>}, Callback, Options) of
+        {ok, #{seen := true}} -> {ok, stream_complete};
+        {ok, _} -> {error, empty_a2a_stream};
+        stop -> {ok, stream_stopped};
+        {error, _} = Error -> Error
+    end.
+
+extract_sse_blocks(Binary, Acc) ->
+    case next_sse_delimiter(Binary) of
+        nomatch -> {lists:reverse(Acc), Binary};
+        {Position, Length} ->
+            Block = binary:part(Binary, 0, Position),
+            RestPosition = Position + Length,
+            Rest = binary:part(Binary, RestPosition,
+                               byte_size(Binary) - RestPosition),
+            extract_sse_blocks(Rest, [Block | Acc])
+    end.
+
+next_sse_delimiter(Binary) ->
+    Candidates = [Match || Match <-
+                                [delimiter_match(Binary, <<"\r\n\r\n">>),
+                                 delimiter_match(Binary, <<"\n\n">>),
+                                 delimiter_match(Binary, <<"\r\r">>)],
+                           Match =/= nomatch],
+    case lists:sort(Candidates) of
+        [] -> nomatch;
+        [{Position, Length} | _] -> {Position, Length}
+    end.
+
+delimiter_match(Binary, Delimiter) ->
+    case binary:match(Binary, Delimiter) of
+        {Position, Length} -> {Position, Length};
+        nomatch -> nomatch
+    end.
+
+consume_sse_callback_blocks([], State, _Callback, _Options) -> {ok, State};
+consume_sse_callback_blocks([Block0 | Rest], State0, Callback, Options) ->
+    Block = normalize_newlines(Block0),
+    case sse_block(Block) of
+        comment ->
+            consume_sse_callback_blocks(Rest, State0, Callback, Options);
+        {ok, Seq, Data} ->
+            case callback_sequence(maps:get(last_seq, State0), Seq,
+                                   maps:get(after_snapshot, State0)) of
+                ok ->
+                    case decode_stream_envelope(Data, maps:get(id, State0)) of
+                        {ok, Payload} ->
+                            case valid_stream_position(
+                                   maps:get(position, State0), Payload) of
+                                false -> {error, invalid_a2a_stream_sequence};
+                                true ->
+                                    Count = maps:get(count, State0) + 1,
+                                    case Count =< maps:get(max_events, Options) of
+                                        false ->
+                                            {error,
+                                             too_many_a2a_stream_events};
+                                        true ->
+                                            case invoke_stream_callback(
+                                                   Callback, Payload) of
+                                                continue ->
+                                                    State1 = State0#{
+                                                      last_seq => Seq,
+                                                      position => next,
+                                                      after_snapshot =>
+                                                        maps:is_key(
+                                                          <<"task">>,
+                                                          Payload),
+                                                      count => Count,
+                                                      seen => true},
+                                                    consume_sse_callback_blocks(
+                                                      Rest, State1, Callback,
+                                                      Options);
+                                                stop -> stop;
+                                                {error, _} = Error -> Error
+                                            end
+                                    end
+                            end;
+                        {error, _} = Error -> Error
+                    end;
+                {error, _} = Error -> Error
+            end
+    end.
+
+callback_sequence(undefined, _Seq, _AfterSnapshot) -> ok;
+callback_sequence(Previous, Seq, true) when Seq > Previous -> ok;
+callback_sequence(Previous, Seq, false) when Seq =:= Previous + 1 -> ok;
+callback_sequence(Previous, Seq, false) when Seq > Previous + 1 ->
+    {error, {a2a_replay_gap, Previous + 1, Seq}};
+callback_sequence(_Previous, _Seq, _AfterSnapshot) ->
+    {error, invalid_a2a_stream_order}.
+
+invoke_stream_callback(Callback, Payload) ->
+    try Callback(Payload) of
+        continue -> continue;
+        stop -> stop;
+        {error, _} -> {error, a2a_stream_callback_rejected};
+        _ -> {error, invalid_a2a_stream_callback_result}
+    catch
+        _:_ -> {error, a2a_stream_callback_failed}
     end.
 
 with_connection(Target, Options, Fun) ->
@@ -1174,4 +1426,25 @@ test_resolve_addresses(Host, Timeout, Resolver)
        is_function(Resolver, 1) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     resolve_addresses(Host, #{deadline => Deadline}, Resolver).
+
+test_stream_chunks(Chunks, Id, Limits, Callback)
+  when is_list(Chunks), is_map(Limits), is_function(Callback, 1) ->
+    Options = #{max_response_bytes =>
+                    maps:get(max_response_bytes, Limits, ?DEFAULT_MAX_BYTES),
+                max_events => maps:get(max_events, Limits,
+                                       ?DEFAULT_MAX_EVENTS)},
+    State0 = #{buffer => <<>>, id => Id, last_seq => undefined,
+               position => first, after_snapshot => false,
+               count => 0, seen => false, total => 0},
+    case lists:foldl(
+           fun(_Chunk, {error, _} = Error) -> Error;
+              (_Chunk, stop) -> stop;
+              (Chunk, {ok, State}) when is_binary(Chunk) ->
+                   consume_sse_chunk(Chunk, State, Callback, Options);
+              (_Chunk, _State) -> {error, invalid_a2a_http_body}
+           end, {ok, State0}, Chunks) of
+        {ok, State} -> finish_sse_callback(State, Callback, Options);
+        stop -> {ok, stream_stopped};
+        {error, _} = Error -> Error
+    end.
 -endif.

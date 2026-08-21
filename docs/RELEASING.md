@@ -5,7 +5,9 @@ publishing a release. The commands below describe actions to take only after
 their prerequisites and approvals are satisfied. The v0.9.0 release status and
 evidence are recorded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md) and the
 [`CHANGELOG`](../CHANGELOG.md); running this checklist does not publish a later
-release by itself.
+release by itself. Version 0.10.0 is currently **IN DEVELOPMENT**; its scope
+and candidate ledger are in
+[`VERSION_0_10_0.md`](VERSION_0_10_0.md).
 
 ## 1. Establish the release candidate
 
@@ -17,12 +19,96 @@ release by itself.
       `FEATURE_PARITY.md`, `PROVIDER_PROFILES.md`,
       `README_EXAMPLE_COVERAGE.md`, `TESTING.md`, and `UPGRADING.md` agree
       with the implementation.
+- [ ] For 0.10, confirm the release contract no longer says **IN DEVELOPMENT**
+      only after every required result has been recorded from this exact
+      candidate. Focused tests alone are insufficient.
 - [ ] Preserve both lock files and the Apache-2.0 license.
 - [ ] Validate the release's model `provider_profiles` with
       `adk_provider_registry:profiles/0`; review binary aliases, concrete
       models, endpoint presets/HTTPS hosts, locked options, and credential
       source descriptors. Do not place a literal production credential in
       version-controlled configuration.
+- [ ] Validate `agent_config_registry` definitions and record the compiled
+      registry's opaque instance ID, snapshot revision ID, and generation.
+      Confirm structural copies with changed trusted entries fail the internal
+      seal check and that diagnostics/fingerprints do not expose the seal.
+      Confirm direct Agent Config `tools` modules remain disabled unless a
+      reviewed trusted caller explicitly needs the legacy opt-in; review the
+      separate legacy-provider-module opt-in the same way. Also validate the
+      opt-in
+      `runtime_service_profile`, evaluation-service/store, and trace-store
+      application environment. Review fixed Mnesia table atoms, the absolute
+      durable artifact root, capacity/retention limits, trace principal and
+      store/bus names, the reserved trace exporter ID, evaluation
+      baseline-prune/accounting-repair policy, canonical single-service eval
+      store ownership, bounded raw-submission behavior, workflow-owner-bound
+      trace receiver TTL/status, and ownership of any persistent directories.
+- [ ] Run `adk serve --config` with conflicting agent and operator Runner
+      options. Confirm trusted `dev_runner_options` win and an enabled runtime
+      profile remains authoritative for artifact/memory service references.
+- [ ] Review any GCS artifact credential/transport boundary, range/credit
+      limits, effect-journal retention, and the operator/backend-specific
+      orphan-reconciliation policy. Confirm the runtime does not claim to
+      infer remote outcomes or supervise a universal reconciler.
+- [ ] Review memory embedding/vector bounds, opt-in policy enforcement,
+      erasure-epoch/outbox four-table topology, deterministic registry hydration,
+      identity-filtered rotating claim bounds, and explicit indexed terminal-
+      prune policy. Verify active jobs reserve terminal capacity, over-cap
+      migration is admission-closed, epoch-bound IDs permit post-erasure
+      resubmission, legacy named APIs select the one bundle owner, nested
+      options/capabilities fail closed, and status is redacted. Majority mode
+      requires at least two shared nodes; do not infer managed/distributed
+      vector search or node-loss recovery.
+- [ ] Verify every evaluation report surface uses the canonical renderer and
+      one maximum of 16 MiB. Check `dev_evaluation_report_max_bytes` can only
+      lower the report route, unrelated CLI responses remain 1 MiB, request
+      bodies remain 64 KiB, and stdout/file deliveries enforce the same bytes.
+- [ ] Pin each MCP peer to an intended legacy or modern era and review OAuth,
+      pool, SSE-credit, and catalog limits. Record the external SDK matrix only
+      if it ran. Likewise review A2A task-store topology and process-local push
+      secrets/drop-new queue behavior; record the external TCK only if it ran.
+- [ ] Keep provider payload inspection disabled unless the release owner has
+      explicitly accepted the loopback-only, redacted, bounded, volatile,
+      failure-open development contract. It is not production telemetry or an
+      audit log.
+- [ ] Review deployment manifests/scripts as render-first inputs. Record
+      Docker runtime, Cloud Run staging, Helm/Kind/GKE, scan/sign/provenance,
+      and managed Agent Runtime separately; deterministic rendering is not a
+      successful infrastructure gate.
+- [ ] Verify the packaged `etc/health-http.sys.config.src` is selected through
+      the exact relx base path
+      `/opt/erlang_adk/etc/health-http.sys.config`, including a nondefault
+      platform `PORT`. Confirm the default listener serves only `/livez` and
+      `/readyz`, with agent/A2A/developer/legacy routes absent. For a Helm
+      `runtimeConfig.existingConfigMap`, require the exact `sys.config` key at
+      `/opt/erlang_adk/etc/runtime/sys.config` and review every listener it
+      enables. Record which of the three modes is intended: closed base
+      release, packaged health-only profile, or application-owned config.
+- [ ] For Cloud Run, verify both the Service and revision template carry the
+      rendered one-instance maximum. Treat these as autoscaling settings, not
+      a hard singleton lease or proof that rollout revisions cannot overlap.
+- [ ] Verify `ERLANG_ADK_NOFILE_CAP` defaults to 65536, rejects values outside
+      1024..1048576, and never raises inherited limits. Exercise the single
+      PID1-owned drain/forward/reap path without a second Helm `preStop`; check
+      the 30000 ms generic/Helm budget within 60 seconds and the 3000 ms Cloud
+      Run budget within its platform shutdown window.
+- [ ] When deployment OTLP is enabled, confirm only
+      `ERLANG_ADK_OTLP_ENDPOINT` activates it; exercise bounded
+      W3C-Baggage-style header parsing, optional-whitespace trimming, strict
+      one-pass value percent decoding, raw-semicolon/invalid-UTF-8/duplicate/
+      malformed rejection, origin-only endpoint, and redacted startup
+      failures. Confirm batch size is one and preserve the 3000 ms HTTP/4000 ms
+      exporter bounds under a bus timeout greater than the sum of every final
+      exporter timeout plus 250 ms. Confirm trace-store export is included
+      before validation, an absent timeout is safely auto-sized, and an
+      explicit undersized timeout fails. Source headers from an existing
+      Secret and review collector egress.
+- [ ] If the managed Agent Runtime feasibility probe is reviewed, confirm it
+      calls only `ListTasks`, reads a bounded RFC 6750 bearer exactly from the
+      named environment variable, rejects CR/LF, and sends the Authorization
+      header through curl standard-input config rather than a process
+      argument. Keep every target-runtime support blocker unresolved until its
+      external exit evidence exists.
 - [ ] Do not include `_build`, `Mnesia.*`, generated `doc`, crash dumps,
       Phoenix `_build`/`deps`, local certificates/keys, provider responses, or
       secrets.
@@ -65,6 +151,7 @@ evidence.
 ./rebar3 xref
 ./rebar3 eunit --module=readme_examples_test
 ./rebar3 eunit --module=readme_workflow_examples_test
+# Run every grouped v0.10 EUnit/CT command in docs/TESTING.md.
 ./rebar3 ct --suite test/runtime/invocations/adk_concurrency_stress_SUITE.erl
 ./rebar3 ct --suite test/integrations/stress/adk_v05_stress_SUITE.erl
 ./rebar3 escriptize
@@ -73,7 +160,29 @@ _build/default/bin/adk config validate examples/agent.json
 ./rebar3 ex_doc
 ./rebar3 hex build
 ./scripts/verify_hex_package.sh
+packages/build_connector_packages.sh
 ```
+
+`packages/build_connector_packages.sh` is the sole supported offline release
+gate for all four curated connectors. It validates each independent package,
+warning-strict compiles/tests its source, internally normalizes the generated
+Hex inspection archive, checks for checkout leakage and the non-optional
+`erlang_adk ~> 0.10.0` requirement, then warning-strict compiles/tests a clean
+extraction. Its package suites must execute every advertised operation through
+the real registry, Agent Config, and `adk_toolset` path and verify projected
+policy metadata. Do not inspect or retain the intermediate raw `rebar3_hex` tarball:
+the package-local `_checkouts/erlang_adk` used for tests is intentionally
+omitted from generated requirements. See the
+[connector package guide](../packages/README.md) for the normalization
+internals.
+
+The wrapper's normalized tarball is an offline inspection/build artifact only.
+`rebar3_hex` 7.1.0 rebuilds during `hex publish` and cannot upload that archive.
+A future connector publication must wait until core Erlang ADK 0.10.0 exists
+in the target Hex repository, remove the local checkout, resolve and lock that
+published core afresh, run the ordinary credentialed publish flow, and verify
+the remote package's requirement afterward. Until that separate sequence is
+recorded, Google, GitHub, Slack, and Postgres connectors remain unpublished.
 
 The 1,176 EUnit, six deterministic Common Test, 73.88% coverage, 210-file
 Dialyzer, 29 README, four workflow, and 193 focused totals in
@@ -94,6 +203,26 @@ call/function findings from `./rebar3 xref`. Its Phoenix companion passed
 health smokes. Coverage, package, escript/doctor, and paid-provider evidence
 remains separately bounded in [`VERSION_0_9_0.md`](VERSION_0_9_0.md).
 
+Current 0.10 evidence applies to the named `codex/version_0.10.0` working-tree
+candidate. HEAD `78f31fd6b72295ebeb37cecbd7c11a6c5a666b34` is the v0.9 baseline;
+all v0.10 changes remain uncommitted, so no reproducible commit/tag is claimed.
+Both non-coverage and coverage EUnit passed 1,826/1,826; deterministic Common
+Test passed 6 with 22 expected paid-provider skips. Compile/xref passed,
+Dialyzer reported 0 warnings over 309 project files, and coverage was
+36,574/49,312 = 74.17% (83 covered lines over the exact floor). Focused
+durable-runtime validation passed 46/46 EUnit, and canonical evaluation-report
+parity/boundary validation passed 56 tests. Escript, doctor, and checked config
+validation passed. README EUnit passed 30/30 plus 4/4, all three checked
+examples compiled with `-Werror`, and ExDoc, local Markdown, root Hex/verifier/
+extracted compile, and diff gates passed. Root artifact hashes/freshness are
+reported out of band so packaged documentation is not self-referential.
+The sole connector wrapper passed 4 packages, 12/12 source EUnit, 12/12 clean-
+extracted EUnit, and 4 package plus 4 docs archives. Exact toolchain, hashes,
+and scoped not-run gates are in the
+[`0.10 development ledger`](VERSION_0_10_0.md#development-validation-ledger).
+The grouped focused commands in [`TESTING.md`](TESTING.md) remain subsystem
+diagnostics and cannot replace that aggregate.
+
 The seven-module post-audit repair regression set passed 67/67, covering
 contiguous in-flight multi-frame priority ordering, Anthropic's minimum
 `max_tokens` value of one, and the 64 KiB synchronous/streaming Gun
@@ -105,7 +234,8 @@ compilation verification.
 
 Inspect generated documentation and the Hex tarball/file list. Confirm the
 package contains core source, public headers, license, README, changelog,
-the provider-profile/version guides, root examples, and the intentionally
+the provider-profile/version guides (including `VERSION_0_10_0.md`), root
+examples, and the intentionally
 packaged Phoenix companion source;
 it must exclude the test source tree, build/dependency caches, local data,
 generated Phoenix output, credentials, and crash dumps. The verifier enforces
@@ -143,6 +273,11 @@ The v0.9.0 companion repeated that complete gate successfully with the patched
 dependency locks: 103 ExUnit tests, 40 browser/audio tests, production assets,
 release assembly, and both health smokes passed.
 
+The merged v0.10 development candidate passed 107 ExUnit and 40 Node tests,
+production assets/release, and both trusted-proxy and CA-verified direct-TLS
+health smokes. Live registry access failed with `Unknown CA`, so this records
+the cached locked gate and does not claim a fresh registry fetch.
+
 The v0.9.0 dependency refresh moved Bandit to 1.12.4, Cowboy to 2.18.0, and
 Cowlib to 2.19.0, removing EEF-CVE-2026-65623, EEF-CVE-2026-65624, and
 EEF-CVE-2026-59248 from the audit. `mix hex.audit` remains non-zero for
@@ -160,7 +295,7 @@ Before approval, the release owner must either:
 Do not use the partial fork patch, remove the audit, or weaken TLS/header
 validation merely to obtain a zero exit status.
 
-## 5. Run opt-in provider gates
+## 5. Run opt-in provider and external-platform gates
 
 Use a release-owned test project and export the key in the same shell. These
 commands use network access, quota, and billable API calls.
@@ -199,6 +334,38 @@ environment variables. If the release owner runs a manual smoke, record it as
 separate provider evidence without prompts, outputs, or credentials. Each
 compatible endpoint is a distinct target, not a blanket certification.
 
+The following 0.10 boundaries also need distinct external evidence when a
+release intends to claim them:
+
+- an MCP SDK/peer matrix for every advertised legacy/modern transport and
+  deployed peer beyond the recorded official Python/TypeScript client cells;
+- the deployment's authenticated A2A HTTPS peer and push receiver beyond the
+  recorded official JSON-RPC TCK;
+- multi-node node-loss and restore tests for every claimed Mnesia topology;
+- a release-candidate OCI repeat using the promoted image digest and registry;
+- Cloud Run staging and Helm on Kind/GKE with the exact rendered image digest;
+- actual SBOM generation, scan policy, signature, and provenance verification;
+  and
+- any managed Agent Runtime target.
+
+The 2026-08-19 candidate record contains the pinned official MCP
+Python/TypeScript 2.0.0 modern/legacy matrix and official A2A JSON-RPC TCK. The
+latter passed 100 tests with 165 expected transport/capability skips, including
+94 JSON-RPC passes and seven inapplicable JSON-RPC skips. Treat those as the
+exact loopback scopes recorded in `VERSION_0_10_0.md`, not as substitutes for
+the remaining peer, identity, push, transport, or infrastructure gates.
+
+The repository records a final local candidate OCI/Kind gate. The image digest
+and constrained direct/Helm resource, health, route, drain, and termination
+results are in `VERSION_0_10_0.md`. The disposable cluster covered the
+closed/headless and packaged health-only modes, not an application-owned
+`sys.config`, GKE, Cloud Run, or registry promotion. Generated SBOM, Grype scan,
+Cosign sign/attest, and provenance verification remain not run because those
+tools were unavailable and no registry identity was authorized. Keep every
+remaining entry `not run` until its owning external command finishes
+successfully; local fixtures, manifest marker validation, feasibility probes,
+and package-local connector tests cannot be substituted.
+
 ## 6. Approve the release record
 
 Before creating a tag, record:
@@ -209,6 +376,16 @@ Before creating a tag, record:
 - paid REST and Live model, date, counts, and non-secret failure reasons;
 - root dependency review and the exact `mix hex.audit` output/status;
 - accepted known limitations, including node locality and partial adapters;
+- for 0.10, runtime bundle generation/fail-stop/lease behavior; Agent Config
+  v2 JSON/YAML/composition and registry provenance; connector authorization
+  boundaries; artifact GCS/stream/reconciliation policy; memory vector/
+  governance/erasure/prune policy; MCP era/OAuth/pool/catalog status; A2A
+  stream/task-store/push restart behavior; evaluation quota/simulator/export/
+  RPC/recovery policy; trace and developer-payload boundaries; and deployment
+  render/apply evidence with all configured limits;
+- exact pass/failure/skip scope for the recorded MCP SDK matrix and A2A TCK,
+  plus explicit `not run`, pass, or failure status for node-loss, Docker,
+  Cloud Run, Helm/Kind/GKE, supply-chain, and managed-runtime gates;
 - secret-scan/package-content review; and
 - the person or process accepting each security/provider exception.
 
@@ -231,9 +408,9 @@ signed tag where maintainer signing is configured; otherwise use an annotated
 tag and preserve the external approval record:
 
 ```bash
-git tag -s v0.9.0 -m "Erlang ADK 0.9.0"
+git tag -s v0.10.0 -m "Erlang ADK 0.10.0"
 # or, when signing is unavailable:
-git tag -a v0.9.0 -m "Erlang ADK 0.9.0"
+git tag -a v0.10.0 -m "Erlang ADK 0.10.0"
 ```
 
 Verify the tag points to the approved commit, then push the branch/tag through
@@ -241,9 +418,9 @@ the repository's protected release process. Publication is a separate
 credentialed action:
 
 ```bash
-git show --no-patch --decorate v0.9.0
-git push origin version_0.9.0
-git push origin v0.9.0
+git show --no-patch --decorate v0.10.0
+git push origin version_0.10.0
+git push origin v0.10.0
 ./rebar3 hex publish
 ```
 
